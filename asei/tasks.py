@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+
+from .data import Record
+
+
+def event_ranges(labels):
+    values = np.asarray(labels, dtype=bool)
+    edges = np.diff(np.pad(values.astype(np.int8), (1, 1)))
+    return list(zip(np.flatnonzero(edges == 1).tolist(), np.flatnonzero(edges == -1).tolist()))
+
+
+def phase_weights(labels, clean_valid, corrupt_valid):
+    """Weights over a pair sum to one; positives and negatives each sum to 1/2."""
+    labels = np.asarray(labels, bool)
+    events = event_ranges(labels)
+    positive = np.zeros(len(labels), np.float64)
+    for start, stop in events:
+        cut = min(start + 8, stop)
+        phases = [np.arange(start, cut), np.arange(cut, stop)]
+        phases = [p[corrupt_valid[p]] for p in phases if len(p)]
+        phases = [p for p in phases if len(p)]
+        if not phases:
+            raise ValueError("No scorable positive sample for an injected event.")
+        for p in phases:
+            positive[p] = 0.5 / len(events) / len(phases) / len(p)
+    if not events:
+        raise ValueError("A task pair requires a scorable event.")
+    clean_negative = np.asarray(clean_valid, np.float64)
+    corrupt_negative = (~labels & corrupt_valid).astype(np.float64)
+    if events:
+        corrupt_negative[events[0][1]:] *= 2
+    negative_total = clean_negative.sum() + corrupt_negative.sum()
+    if not negative_total:
+        raise ValueError("Task pair has no scorable negative sample.")
+    return (0.5 * clean_negative / negative_total).astype(np.float32), (
+        positive + 0.5 * corrupt_negative / negative_total).astype(np.float32)
+
+
+@dataclass
+class TaskPair:
+    clean: Record
+    corrupt: Record
+    labels: np.ndarray
+    recipe: dict
+
+
+def generate_pair(source: Record, donor: Record, window: int, index: int, seed: int,
+                  families=("level", "variance", "temporal", "relation")) -> TaskPair:
+    rng = np.random.default_rng(np.random.SeedSequence([seed, index]))
+    c = source.z.shape[1]
+    families = [f for f in families if c > 1 or f != "relation"]
+    if not families or set(families) - {"level", "variance", "temporal", "relation"}:
+        raise ValueError("No valid task family.")
+    family = families[index % len(families)]
+    layout = 1 + ((index // len(families)) % 2)
+    target_begin = max(window, source.target_start)
+    available = len(source.z) - target_begin
+    min_event = 4 if family in {"temporal", "relation"} else 1
+    min_total = layout * min_event + (4 if layout == 2 else 0) + 1
+    if available < min_total:
+        raise ValueError(f"Normal source has {available} targets; {family}/{layout} events need at least {min_total}.")
+    max_span = min(available, 128 + layout * 4 * window + 64 + window + 128)
+    suffix = min(window + 128, max(1, (max_span - min_total) // 2))
+    prefix = min(128, max(0, (max_span - suffix - min_total) // 3))
+    for attempt in range(80):
+        gap_options = [g for g in (4, 16, 64) if g + layout * min_event + suffix + prefix <= max_span]
+        gap = int(rng.choice(gap_options)) if layout == 2 else 0
+        budget = (max_span - suffix - prefix - gap) // layout
+        choices = sorted({l for l in (1, 4, 16, 64, window, 2 * window, 4 * window)
+                          if min_event <= l <= budget and (family != "relation" or l <= len(donor.z))})
+        if not choices:
+            raise ValueError("Normal record too short for configured task layout.")
+        lengths = [int(rng.choice(choices)) for _ in range(layout)]
+        span = prefix + sum(lengths) + gap + suffix
+        target_origin = int(rng.integers(target_begin, len(source.z) - span + 1))
+        origin, stop = target_origin - window, target_origin + span
+        clean = source.z[origin:stop].copy()
+        masks = source.mask[origin:stop].copy()
+        corrupt, labels = clean.copy(), np.zeros(len(clean), np.int8)
+        start, recipes, failed = window + prefix, [], False
+        for length in lengths:
+            end = start + length
+            eligible = np.flatnonzero(masks[start:end].all(0))
+            if len(eligible) == 0:
+                failed = True
+                break
+            counts = sorted({1, int(np.ceil(0.1 * c)), int(np.ceil(0.5 * c)), c})
+            counts = [n for n in counts if n <= len(eligible) and (family != "relation" or n < c)]
+            if not counts:
+                failed = True
+                break
+            affected = rng.choice(eligible, size=int(rng.choice(counts)), replace=False)
+            reference = clean[start:end, affected].copy()
+            donor_start = None
+            if family == "level":
+                magnitude = np.exp(rng.uniform(np.log(0.2), np.log(3), len(affected)))
+                magnitude *= rng.choice([-1, 1], len(affected))
+                subtype = "shift" if rng.random() < 0.5 else "drift"
+                ramp = np.ones(length) if subtype == "shift" else np.arange(1, length + 1) / length
+                replacement = reference + ramp[:, None] * magnitude
+            elif family == "variance":
+                subtype = "noise" if rng.random() < 0.5 else "stagnation"
+                if subtype == "stagnation":
+                    replacement = np.broadcast_to(reference[0], reference.shape).copy()
+                else:
+                    replacement = reference + rng.normal(0, rng.uniform(0.2, 2), reference.shape)
+            elif family == "temporal":
+                subtype = "shift" if rng.random() < 0.5 else "reorder"
+                permutation = np.roll(np.arange(length), int(rng.integers(1, length))) if subtype == "shift" else rng.permutation(length)
+                replacement = reference[permutation]
+            else:
+                subtype = "matched_donor"
+                replacement = reference.copy()
+                for _ in range(30):
+                    donor_start = int(rng.integers(0, len(donor.z) - length + 1))
+                    if donor.mask[donor_start:donor_start + length, affected].all():
+                        shape = donor.z[donor_start:donor_start + length, affected].copy()
+                        ds, rs = shape.std(0), reference.std(0)
+                        if (ds > 1e-6).all() and (rs > 1e-6).all():
+                            replacement = (shape - shape.mean(0)) / ds * rs + reference.mean(0)
+                            break
+            changed = np.any(np.abs(replacement - reference) > 1e-6)
+            if not changed:
+                failed = True
+                break
+            corrupt[start:end, affected] = replacement
+            labels[start:end] = 1
+            recipes.append({"start": start, "stop": end, "channels": affected.tolist(),
+                            "subtype": subtype, "donor_start": donor_start})
+            start = end + gap
+        if failed:
+            continue
+        # Refill from the perturbed observed past. Reusing clean forward-filled values
+        # after an event would introduce the paired clean trajectory into model inputs.
+        last = clean[0].copy()
+        for t in range(len(corrupt)):
+            last = np.where(masks[t], corrupt[t], last)
+            corrupt[t] = last
+        recipe = {"seed": seed, "index": index, "family": family, "layout": layout,
+                  "source_start": origin, "source_stop": stop, "prefix": prefix,
+                  "recovery_suffix": suffix, "events": recipes, "attempt": attempt}
+        return TaskPair(Record(clean, masks.copy(), window), Record(corrupt, masks, window), labels, recipe)
+    raise ValueError(f"Cannot construct a changed {family} task from observed normal data; inspect constant/missing channels.")

@@ -1,0 +1,46 @@
+一、regression_metrics.py（回归／预测指标；16 个）
+
+mae (Mean Absolute Error) - 平均绝对误差；计算预测值与真实值之差的绝对值的平均数。
+mse (Mean Squared Error) - 均方误差；计算预测误差平方的平均数。
+rmse (Root Mean Squared Error) - 均方根误差；对 mse 开平方，使结果与原数据具有相同量纲。
+mape (Mean Absolute Percentage Error) - 平均绝对百分比误差；平均 |真实值－预测值|／|真实值|，再乘 100。真实值为 0 时可能出现无穷大或 NaN。
+smape (Symmetric Mean Absolute Percentage Error) - 对称平均绝对百分比误差；平均 2×|真实值－预测值|／(|真实值|＋|预测值|)，再乘 100。分母为 0 时可能出现 NaN。
+mase (Mean Absolute Scaled Error) - 平均绝对比例误差；使用历史序列按 seasonality 间隔形成的朴素预测误差作尺度，衡量当前预测的绝对误差。当前实现的默认 seasonality=2 会直接返回 -1，不能将这个默认返回值视为有效 MASE。
+wape (Weighted Absolute Percentage Error) - 加权绝对百分比误差；计算全部绝对预测误差之和／全部真实值绝对值之和，再乘 100。分母为 0 时无定义。
+msmape (Modified Symmetric Mean Absolute Percentage Error) - 改进的对称平均绝对百分比误差；用 max(0.5＋epsilon, |预测值|＋|真实值|＋epsilon) 作分母，平均 2×绝对误差／该分母，再乘 100；默认 epsilon=0.1。
+mae_norm (Normalized Mean Absolute Error) - 先用 scaler.transform 分别变换真实值和预测值，再计算 mae。
+mse_norm (Normalized Mean Squared Error) - 先用 scaler.transform 分别变换真实值和预测值，再计算 mse。
+rmse_norm (Normalized Root Mean Squared Error) - 先用 scaler.transform 分别变换真实值和预测值，再计算 rmse。
+mape_norm (Normalized Mean Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 mape；变换后的真实值为 0 时仍可能无定义。
+smape_norm (Normalized Symmetric Mean Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 smape。
+mase_norm (Normalized Mean Absolute Scaled Error) - 先变换真实值、预测值和历史序列，再按 mase 的方式计算；默认 seasonality=2 时同样直接返回 -1。
+wape_norm (Normalized Weighted Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 wape。
+msmape_norm (Normalized Modified Symmetric Mean Absolute Percentage Error) - 在 scaler.transform 变换后的数据上计算 msmape。
+
+二、classification_metrics_label.py（二值异常标签指标；16 个）
+
+accuracy (Accuracy) - 准确率；正确分类的时间点数／总时间点数。
+f_score (F1-score) - 异常类 F1 分数；异常类精确率与召回率的调和平均。
+precision (Precision) - 异常类精确率；预测为异常的时间点中，真实异常所占比例。
+recall (Recall) - 异常类召回率；真实异常时间点中，被检出的比例。
+adjust_accuracy (Point-adjusted Accuracy) - 先执行点调整，再计算准确率；只要命中某个真实异常区间中的一点，就把该区间的预测标签补为异常。
+adjust_f_score (Point-adjusted F1-score) - 先执行同样的点调整，再计算异常类 F1 分数。
+adjust_precision (Point-adjusted Precision) - 先执行同样的点调整，再计算异常类精确率。
+adjust_recall (Point-adjusted Recall) - 先执行同样的点调整，再计算异常类召回率。
+rrecall (Range Recall) - 区间召回率；根据真实异常区间是否被检出及区间内覆盖情况评价召回，调用 metricor.metric_new()。
+rprecision (Range Precision) - 区间精确率；从预测异常区间的角度评价其与真实异常区间的匹配，调用 metricor.metric_new()。
+precision_at_k (Precision at K) - 前 K 项精确率；令 K 为真实异常点数，依据预测结果的分位阈值选取高分位置，计算其中真实异常数／K。当前函数传入的是二值预测标签，遇到大量同分时会受严格大于阈值的实现影响。
+rf (Range F1-score) - 区间 F1 分数；区间精确率与区间召回率的调和平均，调用 metricor.metric_new()。
+affiliation_f (Affiliation F1-score) - 先将连续异常点转为异常事件，再由事件关联精确率与召回率计算 F1。
+affiliation_precision (Affiliation Precision) - 基于预测异常事件与真实异常事件之间的关联关系计算精确率。
+affiliation_recall (Affiliation Recall) - 基于真实异常事件与预测异常事件之间的关联关系计算召回率。
+add (Average Sequence Detection Delay) - 平均序列检测延迟；对每个连续真实异常区间，取点调整前预测首次命中的位置减去区间起点，漏检时取区间长度，再对区间等权平均。单位为采样点，越小越好；无真实异常区间时返回 NaN。
+
+三、classification_metrics_score.py（连续异常分数指标；6 个）
+
+auc_roc (Area Under the ROC Curve) - ROC 曲线下面积；改变分数阈值，综合评价真实异常点的检出率与误报率。
+auc_pr (Area Under the Precision–Recall Curve，代码使用 Average Precision) - 使用 sklearn.average_precision_score 计算平均精确率；由各召回率增量对精确率加权，代码并非直接对绘制出的 PR 曲线作梯形积分。
+R_AUC_ROC (Range AUC-ROC) - 考虑异常区间及其容忍窗口的 ROC 曲线下面积；容忍窗口取真实异常区间长度的中位数。
+R_AUC_PR (Range AUC-PR) - 考虑异常区间及其容忍窗口的 PR 曲线下面积；容忍窗口同样取真实异常区间长度的中位数。
+VUS_ROC (Volume Under the ROC Surface) - 在多个异常区间容忍窗口下汇总 Range AUC-ROC，得到 ROC 曲面下体积指标；代码使用从 0 到两倍异常区间长度中位数的窗口。
+VUS_PR (Volume Under the PR Surface) - 在多个异常区间容忍窗口下汇总 Range AUC-PR，得到 PR 曲面下体积指标；窗口范围与 VUS_ROC 相同。
