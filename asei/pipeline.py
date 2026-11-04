@@ -23,10 +23,20 @@ from .training import build_task_cache, fit_representation, fit_detector, seed_e
 
 def get_device(name):
     if name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        name = "cuda" if torch.cuda.is_available() else "cpu"
     device = torch.device(name)
-    if device.type == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA requested but unavailable in this PyTorch environment.")
+    if device.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA requested but unavailable in this PyTorch environment.")
+        count = torch.cuda.device_count()
+        if device.index is not None and not 0 <= device.index < count:
+            raise ValueError(f"Requested {device}, but only {count} CUDA device(s) are visible. "
+                             "Use logical indices after CUDA_VISIBLE_DEVICES is applied.")
+        # Memory-stat APIs in older PyTorch releases do not initialize the allocator.
+        torch.cuda.init()
+        index = torch.cuda.current_device() if device.index is None else device.index
+        torch.cuda.set_device(index)
+        device = torch.device("cuda", index)
     return device
 
 
