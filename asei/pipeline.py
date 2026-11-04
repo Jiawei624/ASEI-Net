@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 from .config import (configure_cuda, file_sha256, fingerprint, implementation_fingerprint,
-                     resolve_config, resolve_paths, TAB_COMMIT, write_json)
+                     resolve_config, resolve_paths, write_json)
 from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
@@ -87,7 +87,7 @@ def save_bundle(path, representation, detector, scaler, calibration, cfg, proven
                 "detector": detector.state_dict(),
                 "detector_config": {k: cfg["stage2"].get(k) for k in ("variant", "fixed_retention", "sources")},
                 "scaler": scaler.as_dict(), "threshold": calibration["threshold"],
-                "channel_names": provenance["channels"], "tab_commit": TAB_COMMIT}, path)
+                "channel_names": provenance["channels"]}, path)
 
 
 def load_bundle(path, device="cpu"):
@@ -245,7 +245,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
                                 ("retention", "state_difference", "marginal_difference", "joint_difference")})
     np.savez_compressed(detector_dir / "predictions.npz", **prediction_data)
     write_json(detector_dir / "result.json", {"dataset": entity.dataset, "entity": entity.name, "seed": seed,
-               "variant": variant_name, "model_key": detector_key, "implementation_key": code_key, "tab_commit": TAB_COMMIT,
+               "variant": variant_name, "model_key": detector_key, "implementation_key": code_key,
                "test_points": len(labels), "calibration": calibration, "metrics": results,
                "sensitivity": sensitivity, "timing": timings,
                "environment": {"python": sys.version, "torch": torch.__version__, "numpy": np.__version__,

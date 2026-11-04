@@ -1,6 +1,5 @@
-# Runtime subset of TAB's requirements. Existing satisfying packages are reused.
-# TAB pins numpy==1.21.0; allow newer installed NumPy here to avoid downgrades.
-# Use requirements-tab.txt only when the exact TAB NumPy pin is desired.
+# Runtime requirements. Existing satisfying packages are reused.
+# Use requirements-strict.txt to pin NumPy to 1.21.0 on Python 3.8/3.9.
 numpy>=1.21.0
 pandas
 torch>=1.11.0
@@ -9,5 +8,5 @@ scipy
 statsmodels>=0.14.0
 tqdm>=4.64.0
 
-# ASEI-Net's YAML configuration reader (usually already present in TAB environments).
+# YAML configuration reader.
 PyYAML>=5.1

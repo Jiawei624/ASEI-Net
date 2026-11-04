@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .config import file_sha256
-from .tab import tab_module
+from .data_process import read_data
 
 DATASETS = ("PSM", "SMD", "SWAT", "GECCO", "PUMP")
 
@@ -51,8 +51,8 @@ def _dataset(row: dict) -> str | None:
     return None
 
 
-def metadata_path(tab_data: str | Path, manifest=None) -> Path:
-    root = Path(tab_data).resolve()
+def metadata_path(data_root: str | Path, manifest=None) -> Path:
+    root = Path(data_root).resolve()
     if manifest:
         path = Path(manifest).resolve()
         if not path.is_file():
@@ -65,8 +65,8 @@ def metadata_path(tab_data: str | Path, manifest=None) -> Path:
     return candidates[0]
 
 
-def discover(tab_data: str | Path, manifest=None, multivariate_only=False) -> list[Entity]:
-    meta_path = metadata_path(tab_data, manifest)
+def discover(data_root: str | Path, manifest=None, multivariate_only=False) -> list[Entity]:
+    meta_path = metadata_path(data_root, manifest)
     base = meta_path.parent if manifest else meta_path.parent / "data"
     meta = pd.read_csv(meta_path)
     if not {"file_name", "train_lens"}.issubset(meta.columns):
@@ -79,7 +79,7 @@ def discover(tab_data: str | Path, manifest=None, multivariate_only=False) -> li
         if multivariate_only and _bool(row.get("if_univariate", False)):
             continue
         name = str(row.get("entity", Path(str(row["file_name"])).stem))
-        # TAB uses '@' in source names such as machine-3-4.test.csv@7.csv.
+        # Source names may contain '@', e.g. machine-3-4.test.csv@7.csv.
         if not re.fullmatch(r"[\w.@\-]+", name) or name in {".", ".."}:
             raise ValueError(f"Unsafe entity identifier: {name}")
         if (ds, name) in seen:
@@ -110,10 +110,10 @@ def discover(tab_data: str | Path, manifest=None, multivariate_only=False) -> li
     return entities
 
 
-def read_frame(path: Path, tab_source=None) -> pd.DataFrame:
+def read_frame(path: Path) -> pd.DataFrame:
     header = pd.read_csv(path, nrows=0)
     if "cols" in header.columns:
-        frame = tab_module("data.utils", tab_source).read_data(str(path))
+        frame = read_data(str(path))
         if not isinstance(frame, pd.DataFrame):
             raise ValueError("Expected a multivariate series, not spatial-temporal data.")
     else:
@@ -159,8 +159,8 @@ class Standardizer:
         return {"mean": self.mean.tolist(), "scale": self.scale.tolist()}
 
 
-def load_entity(entity: Entity, fraction: float, tab_source=None):
-    frame = read_frame(entity.path, tab_source)
+def load_entity(entity: Entity, fraction: float):
+    frame = read_frame(entity.path)
     boundary = entity.train_lens
     if not 0 < boundary < len(frame):
         raise ValueError(f"{entity.name}: train_lens is outside the series.")
@@ -179,7 +179,7 @@ def load_entity(entity: Entity, fraction: float, tab_source=None):
     normal = scaler.transform(x[:boundary])
     train = Record(normal.z[:n_fit], normal.mask[:n_fit])
     if entity.validation_path:
-        vf = read_frame(entity.validation_path, tab_source)
+        vf = read_frame(entity.validation_path)
         if vf["label"].any():
             raise ValueError("Independent validation record must be normal.")
         if set(vf.columns.drop("label")) != set(frame.columns.drop("label")):

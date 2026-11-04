@@ -5,7 +5,6 @@ import warnings
 import numpy as np
 from sklearn import metrics as skmetrics
 
-from .tab import tab_module
 from .tasks import event_ranges
 
 LABEL_METRICS = {"accuracy", "precision", "recall", "f_score", "adjust_accuracy", "adjust_precision",
@@ -86,7 +85,7 @@ def _safe_metric(name, function, errors):
             with np.errstate(all="ignore"):
                 value = float(function())
         if not np.isfinite(value):
-            errors[name] = "TAB returned an undefined/non-finite value."
+            errors[name] = "Metric returned an undefined/non-finite value."
             return float("nan")
         if caught:
             errors[name] = "; ".join(sorted({str(w.message) for w in caught}))
@@ -96,11 +95,11 @@ def _safe_metric(name, function, errors):
         return float("nan")
 
 
-def label_metrics(actual, predicted, names, errors, tab_source=None):
+def label_metrics(actual, predicted, names, errors):
     unknown = set(names) - LABEL_METRICS
     if unknown:
         raise ValueError(f"Unsupported label metrics: {unknown}")
-    module = tab_module("evaluation.metrics.classification_metrics_label", tab_source)
+    from .evaluation import classification_metrics_label as module
     result = {}
     both_classes = len(np.unique(actual)) == 2
     for name in names:
@@ -110,7 +109,7 @@ def label_metrics(actual, predicted, names, errors, tab_source=None):
             function = {"precision": skmetrics.precision_score, "recall": skmetrics.recall_score,
                         "f_score": skmetrics.f1_score}[name]
             result[name] = float(function(actual, predicted, zero_division=0))
-            errors[name] = "Single-class input: explicit positive-class sklearn definition avoids TAB's class-index error."
+            errors[name] = "Single-class input: use sklearn's explicit positive-class definition."
         elif not actual.any() and (name.startswith("affiliation") or name in {"rprecision", "rrecall", "rf", "precision_at_k"}):
             result[name] = float("nan")
             errors[name] = "No ground-truth anomaly event."
@@ -119,7 +118,7 @@ def label_metrics(actual, predicted, names, errors, tab_source=None):
     return result
 
 
-def score_metrics(actual, scores, names, errors, tab_source=None):
+def score_metrics(actual, scores, names, errors):
     unknown = set(names) - SCORE_METRICS
     if unknown:
         raise ValueError(f"Unsupported score metrics (test-label threshold scans are excluded): {unknown}")
@@ -127,13 +126,12 @@ def score_metrics(actual, scores, names, errors, tab_source=None):
         for name in names:
             errors[name] = "Ranking metric undefined for a single ground-truth class."
         return {name: float("nan") for name in names}
-    module = tab_module("evaluation.metrics.classification_metrics_score", tab_source)
+    from .evaluation import classification_metrics_score as module
     result = {}
     shared = {}
 
     def calculate(name):
-        # The two upstream wrappers in each family repeat the same expensive call.
-        # Reuse its exact result; keep upstream algorithms and window definitions intact.
+        # Reuse the shared expensive calculation for each metric family.
         if name in {"R_AUC_ROC", "R_AUC_PR"}:
             if "range" not in shared:
                 window = int(np.median(module.get_list_anomaly(actual)))
@@ -152,7 +150,7 @@ def score_metrics(actual, scores, names, errors, tab_source=None):
     return result
 
 
-def evaluate(actual, scores, valid, threshold, cfg, tab_source=None):
+def evaluate(actual, scores, valid, threshold, cfg):
     actual, scores, valid = np.asarray(actual), np.asarray(scores, np.float64), np.asarray(valid, bool)
     if actual.ndim != 1 or actual.shape != scores.shape or scores.shape != valid.shape:
         raise ValueError("Scores, readiness and labels must preserve the same complete time axis.")
@@ -162,14 +160,14 @@ def evaluate(actual, scores, valid, threshold, cfg, tab_source=None):
         raise ValueError("Ready scores and threshold must be finite.")
     predicted = (valid & (scores > threshold)).astype(np.int8)
     errors = {}
-    labels = label_metrics(actual, predicted, cfg["label_metrics"], errors, tab_source)
-    supplementary = label_metrics(actual, predicted, cfg.get("supplementary_label_metrics", []), errors, tab_source)
+    labels = label_metrics(actual, predicted, cfg["label_metrics"], errors)
+    supplementary = label_metrics(actual, predicted, cfg.get("supplementary_label_metrics", []), errors)
     if valid.any():
         floor = np.nextafter(scores[valid].min(), -np.inf)
         full_scores = np.where(valid, scores, floor)
-        ranking = score_metrics(actual, full_scores, cfg["score_metrics"], errors, tab_source)
+        ranking = score_metrics(actual, full_scores, cfg["score_metrics"], errors)
         ready_errors = {}
-        ready = score_metrics(actual[valid], scores[valid], ["auc_roc", "auc_pr"], ready_errors, tab_source)
+        ready = score_metrics(actual[valid], scores[valid], ["auc_roc", "auc_pr"], ready_errors)
         errors.update({"ready_" + k: v for k, v in ready_errors.items()})
     else:
         ranking = {n: float("nan") for n in cfg["score_metrics"]}
@@ -182,15 +180,15 @@ def evaluate(actual, scores, valid, threshold, cfg, tab_source=None):
             "point_adjustment_in_primary_metrics": False}, predicted
 
 
-def regression_metrics(actual, predicted, names=("mae", "mse", "rmse"), tab_source=None, **kwargs):
+def regression_metrics(actual, predicted, names=("mae", "mse", "rmse"), **kwargs):
     """Optional forecasting diagnostics; these are not anomaly-detection metrics."""
-    module = tab_module("evaluation.metrics.regression_metrics", tab_source)
+    from .evaluation import regression_metrics as module
     if set(names) - set(module.__all__):
-        raise ValueError("Unknown TAB regression metric.")
+        raise ValueError("Unknown regression metric.")
     errors = {}
     result = {n: _safe_metric(n, lambda k=n: getattr(module, k)(actual, predicted, **kwargs), errors) for n in names}
     for n in names:
         if n.startswith("mase") and kwargs.get("seasonality", 2) == 2:
             result[n] = float("nan")
-            errors[n] = "TAB default seasonality=2 returns the sentinel -1; supply an explicit different seasonality."
+            errors[n] = "Default seasonality=2 returns the sentinel -1; supply an explicit different seasonality."
     return result, errors

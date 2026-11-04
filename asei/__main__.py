@@ -31,7 +31,7 @@ def main():
             p.add_argument("--variant", choices=["full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru"])
             p.add_argument("--sources", nargs="*", choices=["relation", "marginal", "joint"])
             p.add_argument("--skip-vus", action="store_true")
-            p.add_argument("--all-tab-label-metrics", action="store_true")
+            p.add_argument("--all-label-metrics", "--all-tab-label-metrics", action="store_true")
             p.add_argument("--diagnostics", action="store_true")
             p.add_argument("--log", action="store_true", help="Append stdout/stderr to the configured runtime log file")
         else:
@@ -128,7 +128,7 @@ def execute(args, cfg):
         cfg["stage2"]["sources"] = args.sources
     if args.skip_vus:
         cfg["evaluation"]["score_metrics"] = [m for m in cfg["evaluation"]["score_metrics"] if not m.startswith("VUS_")]
-    if args.all_tab_label_metrics:
+    if args.all_label_metrics:
         cfg["evaluation"]["supplementary_label_metrics"] = ["adjust_accuracy", "adjust_precision", "adjust_recall", "adjust_f_score", "precision_at_k"]
     configure_cuda(cfg)
     # CUDA visibility must be configured before importing PyTorch through the pipeline.

@@ -10,7 +10,6 @@ import sys
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-TAB_COMMIT = "5a7e6f80c405eed7c4dd1390f69fbba2fd8ddcf2"
 DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
 REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
                    "summary": "summary", "environment": "environment.json", "predictions": "predictions"}
@@ -42,7 +41,7 @@ def report_path(cfg: dict, name: str, output_root=None) -> Path:
 
 
 def log_path(cfg: dict) -> Path:
-    path = Path(cfg["runtime"].get("log_file", "gpu1_main.log")).expanduser()
+    path = Path(cfg["runtime"].get("log_file", "main.log")).expanduser()
     return (path if path.is_absolute() else project_path(cfg["runtime"]["log_dir"]) / path).resolve()
 
 
@@ -130,9 +129,10 @@ def file_sha256(path: str | Path) -> str:
 
 def implementation_fingerprint() -> str:
     # Normalize newlines so the same checkout has the same identity on Windows/Linux.
-    files = {p.name: hashlib.sha256(p.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")).hexdigest()
-             for p in sorted((ROOT / "asei").glob("*.py"))}
-    return fingerprint({"source_files": files, "tab_commit": TAB_COMMIT})
+    files = {p.relative_to(ROOT / "asei").as_posix():
+             hashlib.sha256(p.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")).hexdigest()
+             for p in sorted((ROOT / "asei").rglob("*.py"))}
+    return fingerprint({"source_files": files})
 
 
 def write_json(path: str | Path, value):

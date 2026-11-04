@@ -1,4 +1,4 @@
-"""API compatibility with TAB's PyTorch >= 1.11 runtime."""
+"""API compatibility with PyTorch >= 1.11."""
 from __future__ import annotations
 
 import inspect

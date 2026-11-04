@@ -1,4 +1,4 @@
-"""Download the original TAB archive; extraction is a separate explicit operation."""
+"""Download the dataset archive; extraction is a separate explicit operation."""
 import argparse
 from pathlib import Path
 import sys
@@ -24,7 +24,7 @@ def main():
         raise SystemExit(f"Already exists: {target}. Choose another --output to download again.")
     result = gdown.download(id="1V5BAHWBKU8uih3hE1R7WdF6_crZlIbQT", output=str(target), quiet=False)
     if result is None:
-        raise SystemExit("Download failed. Use the official TAB Google Drive link in README.md.")
+        raise SystemExit("Download failed. Use the dataset Google Drive link in README.md.")
 
 
 if __name__ == "__main__":

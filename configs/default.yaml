@@ -53,9 +53,9 @@ runtime:
   device: cuda:0
   feature_batch_size: 64
   threads: 4
-  output: outputs/gpu1
+  output: outputs
   log_dir: logs
-  log_file: gpu1_main.log
+  log_file: main.log
   seeds: [0, 1, 2, 3, 4]
 reports:
   # Relative paths in this section are resolved under runtime.output.

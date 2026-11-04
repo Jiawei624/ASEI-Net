@@ -1,4 +1,4 @@
-"""Read-only check for reusing an existing TAB environment (Python >= 3.8).
+"""Read-only check of the existing runtime environment (Python >= 3.8).
 
 No packages are installed, upgraded or downgraded. Reports use the configured
 path. --check-imports also checks binary imports and a small CPU model forward.
@@ -60,7 +60,7 @@ def satisfies(installed, operator, minimum):
     return not suffix or suffix.startswith(".post")
 
 
-def inspect_packages(rules, upstream):
+def inspect_packages(rules, reference):
     rows = []
     for key, (name, operator, minimum, rule) in rules.items():
         try:
@@ -68,11 +68,11 @@ def inspect_packages(rules, upstream):
         except metadata.PackageNotFoundError:
             installed = None
         supported = satisfies(installed, operator, minimum)
-        tab_rule = upstream.get(key)
+        reference_rule = reference.get(key)
         rows.append({"package": name, "installed": installed, "requirement": rule,
                      "status": "ok" if supported else ("missing" if installed is None else "incompatible"),
-                     "tab_requirement": tab_rule[3] if tab_rule else None,
-                     "tab_matches": satisfies(installed, tab_rule[1], tab_rule[2]) if tab_rule else None})
+                     "reference_requirement": reference_rule[3] if reference_rule else None,
+                     "reference_matches": satisfies(installed, reference_rule[1], reference_rule[2]) if reference_rule else None})
     return rows
 
 
@@ -125,16 +125,22 @@ def check_imports():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", "--config-path", default=str(ROOT / "configs" / "default.yaml"))
-    parser.add_argument("--strict-tab", action="store_true", help="Also require TAB's exact numpy==1.21.0 runtime pin")
+    parser.add_argument("--strict-numpy", "--strict-tab", action="store_true", help="Also require the exact numpy==1.21.0 runtime pin")
     parser.add_argument("--check-imports", action="store_true")
     parser.add_argument("--tools", action="store_true", help="Require optional download/test utilities too")
     parser.add_argument("--output", type=Path, help="Override reports.environment; no environment changes")
     args = parser.parse_args()
-    source = ROOT / "third_party" / "TAB" / "requirements.txt"
-    upstream = requirements(source) if source.is_file() else {}
-    rules = requirements(ROOT / ("requirements-tab.txt" if args.strict_tab else "requirements.txt"))
-    core = inspect_packages(rules, upstream)
-    optional = inspect_packages(requirements(ROOT / "requirements-tools.txt"), upstream)
+    reference = requirements(ROOT / "configs" / "environment_reference.txt")
+    rules = requirements(ROOT / "requirements.txt")
+    if args.strict_numpy:
+        rules["numpy"] = reference["numpy"]
+    core = inspect_packages(rules, reference)
+    tools_file = ROOT / "requirements-tools.txt"
+    tool_rules = (requirements(tools_file) if tools_file.is_file() else {
+        "gdown": ("gdown", ">=", "5.2", "gdown>=5.2"),
+        "pytest": ("pytest", ">=", "7.0", "pytest>=7.0"),
+    })
+    optional = inspect_packages(tool_rules, reference)
     python_ok = sys.version_info >= (3, 8)
     ok = python_ok and all(row["status"] == "ok" for row in core)
     if args.tools:
@@ -142,7 +148,7 @@ def main():
     imports = check_imports() if args.check_imports and ok else {}
     ok = ok and all(row["ok"] for row in imports.values())
     report = {"python": platform.python_version(), "executable": sys.executable,
-              "python_supported": python_ok, "strict_tab_numpy": args.strict_tab,
+              "python_supported": python_ok, "strict_numpy": args.strict_numpy,
               "core": core, "optional_tools": optional, "imports": imports, "ok": ok}
     print("Python:", report["python"], "Executable:", sys.executable)
     print("{:<18} {:<18} {:<24} {}".format("Package", "Installed", "ASEI requirement", "Status"))
@@ -151,8 +157,8 @@ def main():
                                                row["requirement"], row["status"]))
     print("Optional tools:", ", ".join(row["package"] + "=" + (row["installed"] or "missing") for row in optional))
     numpy = next(row for row in core if canonical_name(row["package"]) == "numpy")
-    if numpy["tab_requirement"] and not numpy["tab_matches"]:
-        print("TAB pins numpy==1.21.0; the default reuse profile accepts your newer installed NumPy.")
+    if numpy["reference_requirement"] and not numpy["reference_matches"]:
+        print("The reference profile pins numpy==1.21.0; the default profile accepts your newer installed NumPy.")
     for name, row in imports.items():
         print("Import/probe:", name, "ok" if row["ok"] else row["error"])
     target = ((args.output if args.output.is_absolute() else ROOT / args.output).resolve()

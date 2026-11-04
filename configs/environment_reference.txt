@@ -1,0 +1,7 @@
+numpy==1.21.0
+pandas
+torch>=1.11.0
+scikit-learn
+scipy
+statsmodels>=0.14.0
+tqdm>=4.64.0
