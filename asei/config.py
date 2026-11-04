@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -28,6 +29,13 @@ def resolve_paths(cfg: dict) -> dict:
     runtime = cfg["runtime"]
     runtime["output"] = str(project_path(runtime["output"]))
     runtime["log_dir"] = str(project_path(runtime.get("log_dir", "logs")))
+    try:
+        interval = float(runtime.get("log_interval_seconds", 300))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("runtime.log_interval_seconds must be a finite nonnegative number.") from exc
+    if not math.isfinite(interval) or interval < 0:
+        raise ValueError("runtime.log_interval_seconds must be a finite nonnegative number.")
+    runtime["log_interval_seconds"] = interval
     reports = cfg.setdefault("reports", {})
     for name, value in REPORT_DEFAULTS.items():
         reports.setdefault(name, value)
@@ -132,7 +140,15 @@ def implementation_fingerprint() -> str:
     files = {p.relative_to(ROOT / "asei").as_posix():
              hashlib.sha256(p.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")).hexdigest()
              for p in sorted((ROOT / "asei").rglob("*.py"))}
-    return fingerprint({"source_files": files})
+    identity = fingerprint({"source_files": files})
+    # Exact source aliases preserve checkpoints across reviewed logging-only changes.
+    compatibility = ROOT / "configs" / "implementation_compatibility.json"
+    if compatibility.is_file():
+        record = json.loads(compatibility.read_text(encoding="utf-8"))
+        if record.get("format") != 1 or not isinstance(record.get("aliases"), dict):
+            raise ValueError("Invalid implementation compatibility record.")
+        return record["aliases"].get(identity, identity)
+    return identity
 
 
 def write_json(path: str | Path, value):

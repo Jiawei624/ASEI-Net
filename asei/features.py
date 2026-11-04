@@ -8,6 +8,7 @@ import torch
 
 from .data import Record, Standardizer
 from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
+from .progress import periodic_progress
 
 
 @dataclass
@@ -66,14 +67,15 @@ class FeatureSequence:
 
 
 @torch.no_grad()
-def extract_features(record: Record, model: NormalRepresentation, batch_size=64) -> FeatureSequence:
+def extract_features(record: Record, model: NormalRepresentation, batch_size=64,
+                     log_interval_seconds=0, progress_label="feature extraction batches") -> FeatureSequence:
     model.eval()
     device = next(model.parameters()).device
     n, c = record.z.shape
     w = model.cfg["window"]
     predictions = np.zeros((n, c, 2), np.float32)
     mi, ji = np.full((n, c), -1, np.int32), np.full(n, -1, np.int32)
-    for left in range(w, n, batch_size):
+    for left in periodic_progress(range(w, n, batch_size), progress_label, log_interval_seconds):
         indices = np.arange(left, min(left + batch_size, n))
         hidx = indices[:, None] + np.arange(-w, 0)
         segment, smask = segment_arrays(record, indices)
@@ -87,7 +89,8 @@ def extract_features(record: Record, model: NormalRepresentation, batch_size=64)
 
 
 @torch.no_grad()
-def score_features(sequence: FeatureSequence, representation, detector, block_length=256, diagnostics=False):
+def score_features(sequence: FeatureSequence, representation, detector, block_length=256, diagnostics=False,
+                   log_interval_seconds=0, progress_label="scoring blocks"):
     detector.eval()
     n, c = sequence.z.shape
     scores, valid = np.full(n, np.nan, np.float32), np.zeros(n, bool)
@@ -95,7 +98,7 @@ def score_features(sequence: FeatureSequence, representation, detector, block_le
     extra = {k: np.zeros((n, c), np.float32) for k in
              ("retention", "state_difference", "marginal_difference", "joint_difference")} if diagnostics else {}
     state = None
-    for start in range(0, n, block_length):
+    for start in periodic_progress(range(0, n, block_length), progress_label, log_interval_seconds):
         block = sequence.block(start, min(n, start + block_length), representation)
         for t in range(len(block["chi"])):
             out, state = detector.step({k: v[t:t + 1] for k, v in block.items()}, state, diagnostics)

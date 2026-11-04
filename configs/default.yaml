@@ -56,6 +56,8 @@ runtime:
   output: outputs
   log_dir: logs
   log_file: main.log
+  # Epoch summaries are always printed; 0 disables timed progress messages.
+  log_interval_seconds: 300
   seeds: [0, 1, 2, 3, 4]
 reports:
   # Relative paths in this section are resolved under runtime.output.

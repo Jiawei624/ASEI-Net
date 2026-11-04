@@ -53,7 +53,9 @@ def _cached_features(record, model, cfg, path, key):
     if path.exists():
         return FeatureSequence.load(path, key), 0.0
     start = time.perf_counter()
-    sequence = extract_features(record, model, cfg["runtime"]["feature_batch_size"])
+    sequence = extract_features(record, model, cfg["runtime"]["feature_batch_size"],
+                                log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
+                                progress_label=path.stem + " batches")
     sequence.save(path, key)
     return sequence, time.perf_counter() - start
 
@@ -198,7 +200,9 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     if stage in {"all", "calibrate"}:
         normal_features, _ = _cached_features(normal_record, representation, cfg,
                                               directory / "normal_features.npz", representation_key + "normal")
-        output = score_features(normal_features, representation, detector, cfg["stage2"]["block_length"])
+        output = score_features(normal_features, representation, detector, cfg["stage2"]["block_length"],
+                                log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
+                                progress_label="calibration scoring blocks")
         normal_scores = output["scores"][validation_start:]
         primary = threshold_from_normal(normal_scores, cfg["calibration"]["alpha"])
         calibration = {**primary, "key": cal_key, "validation_targets": len(normal_scores),
@@ -223,7 +227,9 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     features, feature_seconds = _cached_features(test, representation, cfg, directory / "test_features.npz",
                                                  representation_key + "test")
     inference_start = time.perf_counter()
-    output = score_features(features, representation, detector, cfg["stage2"]["block_length"], diagnostics)
+    output = score_features(features, representation, detector, cfg["stage2"]["block_length"], diagnostics,
+                            log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
+                            progress_label="test scoring blocks")
     scores, ready = output["scores"][test_start:], output["valid"][test_start:]
     inference_seconds = time.perf_counter() - inference_start
     results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])

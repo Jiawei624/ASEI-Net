@@ -1,0 +1,7 @@
+{
+  "format": 1,
+  "description": "Exact source compatibility for progress-logging changes; numerical settings and algorithms are unchanged.",
+  "aliases": {
+    "6d82f9ea846084d7ead4eabb1c9d2e521f6c8b22f60268b531898750daae2abc": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d"
+  }
+}

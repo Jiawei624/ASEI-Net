@@ -8,13 +8,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 import torch.nn.functional as F
-from tqdm import tqdm
 
 from .config import fingerprint, write_json
 from .compat import load_torch_checkpoint
 from .data import Record
 from .features import extract_features, FeatureSequence
 from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
+from .progress import periodic_progress
 from .tasks import generate_pair, phase_weights
 
 
@@ -54,7 +54,7 @@ def complete_windows(record):
 
 
 @torch.no_grad()
-def initialize_prototypes(model: NormalRepresentation, record: Record):
+def initialize_prototypes(model: NormalRepresentation, record: Record, log_interval_seconds=0):
     complete = complete_windows(record)
     device = next(model.parameters()).device
     memory = model.memory
@@ -64,7 +64,7 @@ def initialize_prototypes(model: NormalRepresentation, record: Record):
         chi = model.descriptor(torch.as_tensor(seg, device=device))
         return memory.encode(chi, model.history.identity.weight)
 
-    for c in range(record.z.shape[1]):
+    for c in periodic_progress(range(record.z.shape[1]), "stage1 prototype initialization", log_interval_seconds):
         eligible = np.flatnonzero(complete[:, c]) + 31
         eligible = eligible[eligible >= model.cfg["window"]]
         n = min(len(eligible), memory.km)
@@ -128,12 +128,13 @@ def revive_unused(model, optimizer, record, marginal_counts, joint_counts, rng):
 
 
 @torch.no_grad()
-def finalize_memory(model, record, batch_size=2048):
+def finalize_memory(model, record, batch_size=2048, log_interval_seconds=0):
     model.eval()
     memory = model.memory
     marginal, joint = torch.zeros_like(memory.m_unused), torch.zeros_like(memory.j_unused)
     device = next(model.parameters()).device
-    for start in range(model.cfg["window"], len(record.z), batch_size):
+    for start in periodic_progress(range(model.cfg["window"], len(record.z), batch_size),
+                                   "stage1 prototype finalization", log_interval_seconds):
         seg, mask = segment_arrays(record, np.arange(start, min(start + batch_size, len(record.z))))
         chi = model.descriptor(torch.as_tensor(seg, device=device))
         mi, ji = memory.query(chi, torch.as_tensor(mask.all(1), device=device), model.history.identity.weight)
@@ -153,8 +154,9 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
     directory.mkdir(parents=True, exist_ok=True)
     device = next(model.parameters()).device
     s = cfg["stage1"]
+    interval = cfg["runtime"].get("log_interval_seconds", 300)
     model.descriptor.fit(train)
-    initialize_prototypes(model, train)
+    initialize_prototypes(model, train, log_interval_seconds=interval)
     # No weight decay for the projected relation or the VQ codebooks.
     special = [model.relation, model.memory.m_codes, model.memory.j_codes]
     special_ids = {id(p) for p in special}
@@ -169,12 +171,13 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
     best, stale, logs = float("inf"), 0, []
     began = time.perf_counter()
     for epoch in range(s["epochs"]):
+        epoch_began = time.perf_counter()
         for group in optimizer.param_groups:
             group["lr"] = s["lr"] * min(1, (epoch + 1) / max(1, s["warmup_epochs"]))
         model.train()
         marginal, joint = torch.zeros_like(model.memory.m_unused), torch.zeros_like(model.memory.j_unused)
         train_total, train_n = 0.0, 0
-        for batch in tqdm(dl, desc=f"representation {epoch + 1}", leave=False):
+        for batch in periodic_progress(dl, f"stage1 epoch={epoch + 1} train", interval):
             batch = {k: v.to(device) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             loss, usage = model.normal_loss(batch)
@@ -191,7 +194,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
         model.eval()
         val_total, val_n = 0.0, 0
         with torch.no_grad():
-            for batch in vl:
+            for batch in periodic_progress(vl, f"stage1 epoch={epoch + 1} validation", interval):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 loss, _ = model.normal_loss(batch)
                 n = len(batch["target"])
@@ -200,7 +203,8 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
         if not np.isfinite(val_loss):
             raise FloatingPointError("Non-finite normal validation loss.")
         logs.append({"epoch": epoch + 1, "train_loss": train_total / train_n, "validation_loss": val_loss})
-        print(f"stage1 epoch={epoch + 1} train={train_total / train_n:.6f} validation={val_loss:.6f}", flush=True)
+        print(f"stage1 epoch={epoch + 1} train={train_total / train_n:.6f} validation={val_loss:.6f} "
+              f"seconds={time.perf_counter() - epoch_began:.1f}", flush=True)
         if val_loss < best:
             best, stale = val_loss, 0
             torch.save({"model": model.state_dict(), "model_config": model.cfg, "key": run_key,
@@ -211,7 +215,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
             break
     best_checkpoint = load_torch_checkpoint(directory / "stage1_best.pt", map_location=device)
     model.load_state_dict(best_checkpoint["model"])
-    usage = finalize_memory(model, train)
+    usage = finalize_memory(model, train, log_interval_seconds=interval)
     torch.save({"model": model.state_dict(), "model_config": model.cfg, "key": run_key,
                 "epoch": best_checkpoint["epoch"], "validation_loss": best, "usage": usage}, directory / "representation.pt")
     elapsed = time.perf_counter() - began
@@ -236,7 +240,7 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
                                "preparation_seconds_total": previous_seconds})
     began, recipes, built = time.perf_counter(), [], 0
     for split, source, n in (("train", train, s["train_pairs"]), ("validation", valid, s["validation_pairs"])):
-        for i in tqdm(range(n), desc=f"frozen {split} task pairs"):
+        for i in periodic_progress(range(n), f"cache {split} task pairs", cfg["runtime"].get("log_interval_seconds", 300)):
             clean_path, corrupt_path = directory / f"{split}_{i:04d}_clean.npz", directory / f"{split}_{i:04d}_corrupt.npz"
             recipe_path = directory / f"{split}_{i:04d}.json"
             if clean_path.exists() and corrupt_path.exists() and recipe_path.exists():
@@ -257,6 +261,7 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
             recipe = {"split": split, **pair.recipe}
             write_json(recipe_path, recipe)
             recipes.append(recipe)
+        print(f"cache {split} complete pairs={n}", flush=True)
     seconds = time.perf_counter() - began
     size = sum(p.stat().st_size for p in directory.glob("*.npz"))
     write_json(manifest_path, {"key": key, "settings": settings, "complete": True, "seconds_this_call": seconds,
@@ -282,13 +287,15 @@ def _batch_blocks(sequences, start, stop, representation):
     return {k: torch.stack([b[k] for b in blocks]) for k in blocks[0]}
 
 
-def detector_epoch(detector, representation, cache_dir, cache_key, indices, split, cfg, optimizer=None):
+def detector_epoch(detector, representation, cache_dir, cache_key, indices, split, cfg, optimizer=None, epoch=None):
     training = optimizer is not None
     detector.train(training)
     s = cfg["stage2"]
     device = next(detector.parameters()).device
     total, pairs = 0.0, 0
-    for batch_start in range(0, len(indices), s["batch_pairs"]):
+    label = f"stage2 epoch={epoch} {split}" if epoch is not None else f"stage2 {split}"
+    for batch_start in periodic_progress(range(0, len(indices), s["batch_pairs"]), label,
+                                         cfg["runtime"].get("log_interval_seconds", 300)):
         batch_indices = indices[batch_start:batch_start + s["batch_pairs"]]
         sequences = [FeatureSequence.load(Path(cache_dir) / f"{split}_{i:04d}_{role}.npz", cache_key)
                      for i in batch_indices for role in ("clean", "corrupt")]
@@ -335,12 +342,14 @@ def fit_detector(detector, representation, cfg, cache_dir, cache_key, directory,
     best, stale, history = float("inf"), 0, []
     began = time.perf_counter()
     for epoch in range(s["epochs"]):
+        epoch_began = time.perf_counter()
         train_loss = detector_epoch(detector, representation, cache_dir, cache_key,
-                                    rng.permutation(s["train_pairs"]), "train", cfg, optimizer)
+                                    rng.permutation(s["train_pairs"]), "train", cfg, optimizer, epoch=epoch + 1)
         val_loss = detector_epoch(detector, representation, cache_dir, cache_key,
-                                  np.arange(s["validation_pairs"]), "validation", cfg)
+                                  np.arange(s["validation_pairs"]), "validation", cfg, epoch=epoch + 1)
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": val_loss})
-        print(f"stage2 epoch={epoch + 1} train={train_loss:.6f} validation={val_loss:.6f}", flush=True)
+        print(f"stage2 epoch={epoch + 1} train={train_loss:.6f} validation={val_loss:.6f} "
+              f"seconds={time.perf_counter() - epoch_began:.1f}", flush=True)
         if val_loss < best:
             best, stale = val_loss, 0
             torch.save({"model": detector.state_dict(), "key": run_key, "epoch": epoch + 1,
