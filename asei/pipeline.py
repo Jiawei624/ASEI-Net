@@ -11,7 +11,8 @@ import time
 import numpy as np
 import torch
 
-from .config import file_sha256, fingerprint, implementation_fingerprint, resolve_config, TAB_COMMIT, write_json
+from .config import (configure_cuda, file_sha256, fingerprint, implementation_fingerprint,
+                     resolve_config, resolve_paths, TAB_COMMIT, write_json)
 from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
@@ -109,13 +110,16 @@ def load_bundle(path, device="cpu"):
 
 
 def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics=False):
-    config = copy.deepcopy(config)
+    config = resolve_paths(copy.deepcopy(config))
+    configure_cuda(config)
     seed_everything(seed)
     torch.set_num_threads(config["runtime"]["threads"])
     device = get_device(config["runtime"]["device"])
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     train, raw_valid, raw_test, labels, scaler, provenance = load_entity(entity, config["data"]["train_fraction"])
+    if config["data"].get("multivariate_only", True) and train.z.shape[1] < 2:
+        raise ValueError("Multivariate experiments require at least two observed training channels.")
     cfg = resolve_config(config, len(train.z), train.z.shape[1])
     w = cfg["model"]["window"]
     valid = validation_context(train, raw_valid, w, independent=entity.validation_path is not None)

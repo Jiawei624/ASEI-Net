@@ -1,6 +1,10 @@
 data:
-  root: dataset/anomaly_detect
+  # Relative to the ASEI-Net project root: /ASEI-Net/dataset on the server.
+  root: dataset
   manifest: null
+  multivariate_only: true
+  use_prepared_manifest: true
+  archive: TAB_dataset.zip
   train_fraction: 0.8
   datasets: [PSM, SMD, SWAT, GECCO, PUMP]
 model:
@@ -43,7 +47,20 @@ evaluation:
   recovery_confirmation: 8
   latency_points: 256
 runtime:
-  device: auto
+  # Physical GPU 1 is the only visible GPU and is cuda:0 inside this process.
+  cuda_visible_devices: "1"
+  cuda_device_order: PCI_BUS_ID
+  device: cuda:0
   feature_batch_size: 64
   threads: 4
-  output: outputs
+  output: outputs/gpu1
+  log_dir: logs
+  log_file: gpu1_main.log
+  seeds: [0, 1, 2, 3, 4]
+reports:
+  # Relative paths in this section are resolved under runtime.output.
+  inventory: data_inventory.csv
+  eligible_manifest: eligible_manifest.csv
+  summary: summary
+  environment: environment.json
+  predictions: predictions

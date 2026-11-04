@@ -51,18 +51,23 @@ def _dataset(row: dict) -> str | None:
     return None
 
 
-def discover(tab_data: str | Path, manifest=None) -> list[Entity]:
+def metadata_path(tab_data: str | Path, manifest=None) -> Path:
     root = Path(tab_data).resolve()
     if manifest:
-        meta_path = Path(manifest).resolve()
-        base = meta_path.parent
-    else:
-        candidates = [p for p in (root / "DETECT_META.csv", root / "anomaly_detect" / "DETECT_META.csv",
-                                  root / "dataset" / "anomaly_detect" / "DETECT_META.csv") if p.is_file()]
-        if len(candidates) != 1:
-            raise FileNotFoundError("Set --data-root to the folder containing DETECT_META.csv and data/.")
-        meta_path = candidates[0]
-        base = meta_path.parent / "data"
+        path = Path(manifest).resolve()
+        if not path.is_file():
+            raise FileNotFoundError("Metadata manifest not found: " + str(path))
+        return path
+    candidates = [p for p in (root / "DETECT_META.csv", root / "anomaly_detect" / "DETECT_META.csv",
+                              root / "dataset" / "anomaly_detect" / "DETECT_META.csv") if p.is_file()]
+    if len(candidates) != 1:
+        raise FileNotFoundError("data.root must identify one DETECT_META.csv, directly or under anomaly_detect/.")
+    return candidates[0]
+
+
+def discover(tab_data: str | Path, manifest=None, multivariate_only=False) -> list[Entity]:
+    meta_path = metadata_path(tab_data, manifest)
+    base = meta_path.parent if manifest else meta_path.parent / "data"
     meta = pd.read_csv(meta_path)
     if not {"file_name", "train_lens"}.issubset(meta.columns):
         raise ValueError("Metadata requires file_name and train_lens columns.")
@@ -71,8 +76,11 @@ def discover(tab_data: str | Path, manifest=None) -> list[Entity]:
         ds = _dataset(row)
         if ds is None:
             continue
+        if multivariate_only and _bool(row.get("if_univariate", False)):
+            continue
         name = str(row.get("entity", Path(str(row["file_name"])).stem))
-        if not re.fullmatch(r"[\w.\-]+", name) or name in {".", ".."}:
+        # TAB uses '@' in source names such as machine-3-4.test.csv@7.csv.
+        if not re.fullmatch(r"[\w.@\-]+", name) or name in {".", ".."}:
             raise ValueError(f"Unsafe entity identifier: {name}")
         if (ds, name) in seen:
             raise ValueError(f"Duplicate entity {ds}/{name}")
@@ -84,6 +92,13 @@ def discover(tab_data: str | Path, manifest=None) -> list[Entity]:
         file_path = Path(str(row["file_name"] if file_value is None or pd.isna(file_value) else file_value))
         if not file_path.is_absolute():
             file_path = base / file_path
+            if not manifest:
+                # Also accept CSV files adjacent to the metadata, or file_name=data/xxx.csv.
+                adjacent = meta_path.parent / str(row["file_name"] if file_value is None or pd.isna(file_value) else file_value)
+                if adjacent.is_file() and file_path.is_file() and adjacent.resolve() != file_path.resolve():
+                    raise ValueError("Ambiguous data file in both metadata and data directories: " + str(row["file_name"]))
+                if adjacent.is_file():
+                    file_path = adjacent
         val = row.get("validation_path")
         val_path = None if val is None or pd.isna(val) else Path(str(val))
         if val_path and not val_path.is_absolute():

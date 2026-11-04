@@ -3,24 +3,76 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 from pathlib import Path
+import sys
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 TAB_COMMIT = "5a7e6f80c405eed7c4dd1390f69fbba2fd8ddcf2"
+DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
+REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
+                   "summary": "summary", "environment": "environment.json", "predictions": "predictions"}
 
 
-def load_config(path: str | Path) -> dict:
-    with open(path, encoding="utf-8") as stream:
-        cfg = yaml.safe_load(stream)
-    if not isinstance(cfg, dict):
-        raise ValueError("Configuration must be a YAML mapping.")
+def project_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return (path if path.is_absolute() else ROOT / path).resolve()
+
+
+def resolve_paths(cfg: dict) -> dict:
+    """Fixed paths are relative to the project, never to the launch directory."""
+    cfg["data"]["root"] = str(project_path(cfg["data"]["root"]))
+    if cfg["data"].get("manifest"):
+        cfg["data"]["manifest"] = str(project_path(cfg["data"]["manifest"]))
+    runtime = cfg["runtime"]
+    runtime["output"] = str(project_path(runtime["output"]))
+    runtime["log_dir"] = str(project_path(runtime.get("log_dir", "logs")))
+    reports = cfg.setdefault("reports", {})
+    for name, value in REPORT_DEFAULTS.items():
+        reports.setdefault(name, value)
     return cfg
 
 
+def report_path(cfg: dict, name: str, output_root=None) -> Path:
+    path = Path(cfg.get("reports", {}).get(name, REPORT_DEFAULTS[name])).expanduser()
+    root = project_path(output_root if output_root is not None else cfg["runtime"]["output"])
+    return (path if path.is_absolute() else root / path).resolve()
+
+
+def log_path(cfg: dict) -> Path:
+    path = Path(cfg["runtime"].get("log_file", "gpu1_main.log")).expanduser()
+    return (path if path.is_absolute() else project_path(cfg["runtime"]["log_dir"]) / path).resolve()
+
+
+def configure_cuda(cfg: dict):
+    """Apply configured device visibility before CUDA is initialized."""
+    runtime = cfg["runtime"]
+    if str(runtime.get("device", "auto")) == "cpu":
+        return
+    settings = {}
+    if runtime.get("cuda_device_order") is not None:
+        settings["CUDA_DEVICE_ORDER"] = str(runtime["cuda_device_order"])
+    if runtime.get("cuda_visible_devices") is not None:
+        settings["CUDA_VISIBLE_DEVICES"] = str(runtime["cuda_visible_devices"])
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.cuda.is_initialized():
+        if any(os.environ.get(key) != value for key, value in settings.items()):
+            raise RuntimeError("CUDA is already initialized; set GPU visibility in config before starting this process.")
+    os.environ.update(settings)
+
+
+def load_config(path: str | Path) -> dict:
+    with open(project_path(path), encoding="utf-8") as stream:
+        cfg = yaml.safe_load(stream)
+    if not isinstance(cfg, dict):
+        raise ValueError("Configuration must be a YAML mapping.")
+    return resolve_paths(cfg)
+
+
 def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
-    cfg = copy.deepcopy(cfg)
+    cfg = resolve_paths(copy.deepcopy(cfg))
     m = cfg["model"]
     if n_train < 65:
         raise ValueError("At least 65 normal training samples are required.")

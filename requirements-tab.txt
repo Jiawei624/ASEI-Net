@@ -1,4 +1,0 @@
-# Exact NumPy constraint from the pinned TAB source; other runtime rules are shared.
-# Intended for an existing TAB Python 3.8/3.9 environment, not to downgrade Python 3.10+.
--r requirements.txt
-numpy==1.21.0

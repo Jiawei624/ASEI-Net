@@ -1,7 +1,7 @@
 """Read-only check for reusing an existing TAB environment (Python >= 3.8).
 
-No packages are installed, upgraded or downgraded. --check-imports additionally
-checks binary imports, the NumPy/PyTorch bridge and a small CPU model forward.
+No packages are installed, upgraded or downgraded. Reports use the configured
+path. --check-imports also checks binary imports and a small CPU model forward.
 """
 from __future__ import annotations
 
@@ -124,10 +124,11 @@ def check_imports():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", "--config-path", default=str(ROOT / "configs" / "default.yaml"))
     parser.add_argument("--strict-tab", action="store_true", help="Also require TAB's exact numpy==1.21.0 runtime pin")
     parser.add_argument("--check-imports", action="store_true")
     parser.add_argument("--tools", action="store_true", help="Require optional download/test utilities too")
-    parser.add_argument("--output", type=Path, help="Optional JSON report; no environment changes")
+    parser.add_argument("--output", type=Path, help="Override reports.environment; no environment changes")
     args = parser.parse_args()
     source = ROOT / "third_party" / "TAB" / "requirements.txt"
     upstream = requirements(source) if source.is_file() else {}
@@ -154,9 +155,20 @@ def main():
         print("TAB pins numpy==1.21.0; the default reuse profile accepts your newer installed NumPy.")
     for name, row in imports.items():
         print("Import/probe:", name, "ok" if row["ok"] else row["error"])
-    if args.output:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    target = ((args.output if args.output.is_absolute() else ROOT / args.output).resolve()
+              if args.output else None)
+    try:
+        sys.path.insert(0, str(ROOT))
+        from asei.config import load_config, project_path, report_path
+        target = project_path(target) if target else report_path(load_config(args.config), "environment")
+    except ModuleNotFoundError as exc:
+        if exc.name != "yaml":
+            raise
+        print("PyYAML is missing; the configured report path cannot be read until it is installed.")
+    if target:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("Environment report:", target)
     print("Environment check:", "PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

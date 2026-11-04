@@ -1,3 +1,0 @@
-# Optional utilities only. Neither is required for training/evaluation with local data.
-gdown>=5.2
-pytest>=7.0

@@ -5,10 +5,17 @@ __pycache__/
 .compat/
 .test_compat_runs/
 .test_legacy_runs/
+.test_config_runs/
 *.pyc
 data/
 docs/
 dataset/
 outputs/
+tests/
 third_party/TAB/
 *.zip
+In1_2_2.md
+metrics.txt
+README.md
+requirements-tab.txt
+requirements-tools.txt
