@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .config import fingerprint, write_json
+from .compat import load_torch_checkpoint
 from .data import Record
 from .features import extract_features, FeatureSequence
 from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
@@ -208,7 +209,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
             stale += 1
         if stale >= s["patience"]:
             break
-    best_checkpoint = torch.load(directory / "stage1_best.pt", map_location=device, weights_only=True)
+    best_checkpoint = load_torch_checkpoint(directory / "stage1_best.pt", map_location=device)
     model.load_state_dict(best_checkpoint["model"])
     usage = finalize_memory(model, train)
     torch.save({"model": model.state_dict(), "model_config": model.cfg, "key": run_key,
@@ -349,7 +350,7 @@ def fit_detector(detector, representation, cfg, cache_dir, cache_key, directory,
         if stale >= s["patience"]:
             break
     device = next(detector.parameters()).device
-    detector.load_state_dict(torch.load(directory / "detector.pt", map_location=device, weights_only=True)["model"])
+    detector.load_state_dict(load_torch_checkpoint(directory / "detector.pt", map_location=device)["model"])
     seconds = time.perf_counter() - began
     write_json(directory / "stage2_history.json", {"epochs": history, "seconds": seconds,
                                                   "parameters": sum(p.numel() for p in detector.parameters())})

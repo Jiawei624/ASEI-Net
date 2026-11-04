@@ -8,6 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from .data import Record
+from .compat import transformer_encoder
 
 
 def mlp(n_in, hidden, n_out):
@@ -32,8 +33,8 @@ class Descriptor(nn.Module):
         # Input [B,32,C], output [B,C,5], [B,C,32].
         segment = segment.transpose(1, 2)
         mean8, mean32 = segment[..., -8:].mean(-1), segment.mean(-1)
-        var8 = segment[..., -8:].var(-1, correction=0)
-        var32 = segment.var(-1, correction=0)
+        var8 = segment[..., -8:].var(-1, unbiased=False)
+        var32 = segment.var(-1, unbiased=False)
         amp = torch.stack([segment[..., -1], mean8, mean32,
                            (var8 + 1e-4).log(), (var32 + 1e-4).log()], -1)
         shape = (segment - mean32[..., None]) / (var32[..., None] + 1e-4).sqrt()
@@ -79,8 +80,7 @@ class HistoryEncoder(nn.Module):
         self.register_buffer("causal_mask", endpoints[None, :] > endpoints[:, None])
         layer = nn.TransformerEncoderLayer(d_model, heads, 4 * d_model, dropout,
                                            activation="gelu", batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(layer, layers, norm=nn.LayerNorm(d_model),
-                                                 enable_nested_tensor=False)
+        self.transformer = transformer_encoder(layer, layers, nn.LayerNorm(d_model))
 
     def forward(self, history, observed):
         b, w, c = history.shape

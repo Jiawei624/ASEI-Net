@@ -2,8 +2,12 @@ __pycache__/
 .pytest_cache/
 .test_runs/
 .test_pipeline_runs/
+.compat/
+.test_compat_runs/
+.test_legacy_runs/
 *.pyc
 data/
+docs/
 dataset/
 outputs/
 third_party/TAB/

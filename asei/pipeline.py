@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from .config import file_sha256, fingerprint, implementation_fingerprint, resolve_config, TAB_COMMIT, write_json
+from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
 from .metrics import evaluate, threshold_from_normal
@@ -31,7 +32,7 @@ def get_device(name):
 def _load_checkpoint(path, expected_key, device):
     if not Path(path).is_file():
         raise FileNotFoundError(f"Missing prerequisite checkpoint: {path}")
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = load_torch_checkpoint(path, map_location=device)
     if checkpoint["key"] != expected_key:
         raise ValueError(f"Checkpoint configuration/data differ: {path}. Use a new output directory.")
     return checkpoint
@@ -90,7 +91,7 @@ def save_bundle(path, representation, detector, scaler, calibration, cfg, proven
 
 def load_bundle(path, device="cpu"):
     device = get_device(device)
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
+    checkpoint = load_torch_checkpoint(path, map_location=device)
     if checkpoint.get("format") != 1:
         raise ValueError("Unsupported deployment bundle format.")
     model = NormalRepresentation(checkpoint["model_config"]).to(device)
@@ -121,8 +122,13 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     directory = Path(cfg["runtime"]["output"]) / entity.dataset / entity.name / f"seed_{seed}"
     directory.mkdir(parents=True, exist_ok=True)
     code_key = implementation_fingerprint()
+    runtime_packages = {name: metadata.version(name) for name in
+                        ("numpy", "pandas", "torch", "scikit-learn", "scipy", "statsmodels", "PyYAML")}
+    runtime_identity = {"packages": runtime_packages, "python": list(sys.version_info[:2]),
+                        "torch_build": str(torch.__version__)}
     normal_key = fingerprint({"implementation": code_key, "model": cfg["model"], "stage1": cfg["stage1"],
-                              "data": {k: v for k, v in provenance.items() if k != "source"}, "seed": seed})
+                              "data": {k: v for k, v in provenance.items() if k != "source"},
+                              "runtime": runtime_identity, "seed": seed})
     write_json(directory / "resolved_config.json", cfg)
     write_json(directory / "data_provenance.json", provenance)
     representation = NormalRepresentation(cfg["model"]).to(device)
@@ -243,8 +249,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
                                "cuda": torch.version.cuda,
                                "cudnn": torch.backends.cudnn.version(),
                                "accelerator": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-                               "packages": {name: metadata.version(name) for name in
-                                            ("numpy", "pandas", "torch", "scikit-learn", "scipy", "statsmodels", "PyYAML")}},
+                               "packages": runtime_packages},
                "parameters": {"representation": sum(p.numel() for p in representation.parameters()),
                               "detector": sum(p.numel() for p in detector.parameters())}, "config": cfg})
     print(f"saved {detector_dir / 'result.json'}", flush=True)

@@ -26,8 +26,10 @@ def collect(root):
         data = json.loads(path.read_text(encoding="utf-8"))
         if not {"dataset", "entity", "seed", "metrics", "variant"}.issubset(data):
             continue
-        rows.append({k: data[k] for k in ("dataset", "entity", "seed", "variant")} |
-                    flatten_numeric(data["metrics"]) | {"path": str(path)})
+        row = {k: data[k] for k in ("dataset", "entity", "seed", "variant")}
+        row.update(flatten_numeric(data["metrics"]))
+        row["path"] = str(path)
+        rows.append(row)
     if not rows:
         raise ValueError("No completed result.json files found.")
     frame = pd.DataFrame(rows)

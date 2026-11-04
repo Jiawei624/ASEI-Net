@@ -54,3 +54,9 @@ def test_two_stage_checkpoint_calibration_evaluation_and_bundle(tmp_path, tiny_c
         np.testing.assert_array_equal(before, data["scores"])
     summary = aggregate(tmp_path / "outputs", tmp_path / "summary")
     assert (summary / "dataset_summary.csv").is_file()
+    # A changed numerical runtime must not silently reuse old checkpoints or features.
+    from importlib import metadata
+    version = metadata.version
+    monkeypatch.setattr(metadata, "version", lambda name: version(name) + ".changed" if name == "torch" else version(name))
+    with pytest.raises(ValueError, match="Checkpoint configuration/data differ"):
+        run_entity(entity, tiny_config, 0, stage="evaluate")

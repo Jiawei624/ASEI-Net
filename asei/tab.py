@@ -31,8 +31,10 @@ def activate_tab(path: str | Path | None = None) -> Path:
         sys.path.insert(0, str(path))
     loaded = sys.modules.get("ts_benchmark")
     if loaded and getattr(loaded, "__file__", None):
-        if not Path(loaded.__file__).resolve().is_relative_to(path):
-            raise RuntimeError("Another ts_benchmark package is already loaded.")
+        try:
+            Path(loaded.__file__).resolve().relative_to(path)
+        except ValueError as exc:
+            raise RuntimeError("Another ts_benchmark package is already loaded.") from exc
     return path
 
 

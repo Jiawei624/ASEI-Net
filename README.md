@@ -6,20 +6,41 @@
 
 ## 环境
 
-使用 Python 3.10 或更新版本，在项目根目录执行：
+优先复用已有 TAB 环境，支持 Python 3.8 及以上。先在项目根目录执行只读检查；检查不会安装、升级或降级任何包：
 
 ```bash
-python -m pip install -r requirements.txt
+python scripts/check_environment.py --check-imports
+```
+
+显示 `Environment check: PASSED` 后，可以直接准备 TAB 源码并运行后续命令，无需重新创建环境或重装 PyTorch：
+
+```bash
 python scripts/bootstrap_tab.py
 ```
 
-本地指定环境为：
+运行依赖采用 TAB 的对应要求：`torch>=1.11.0`、`statsmodels>=0.14.0`、`tqdm>=4.64.0`；pandas、SciPy、scikit-learn 沿用已安装版本。默认 `requirements.txt` 将 NumPy 要求设为 `>=1.21.0`，接受 TAB 的 `1.21.0`，同时保留现代环境已有的较新版本。YAML 配置读取额外需要 `PyYAML>=5.1`。
 
-```powershell
-& 'E:\Miniconda3\Scripts\conda.exe' run -n codex python -m pytest -q tests
+只有检查显示缺少运行依赖时，才补装缺失包。例如仅缺 PyYAML：
+
+```bash
+python -m pip install --no-deps "PyYAML>=5.1"
 ```
 
-服务器上使用对应的 Python 环境。GPU 训练需要该环境的 PyTorch 能识别 CUDA。默认 `device: auto`，也可传入 `--device cuda:0`。代码不依赖 TAB 的整个基线依赖列表。
+新环境可安装 `requirements.txt`；已有 TAB 环境建议先检查，不执行全量重装。若明确需要 TAB 原始 `numpy==1.21.0` 固定值，使用 `requirements-tab.txt` 或 `--strict-tab` 检查。这适用于 Python 3.8/3.9 的 TAB 环境；Python 3.10+ 不应为此强装 NumPy 1.21.0。详细版本对应见 [依赖兼容说明](docs/dependency_compatibility.md)。
+
+下载工具和测试工具单列，不是训练依赖：
+
+```bash
+python -m pip install -r requirements-tools.txt
+```
+
+已有本地 `codex` 环境可以直接检查：
+
+```powershell
+& 'E:\Miniconda3\Scripts\conda.exe' run -n codex python scripts/check_environment.py --check-imports
+```
+
+服务器上激活已有的 TAB 环境即可。GPU 训练需要其中的 PyTorch 能识别 CUDA。默认 `device: auto`，也可传入 `--device cuda:0`。代码不依赖 TAB 的整个基线依赖列表，检查报告中的 `gdown=missing` 仅影响下载脚本，不影响使用本地数据训练。
 
 TAB 固定提交为 `5a7e6f80c405eed7c4dd1390f69fbba2fd8ddcf2`。`bootstrap_tab.py` 下载该版本；本项目不修改其源码。
 
@@ -31,7 +52,7 @@ TAB 固定提交为 `5a7e6f80c405eed7c4dd1390f69fbba2fd8ddcf2`。`bootstrap_tab.
 python scripts/download_tab.py --output dataset/TAB_dataset.zip
 ```
 
-解压后，将 `--data-root` 指向包含以下结构的目录：
+下载脚本需要可选的 gdown；已有本地数据时可直接跳过下载。解压后，将 `--data-root` 指向包含以下结构的目录：
 
 ```text
 dataset/anomaly_detect/

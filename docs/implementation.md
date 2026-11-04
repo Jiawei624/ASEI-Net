@@ -2,6 +2,8 @@
 
 本项目实现 `In1_2_2.md` 的正常参照与双轨迹状态对齐结构。候选数据范围采用 `dataset.txt`，指标接口依据 `metrics.txt` 并核对 TAB 提交 `5a7e6f80c405eed7c4dd1390f69fbba2fd8ddcf2`。原方案正文不作修改。
 
+运行环境优先复用 TAB，Python 下限为 3.8、PyTorch 下限为 1.11。NumPy 等共享库沿用实际 TAB 环境版本，运行与可选工具依赖分别声明，具体要求见 [依赖兼容说明](dependency_compatibility.md)。
+
 ## 机制与代码
 
 | 方案模块 | 实现 | 约束 |

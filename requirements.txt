@@ -1,10 +1,13 @@
-numpy>=1.24,<3
-pandas>=2.0,<3
-torch>=2.2,<3
-scikit-learn>=1.3,<2
-scipy>=1.10,<2
-statsmodels>=0.14,<1
-PyYAML>=6.0,<7
-tqdm>=4.66,<5
-gdown>=5.2,<6
-pytest>=8,<10
+# Runtime subset of TAB's requirements. Existing satisfying packages are reused.
+# TAB pins numpy==1.21.0; allow newer installed NumPy here to avoid downgrades.
+# Use requirements-tab.txt only when the exact TAB NumPy pin is desired.
+numpy>=1.21.0
+pandas
+torch>=1.11.0
+scikit-learn
+scipy
+statsmodels>=0.14.0
+tqdm>=4.64.0
+
+# ASEI-Net's YAML configuration reader (usually already present in TAB environments).
+PyYAML>=5.1
