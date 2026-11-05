@@ -16,9 +16,11 @@ docs/
 dataset/
 outputs/
 tests/
+logs/
 *.zip
 In1_2_2.md
 metrics.txt
 README.md
 requirements-strict.txt
 requirements-tools.txt
+PROJECT_CONTEXT.md

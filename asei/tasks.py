@@ -66,7 +66,10 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
     max_span = min(available, 128 + layout * 4 * window + 64 + window + 128)
     suffix = min(window + 128, max(1, (max_span - min_total) // 2))
     prefix = min(128, max(0, (max_span - suffix - min_total) // 3))
-    for attempt in range(80):
+    # Keep the original draws for tasks that already succeed, including cached
+    # prefixes. Sparse actuator changes need a second pass over variable channels.
+    for attempt in range(160):
+        variable_fallback = attempt >= 80 and family in {"temporal", "relation"}
         gap_options = [g for g in (4, 16, 64) if g + layout * min_event + suffix + prefix <= max_span]
         gap = int(rng.choice(gap_options)) if layout == 2 else 0
         budget = (max_span - suffix - prefix - gap) // layout
@@ -74,7 +77,10 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
                           if min_event <= l <= budget and (family != "relation" or l <= len(donor.z))})
         if not choices:
             raise ValueError("Normal record too short for configured task layout.")
-        lengths = [int(rng.choice(choices)) for _ in range(layout)]
+        # Short complete spans remain usable when missing observations prevent
+        # longer events. Four points is already in the configured duration grid.
+        lengths = ([min_event] * layout if variable_fallback and attempt >= 120
+                   else [int(rng.choice(choices)) for _ in range(layout)])
         span = prefix + sum(lengths) + gap + suffix
         target_origin = int(rng.integers(target_begin, len(source.z) - span + 1))
         origin, stop = target_origin - window, target_origin + span
@@ -85,6 +91,10 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
         for length in lengths:
             end = start + length
             eligible = np.flatnonzero(masks[start:end].all(0))
+            if variable_fallback and len(eligible):
+                local = clean[start:end, eligible]
+                eligible = eligible[(np.ptp(local, axis=0) > 1e-6)
+                                    & (local.std(axis=0, dtype=np.float64) > 1e-6)]
             if len(eligible) == 0:
                 failed = True
                 break
@@ -119,10 +129,17 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
                     donor_start = int(rng.integers(0, len(donor.z) - length + 1))
                     if donor.mask[donor_start:donor_start + length, affected].all():
                         shape = donor.z[donor_start:donor_start + length, affected].copy()
-                        ds, rs = shape.std(0), reference.std(0)
+                        if variable_fallback:
+                            # Compute moments in float64 for almost-flat sensors.
+                            shape = shape.astype(np.float64)
+                            matched = reference.astype(np.float64)
+                        else:
+                            matched = reference
+                        ds, rs = shape.std(0), matched.std(0)
                         if (ds > 1e-6).all() and (rs > 1e-6).all():
-                            replacement = (shape - shape.mean(0)) / ds * rs + reference.mean(0)
-                            break
+                            replacement = ((shape - shape.mean(0)) / ds * rs + matched.mean(0)).astype(reference.dtype)
+                            if not variable_fallback or np.any(np.abs(replacement - reference) > 1e-6):
+                                break
             changed = np.any(np.abs(replacement - reference) > 1e-6)
             if not changed:
                 failed = True
@@ -143,5 +160,9 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
         recipe = {"seed": seed, "index": index, "family": family, "layout": layout,
                   "source_start": origin, "source_stop": stop, "prefix": prefix,
                   "recovery_suffix": suffix, "events": recipes, "attempt": attempt}
+        if attempt >= 80:
+            recipe["fallback"] = "variable_channels" if variable_fallback else "additional_attempts"
         return TaskPair(Record(clean, masks.copy(), window), Record(corrupt, masks, window), labels, recipe)
-    raise ValueError(f"Cannot construct a changed {family} task from observed normal data; inspect constant/missing channels.")
+    raise ValueError(f"Cannot construct a changed {family} task from observed normal data "
+                     f"(seed={seed}, index={index}, attempts=160); this task needs observed, "
+                     "locally varying channels and, for relation tasks, a usable normal donor.")
