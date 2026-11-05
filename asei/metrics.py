@@ -3,7 +3,6 @@ from __future__ import annotations
 import warnings
 
 import numpy as np
-from sklearn import metrics as skmetrics
 
 from .tasks import event_ranges
 
@@ -11,6 +10,16 @@ LABEL_METRICS = {"accuracy", "precision", "recall", "f_score", "adjust_accuracy"
                  "adjust_recall", "adjust_f_score", "rprecision", "rrecall", "rf", "precision_at_k",
                  "affiliation_precision", "affiliation_recall", "affiliation_f", "add"}
 SCORE_METRICS = {"auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR"}
+POINT_ADJUSTED_METRICS = {"adjust_accuracy", "adjust_precision", "adjust_recall", "adjust_f_score"}
+REGRESSION_METRICS = {"mae", "mse", "rmse", "mape", "smape", "mase", "wape", "msmape",
+                      "mae_norm", "mse_norm", "rmse_norm", "mape_norm", "smape_norm", "mase_norm",
+                      "wape_norm", "msmape_norm"}
+
+
+def point_adjusted_predictions(actual, predicted):
+    actual, predicted = _binary_pair(actual, predicted)
+    from .evaluation.classification_metrics_label import adjust_predicts
+    return adjust_predicts(actual, predicted)
 
 
 def threshold_from_normal(scores, alpha=0.01):
@@ -101,20 +110,30 @@ def label_metrics(actual, predicted, names, errors):
         raise ValueError(f"Unsupported label metrics: {unknown}")
     from .evaluation import classification_metrics_label as module
     result = {}
-    both_classes = len(np.unique(actual)) == 2
+    actual, predicted = _binary_pair(actual, predicted)
+    adjusted = None
+    shared = {}
+    range_index = {"rrecall": 4, "rprecision": 7, "rf": 8, "precision_at_k": 9}
+
+    def native_value(name):
+        if name in range_index:
+            if "range" not in shared:
+                shared["range"] = module.metricor_grader.metric_new(actual.copy(), predicted.copy(), plot_ROC=False)
+            return shared["range"][range_index[name]]
+        return getattr(module, name)(actual.copy(), predicted.copy())
     for name in names:
         if name == "add":
-            result[name] = add(actual, predicted)
-        elif not both_classes and name in {"precision", "recall", "f_score"}:
-            function = {"precision": skmetrics.precision_score, "recall": skmetrics.recall_score,
-                        "f_score": skmetrics.f1_score}[name]
-            result[name] = float(function(actual, predicted, zero_division=0))
-            errors[name] = "Single-class input: use sklearn's explicit positive-class definition."
+            result[name] = _safe_metric(name, lambda: add(actual, predicted), errors)
+        elif name in POINT_ADJUSTED_METRICS:
+            if adjusted is None:
+                adjusted = point_adjusted_predictions(actual, predicted)
+            base = name[len("adjust_"):]
+            result[name] = _safe_metric(name, lambda n=base: getattr(module, n)(actual, adjusted), errors)
         elif not actual.any() and (name.startswith("affiliation") or name in {"rprecision", "rrecall", "rf", "precision_at_k"}):
             result[name] = float("nan")
             errors[name] = "No ground-truth anomaly event."
         else:
-            result[name] = _safe_metric(name, lambda n=name: getattr(module, n)(actual.copy(), predicted.copy()), errors)
+            result[name] = _safe_metric(name, lambda n=name: native_value(n), errors)
     return result
 
 
@@ -177,18 +196,18 @@ def evaluate(actual, scores, valid, threshold, cfg):
             "event": event_metrics(actual, predicted, valid, cfg["recovery_confirmation"]),
             "undefined_or_warnings": errors,
             "score_convention": "Full time axis; unavailable scores rank below all finite scores. Ready AP/AUC use observed ready points only.",
-            "point_adjustment_in_primary_metrics": False}, predicted
+            "point_adjustment_in_primary_metrics": bool(POINT_ADJUSTED_METRICS.intersection(labels)),
+            "label_convention": "Only adjust_* metrics use point-adjusted alarms; other label metrics and ADD use original alarms."}, predicted
 
 
 def regression_metrics(actual, predicted, names=("mae", "mse", "rmse"), **kwargs):
-    """Optional forecasting diagnostics; these are not anomaly-detection metrics."""
+    """Forecasting metrics on observed values; inputs retain their channel schema."""
     from .evaluation import regression_metrics as module
     if set(names) - set(module.__all__):
         raise ValueError("Unknown regression metric.")
+    actual, predicted = np.asarray(actual, np.float64), np.asarray(predicted, np.float64)
+    if actual.shape != predicted.shape or actual.ndim not in (1, 2) or not actual.size:
+        raise ValueError("Regression metrics require nonempty, equally shaped one- or two-dimensional arrays.")
     errors = {}
     result = {n: _safe_metric(n, lambda k=n: getattr(module, k)(actual, predicted, **kwargs), errors) for n in names}
-    for n in names:
-        if n.startswith("mase") and kwargs.get("seasonality", 2) == 2:
-            result[n] = float("nan")
-            errors[n] = "Default seasonality=2 returns the sentinel -1; supply an explicit different seasonality."
     return result, errors

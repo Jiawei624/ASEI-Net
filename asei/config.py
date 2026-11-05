@@ -142,6 +142,15 @@ def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
         raise ValueError("Invalid fixed retention or validation seeds.")
     if set(s2.get("sources", [])) - {"relation", "marginal", "joint"}:
         raise ValueError("Unknown detector evidence source.")
+    from .metrics import LABEL_METRICS, SCORE_METRICS, REGRESSION_METRICS
+    for key, allowed in (("label_metrics", LABEL_METRICS), ("supplementary_label_metrics", LABEL_METRICS),
+                         ("score_metrics", SCORE_METRICS), ("regression_metrics", REGRESSION_METRICS)):
+        names = cfg["evaluation"].get(key, [])
+        if not isinstance(names, (list, tuple)) or any(name not in allowed for name in names):
+            raise ValueError("evaluation." + key + " must contain supported metric names.")
+    seasonality = cfg["evaluation"].get("regression_seasonality", 1)
+    if isinstance(seasonality, bool) or not isinstance(seasonality, int) or not 0 < seasonality < n_train:
+        raise ValueError("evaluation.regression_seasonality must be a positive integer shorter than normal training history.")
     return cfg
 
 

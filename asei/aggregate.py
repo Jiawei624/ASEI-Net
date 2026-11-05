@@ -16,8 +16,10 @@ def flatten_numeric(data, prefix=""):
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, dict):
             result.update(flatten_numeric(value, name))
-        elif isinstance(value, (int, float)) and not isinstance(value, bool) and np.isfinite(value):
-            result[name] = value
+        elif value is None:
+            result[name] = float("nan")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            result[name] = value if np.isfinite(value) else float("nan")
     return result
 
 

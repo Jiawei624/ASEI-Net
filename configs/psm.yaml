@@ -59,9 +59,14 @@ evaluation:
   - precision
   - recall
   - f_score
+  - adjust_accuracy
+  - adjust_precision
+  - adjust_recall
+  - adjust_f_score
   - rprecision
   - rrecall
   - rf
+  - precision_at_k
   - affiliation_precision
   - affiliation_recall
   - affiliation_f
@@ -74,6 +79,8 @@ evaluation:
   - VUS_ROC
   - VUS_PR
   supplementary_label_metrics: []
+  regression_metrics: [mae, mse, rmse, mape, smape, mase, wape, msmape, mae_norm, mse_norm, rmse_norm, mape_norm, smape_norm, mase_norm, wape_norm, msmape_norm]
+  regression_seasonality: 1
   recovery_confirmation: 8
   latency_points: 256
 runtime:

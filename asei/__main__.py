@@ -31,6 +31,7 @@ def main():
             p.add_argument("--sources", nargs="*", choices=["relation", "marginal", "joint"])
             p.add_argument("--skip-vus", action="store_true")
             p.add_argument("--all-label-metrics", "--all-tab-label-metrics", action="store_true")
+            p.add_argument("--all-metrics", action="store_true", help="Compute every label, score and forecast metric listed in metrics.txt")
             p.add_argument("--diagnostics", action="store_true")
             p.add_argument("--log", action="store_true", help="Append training output to the configured log filename with its run timestamp")
         else:
@@ -126,10 +127,15 @@ def execute(args, cfg):
         cfg["stage2"]["variant"] = args.variant
     if args.sources is not None:
         cfg["stage2"]["sources"] = args.sources
+    if args.all_metrics or args.all_label_metrics:
+        from .metrics import LABEL_METRICS, SCORE_METRICS, REGRESSION_METRICS
+        cfg["evaluation"]["label_metrics"] = sorted(LABEL_METRICS)
+        if args.all_metrics:
+            cfg["evaluation"]["score_metrics"] = sorted(SCORE_METRICS)
+            cfg["evaluation"]["regression_metrics"] = sorted(REGRESSION_METRICS)
+            cfg["evaluation"].setdefault("regression_seasonality", 1)
     if args.skip_vus:
         cfg["evaluation"]["score_metrics"] = [m for m in cfg["evaluation"]["score_metrics"] if not m.startswith("VUS_")]
-    if args.all_label_metrics:
-        cfg["evaluation"]["supplementary_label_metrics"] = ["adjust_accuracy", "adjust_precision", "adjust_recall", "adjust_f_score", "precision_at_k"]
     seeds = args.seeds if args.seeds is not None else cfg["runtime"].get("seeds", [41, 42, 43, 44, 45])
     if args.stage not in {"all", "representation"} and not args.resume:
         raise ValueError("--stage " + args.stage + " requires --resume <run_id>; use --resume legacy for older results.")

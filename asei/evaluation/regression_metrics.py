@@ -35,24 +35,27 @@ def mase(
     actual: np.ndarray,
     predicted: np.ndarray,
     hist_data: np.ndarray,
-    seasonality: int = 2,
+    seasonality: int = 1,
     **kwargs
 ):
     """
     Mean Absolute Scaled Error
     Baseline (benchmark) is computed with naive forecasting (shifted by @seasonality)
     """
-    if seasonality == 2:
-        return -1
-    scale = len(predicted) / (len(hist_data) - seasonality)
-
-    dif = 0
-    for i in range((seasonality + 1), len(hist_data)):
-        dif = dif + abs(hist_data[i] - hist_data[i - seasonality])
-
-    scale = scale * dif
-
-    return (sum(abs(actual - predicted)) / scale)[0]
+    actual, predicted, history = (np.asarray(x, dtype=np.float64) for x in (actual, predicted, hist_data))
+    if actual.shape != predicted.shape or not actual.size or actual.ndim not in (1, 2):
+        raise ValueError("MASE requires equally shaped nonempty forecast and target arrays.")
+    if history.ndim != actual.ndim or history.shape[1:] != actual.shape[1:]:
+        raise ValueError("MASE history must preserve the forecast channel schema.")
+    if isinstance(seasonality, bool) or not isinstance(seasonality, (int, np.integer)) or not 0 < seasonality < len(history):
+        raise ValueError("MASE seasonality must be a positive integer shorter than the training history.")
+    differences = np.abs(history[seasonality:] - history[:-seasonality])
+    observed = np.isfinite(differences)
+    counts = observed.sum(axis=0)
+    scale = np.divide(np.where(observed, differences, 0).sum(axis=0), counts,
+                      out=np.full_like(counts, np.nan, dtype=np.float64), where=counts > 0)
+    scale = np.where(scale > 0, scale, np.nan)
+    return np.mean(np.abs(actual - predicted) / scale)
 
 
 def mape(actual: np.ndarray, predicted: np.ndarray, **kwargs):
@@ -100,8 +103,7 @@ def msmape(actual: np.ndarray, predicted: np.ndarray, epsilon: float = 0.1, **kw
     test_set - a matrix with the same dimensions as 'forecasts' containing the actual values corresponding with them
     """
 
-    comparator = np.full_like(actual, 0.5 + epsilon)
-    denom = np.maximum(comparator, np.abs(predicted) + np.abs(actual) + epsilon)
+    denom = np.maximum(0.5 + epsilon, np.abs(predicted) + np.abs(actual) + epsilon)
     msmape_per_series = np.mean(2 * np.abs(predicted - actual) / denom) * 100
     return msmape_per_series
 
@@ -137,7 +139,7 @@ def mase_norm(
     predicted: np.ndarray,
     scaler: object,
     hist_data: np.ndarray,
-    seasonality: int = 2,
+    seasonality: int = 1,
     **kwargs
 ):
     """
@@ -147,17 +149,7 @@ def mase_norm(
     actual = scaler.transform(actual)
     predicted = scaler.transform(predicted)
     hist_data = scaler.transform(hist_data)
-    if seasonality == 2:
-        return -1
-    scale = len(predicted) / (len(hist_data) - seasonality)
-
-    dif = 0
-    for i in range((seasonality + 1), len(hist_data)):
-        dif = dif + abs(hist_data[i] - hist_data[i - seasonality])
-
-    scale = scale * dif
-
-    return (sum(abs(actual - predicted)) / scale)[0]
+    return mase(actual, predicted, hist_data, seasonality=seasonality)
 
 
 def mape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, **kwargs):
@@ -210,7 +202,6 @@ def msmape_norm(actual: np.ndarray, predicted: np.ndarray, scaler: object, epsil
     """
     actual = scaler.transform(actual)
     predicted = scaler.transform(predicted)
-    comparator = np.full_like(actual, 0.5 + epsilon)
-    denom = np.maximum(comparator, np.abs(predicted) + np.abs(actual) + epsilon)
+    denom = np.maximum(0.5 + epsilon, np.abs(predicted) + np.abs(actual) + epsilon)
     msmape_per_series = np.mean(2 * np.abs(predicted - actual) / denom) * 100
     return msmape_per_series

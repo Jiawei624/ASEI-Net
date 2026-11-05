@@ -16,7 +16,8 @@ from .config import (configure_cuda, file_sha256, fingerprint, implementation_fi
 from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
-from .metrics import evaluate, threshold_from_normal
+from .metrics import evaluate, threshold_from_normal, point_adjusted_predictions
+from .forecast_metrics import evaluate_forecasts
 from .model import NormalRepresentation, DualTrajectoryDetector
 from .training import build_task_cache, fit_representation, fit_detector, seed_everything
 from .resources import configure_cpu
@@ -255,6 +256,12 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     scores, ready = output["scores"][test_start:], output["valid"][test_start:]
     inference_seconds = time.perf_counter() - inference_start
     results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])
+    forecast_diagnostics = None
+    regression_names = cfg["evaluation"].get("regression_metrics", [])
+    if regression_names:
+        results["regression"], forecast_diagnostics = evaluate_forecasts(
+            features, train, scaler, regression_names, test_start,
+            cfg["evaluation"].get("regression_seasonality", 1), provenance["channels"])
     sensitivity = []
     for point in calibration["sensitivity"]:
         from .metrics import event_metrics
@@ -277,6 +284,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     measured_training = [timings[k] for k in ("stage1_seconds", "stage2_seconds", "cache_preparation_seconds")]
     timings["total_training_seconds"] = sum(measured_training) if all(v is not None for v in measured_training) else None
     prediction_data = {"scores": scores, "valid": ready, "alarms": alarms, "labels": labels,
+                       "point_adjusted_alarms": point_adjusted_predictions(labels, alarms),
                        "attribution": output["attribution"][test_start:]}
     if diagnostics:
         prediction_data.update({k: output[k][test_start:] for k in
@@ -286,6 +294,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
                "run_id": cfg["runtime"]["run_id"], "run_created_ns": cfg["runtime"]["run_created_ns"],
                "variant": variant_name, "model_key": detector_key, "implementation_key": code_key,
                "test_points": len(labels), "calibration": calibration, "metrics": results,
+               "forecast_diagnostics": forecast_diagnostics,
                "sensitivity": sensitivity, "timing": timings,
                "environment": {"python": sys.version, "torch": torch.__version__, "numpy": np.__version__,
                                "platform": platform.platform(), "device": str(device),

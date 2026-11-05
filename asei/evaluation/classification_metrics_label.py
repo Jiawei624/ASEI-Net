@@ -24,6 +24,7 @@ __all__ = [
     "affiliation_f",
     "affiliation_precision",
     "affiliation_recall",
+    "add",
 ]
 
 
@@ -74,27 +75,15 @@ def adjust_predicts(actual: np.ndarray, predicted: np.ndarray, **kwargs) -> np.n
 
 
 def adjust_precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    predicted = adjust_predicts(actual, predicted)
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Precision[1]
+    return precision(actual, adjust_predicts(actual, predicted))
 
 
 def adjust_recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    predicted = adjust_predicts(actual, predicted)
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Recall[1]
+    return recall(actual, adjust_predicts(actual, predicted))
 
 
 def adjust_f_score(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    predicted = adjust_predicts(actual, predicted)
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return F[1]
+    return f_score(actual, adjust_predicts(actual, predicted))
 
 
 def adjust_accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):
@@ -104,24 +93,20 @@ def adjust_accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 
 
 def precision(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Precision[1]
+    return metrics.precision_score(actual, predicted, pos_label=1, zero_division=0)
 
 
 def recall(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return Recall[1]
+    return metrics.recall_score(actual, predicted, pos_label=1, zero_division=0)
 
 
 def f_score(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-        actual, predicted, zero_division=0
-    )
-    return F[1]
+    return metrics.f1_score(actual, predicted, pos_label=1, zero_division=0)
+
+
+def add(actual: np.ndarray, predicted: np.ndarray, **kwargs):
+    from ..metrics import add as detection_delay
+    return detection_delay(actual, predicted)
 
 
 def accuracy(actual: np.ndarray, predicted: np.ndarray, **kwargs):

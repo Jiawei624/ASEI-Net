@@ -124,10 +124,14 @@ class metricor:
             return None
 
         # area under curve
-        auc = metrics.roc_auc_score(label, score)
+        both_classes = len(np.unique(label)) == 2
+        auc = metrics.roc_auc_score(label, score) if both_classes else float("nan")
         # plor ROC curve
         if plot_ROC:
-            fpr, tpr, thresholds = metrics.roc_curve(label, score)
+            if both_classes:
+                fpr, tpr, thresholds = metrics.roc_curve(label, score)
+            else:
+                fpr = tpr = np.array([np.nan])
             # display = metrics.RocCurveDisplay(fpr=fpr, tpr=tpr, roc_auc=auc)
             # display.plot()
 
@@ -135,11 +139,11 @@ class metricor:
         preds = score
         # preds = score > (np.mean(score) + 3 * np.std(score))
         Precision, Recall, F, Support = metrics.precision_recall_fscore_support(
-            label, preds, zero_division=0
+            label, preds, labels=[1], zero_division=0
         )
-        precision = Precision[1]
-        recall = Recall[1]
-        f = F[1]
+        precision = Precision[0]
+        recall = Recall[0]
+        f = F[0]
 
         # range anomaly
         Rrecall, ExistenceReward, OverlapReward = self.range_recall_new(

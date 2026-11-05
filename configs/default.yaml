@@ -41,8 +41,10 @@ calibration:
   alpha: 0.01
   sensitivity_alphas: [0.005, 0.001]
 evaluation:
-  label_metrics: [accuracy, precision, recall, f_score, rprecision, rrecall, rf, affiliation_precision, affiliation_recall, affiliation_f, add]
+  label_metrics: [accuracy, precision, recall, f_score, adjust_accuracy, adjust_precision, adjust_recall, adjust_f_score, rprecision, rrecall, rf, precision_at_k, affiliation_precision, affiliation_recall, affiliation_f, add]
   score_metrics: [auc_roc, auc_pr, R_AUC_ROC, R_AUC_PR, VUS_ROC, VUS_PR]
+  regression_metrics: [mae, mse, rmse, mape, smape, mase, wape, msmape, mae_norm, mse_norm, rmse_norm, mape_norm, smape_norm, mase_norm, wape_norm, msmape_norm]
+  regression_seasonality: 1
   supplementary_label_metrics: []
   recovery_confirmation: 8
   latency_points: 256
