@@ -1,0 +1,65 @@
+data:
+  root: dataset
+  manifest: null
+  multivariate_only: true
+  use_prepared_manifest: true
+  archive: TAB_dataset.zip
+  train_fraction: 0.8
+  datasets: [SWAT]
+model:
+  window: auto
+  d_model: auto
+  heads: 4
+  layers: 2
+  dropout: 0.1
+  marginal_prototypes: auto
+  joint_prototypes: auto
+stage1:
+  epochs: 80
+  batch_size: 128
+  lr: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  patience: 10
+  stride: 1
+  workers: 0
+stage2:
+  epochs: 50
+  batch_pairs: 8
+  lr: 0.001
+  patience: 8
+  block_length: 256
+  train_pairs: auto
+  validation_pairs: 128
+  validation_seeds: [1001, 1002]
+  families: [level, variance, temporal, relation]
+  variant: full
+  sources: [relation, marginal, joint]
+  fixed_retention: 0.9
+calibration:
+  alpha: 0.01
+  sensitivity_alphas: [0.005, 0.001]
+evaluation:
+  label_metrics: [accuracy, precision, recall, f_score, rprecision, rrecall, rf, affiliation_precision, affiliation_recall, affiliation_f, add]
+  score_metrics: [auc_roc, auc_pr, R_AUC_ROC, R_AUC_PR, VUS_ROC, VUS_PR]
+  supplementary_label_metrics: []
+  recovery_confirmation: 8
+  latency_points: 256
+runtime:
+  # Physical GPU 0 is the only visible GPU and is cuda:0 inside this process.
+  cuda_visible_devices: "0"
+  cuda_device_order: PCI_BUS_ID
+  device: cuda:0
+  feature_batch_size: 64
+  threads: 4
+  output: outputs
+  log_dir: logs
+  log_file: swat.log
+  log_interval_seconds: 300
+  seeds: [0, 1, 2, 3, 4]
+reports:
+  inventory: data_inventory.csv
+  eligible_manifest: eligible_manifest.csv
+  summary: summary
+  environment: environment.json
+  predictions: predictions
