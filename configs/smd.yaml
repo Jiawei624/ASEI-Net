@@ -19,7 +19,7 @@ model:
   joint_prototypes: 256
 stage1:
   epochs: 80
-  batch_size: 96
+  batch_size: 192
   lr: 0.0003
   weight_decay: 0.0001
   warmup_epochs: 5
@@ -28,7 +28,7 @@ stage1:
   workers: 4
 stage2:
   epochs: 50
-  batch_pairs: 24
+  batch_pairs: 32
   lr: 0.001
   patience: 8
   block_length: 256
@@ -87,7 +87,7 @@ runtime:
   cuda_visible_devices: '1'
   cuda_device_order: PCI_BUS_ID
   device: cuda:0
-  feature_batch_size: 192
+  feature_batch_size: 384
   threads: 4
   interop_threads: 1
   cpu_cores: 8
