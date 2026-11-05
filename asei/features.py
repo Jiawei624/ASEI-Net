@@ -44,15 +44,16 @@ class FeatureSequence:
                 "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
                 "observed": torch.as_tensor(self.mask[indices], device=device), "prediction_ready": ready}
 
-    def save(self, path, key):
+    def save(self, path, key, compressed=True):
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(".tmp")
         with open(temporary, "wb") as stream:
-            np.savez_compressed(stream, z=self.z, mask=self.mask, prediction=self.prediction,
-                                marginal_index=self.marginal_index, joint_index=self.joint_index,
-                                window=np.int64(self.window), labels=self.labels if self.labels is not None else [],
-                                weights=self.weights if self.weights is not None else [], key=np.array(key))
+            writer = np.savez_compressed if compressed else np.savez
+            writer(stream, z=self.z, mask=self.mask, prediction=self.prediction,
+                   marginal_index=self.marginal_index, joint_index=self.joint_index,
+                   window=np.int64(self.window), labels=self.labels if self.labels is not None else [],
+                   weights=self.weights if self.weights is not None else [], key=np.array(key))
         temporary.replace(path)
 
     @classmethod
@@ -64,6 +65,49 @@ class FeatureSequence:
                        data["joint_index"], int(data["window"]),
                        data["labels"] if data["labels"].size else None,
                        data["weights"] if data["weights"].size else None)
+
+
+@torch.no_grad()
+def batch_feature_blocks(sequences, start, stop, model):
+    """Assemble a padded CPU block and transfer each feature array once."""
+    batch, length, channels = len(sequences), stop - start, sequences[0].z.shape[1]
+    context = np.zeros((batch, length + 31, channels), np.float32)
+    observed = np.zeros((batch, length, channels), bool)
+    ready = np.zeros_like(observed)
+    present = np.zeros((batch, length), bool)
+    current = np.zeros((batch, length, channels), np.float32)
+    prediction = np.zeros((batch, length, channels, 2), np.float32)
+    mi = np.full((batch, length, channels), -1, np.int64)
+    ji = np.full((batch, length), -1, np.int64)
+    for i, sequence in enumerate(sequences):
+        indices = np.arange(start, min(stop, len(sequence)))
+        n = len(indices)
+        if not n:
+            continue
+        left, right = max(0, start - 31), min(stop, len(sequence))
+        offset = left - (start - 31)
+        context[i, offset:offset + right - left] = sequence.z[left:right]
+        current[i, :n], observed[i, :n] = sequence.z[indices], sequence.mask[indices]
+        prediction[i, :n] = sequence.prediction[indices]
+        mi[i, :n], ji[i, :n] = sequence.marginal_index[indices], sequence.joint_index[indices]
+        ready[i, :n] = (indices >= sequence.window)[:, None]
+        present[i, :n] = True
+    device = next(model.parameters()).device
+    # Transfer the context once; materialize overlapping descriptor windows on GPU.
+    segments = torch.as_tensor(context, device=device).unfold(1, 32, 1).transpose(-1, -2).contiguous()
+    chi = model.descriptor(segments.reshape(-1, 32, channels))
+    chi = chi.reshape(batch, length, channels, 37)
+    chi *= torch.as_tensor(present, device=device)[..., None, None]
+    rm, rj, mv, jv = model.memory.references(torch.as_tensor(mi.reshape(-1, channels), device=device),
+                                           torch.as_tensor(ji.reshape(-1), device=device))
+    pred = torch.as_tensor(prediction, device=device)
+    return {"chi": chi, "prediction": pred,
+            "residual": torch.as_tensor(current, device=device)[..., None] - pred,
+            "marginal": rm.reshape(batch, length, channels, 37),
+            "joint": rj.reshape(batch, length, channels, 37),
+            "m_valid": mv.reshape(batch, length, channels), "j_valid": jv.reshape(batch, length, channels),
+            "observed": torch.as_tensor(observed, device=device),
+            "prediction_ready": torch.as_tensor(ready, device=device)}
 
 
 @torch.no_grad()
@@ -90,7 +134,9 @@ def extract_features(record: Record, model: NormalRepresentation, batch_size=64,
 
 @torch.no_grad()
 def score_features(sequence: FeatureSequence, representation, detector, block_length=256, diagnostics=False,
-                   log_interval_seconds=0, progress_label="scoring blocks"):
+                   log_interval_seconds=0, progress_label="scoring blocks", execution="block"):
+    if execution not in {"block", "step"}:
+        raise ValueError("Detector execution must be block or step.")
     detector.eval()
     n, c = sequence.z.shape
     scores, valid = np.full(n, np.nan, np.float32), np.zeros(n, bool)
@@ -100,15 +146,25 @@ def score_features(sequence: FeatureSequence, representation, detector, block_le
     state = None
     for start in periodic_progress(range(0, n, block_length), progress_label, log_interval_seconds):
         block = sequence.block(start, min(n, start + block_length), representation)
-        for t in range(len(block["chi"])):
-            out, state = detector.step({k: v[t:t + 1] for k, v in block.items()}, state, diagnostics)
-            i = start + t
-            if out["valid"].item():
-                scores[i] = out["score"].item()
-                valid[i] = True
-                attribution[i] = out["attribution"].item()
+        if execution == "block":
+            out, state = detector.forward_block({k: v[None] for k, v in block.items()}, state, diagnostics)
+            stop = start + len(block["chi"])
+            ready = out["valid"][0].cpu().numpy()
+            scores[start:stop] = np.where(ready, out["score"][0].cpu().numpy(), np.nan)
+            valid[start:stop] = ready
+            attribution[start:stop] = np.where(ready, out["attribution"][0].cpu().numpy(), -1)
             for key in extra:
-                extra[key][i] = out[key][0].cpu().numpy()
+                extra[key][start:stop] = out[key][0].cpu().numpy()
+        else:
+            for t in range(len(block["chi"])):
+                out, state = detector.step({k: v[t:t + 1] for k, v in block.items()}, state, diagnostics)
+                i = start + t
+                if out["valid"].item():
+                    scores[i] = out["score"].item()
+                    valid[i] = True
+                    attribution[i] = out["attribution"].item()
+                for key in extra:
+                    extra[key][i] = out[key][0].cpu().numpy()
     return {"scores": scores, "valid": valid, "attribution": attribution, **extra}
 
 

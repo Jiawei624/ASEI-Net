@@ -11,11 +11,13 @@ import torch.nn.functional as F
 
 from .config import fingerprint, write_json
 from .compat import load_torch_checkpoint
+from .cache import PackedTaskWriter, TaskFeatureStore
 from .data import Record
-from .features import extract_features, FeatureSequence
+from .features import extract_features, FeatureSequence, batch_feature_blocks
 from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
 from .progress import periodic_progress
 from .tasks import generate_pair, phase_weights
+from .resources import cooperate
 
 
 def seed_everything(seed):
@@ -163,10 +165,14 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
     optimizer = torch.optim.AdamW([
         {"params": [p for p in model.parameters() if id(p) not in special_ids], "weight_decay": s["weight_decay"]},
         {"params": special, "weight_decay": 0}], lr=s["lr"])
+    pinned = device.type == "cuda"
+    workers = cfg["runtime"].get("effective_cpu", {}).get("workers", s["workers"])
     dl = DataLoader(NormalWindows(train, model.cfg["window"], s["stride"]), batch_size=s["batch_size"],
-                    shuffle=True, num_workers=s["workers"], drop_last=False)
+                    shuffle=True, num_workers=workers, drop_last=False, pin_memory=pinned,
+                    persistent_workers=workers > 0)
     vl = DataLoader(NormalWindows(valid, model.cfg["window"]), batch_size=s["batch_size"],
-                    shuffle=False, num_workers=s["workers"])
+                    shuffle=False, num_workers=workers, pin_memory=pinned,
+                    persistent_workers=workers > 0)
     rng = np.random.default_rng(8701)
     best, stale, logs = float("inf"), 0, []
     began = time.perf_counter()
@@ -178,7 +184,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
         marginal, joint = torch.zeros_like(model.memory.m_unused), torch.zeros_like(model.memory.j_unused)
         train_total, train_n = 0.0, 0
         for batch in periodic_progress(dl, f"stage1 epoch={epoch + 1} train", interval):
-            batch = {k: v.to(device) for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=pinned) for k, v in batch.items()}
             optimizer.zero_grad(set_to_none=True)
             loss, usage = model.normal_loss(batch)
             if not torch.isfinite(loss):
@@ -195,7 +201,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
         val_total, val_n = 0.0, 0
         with torch.no_grad():
             for batch in periodic_progress(vl, f"stage1 epoch={epoch + 1} validation", interval):
-                batch = {k: v.to(device) for k, v in batch.items()}
+                batch = {k: v.to(device, non_blocking=pinned) for k, v in batch.items()}
                 loss, _ = model.normal_loss(batch)
                 n = len(batch["target"])
                 val_total, val_n = val_total + loss.item() * n, val_n + n
@@ -218,6 +224,7 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
     usage = finalize_memory(model, train, log_interval_seconds=interval)
     torch.save({"model": model.state_dict(), "model_config": model.cfg, "key": run_key,
                 "epoch": best_checkpoint["epoch"], "validation_loss": best, "usage": usage}, directory / "representation.pt")
+    (directory / "stage1_best.pt").unlink()
     elapsed = time.perf_counter() - began
     write_json(directory / "stage1_history.json", {"epochs": logs, "seconds": elapsed, "usage": usage})
     return elapsed
@@ -231,63 +238,76 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
     key = fingerprint({"version": 1, "representation": representation_key, "seed": seed, "tasks": settings})
     manifest_path = directory / "manifest.json"
     previous_seconds = 0.0
+    storage = cfg["runtime"].get("task_cache_format", "packed")
     if manifest_path.exists():
         previous = json.loads(manifest_path.read_text(encoding="utf-8"))
         if previous["key"] != key:
             raise ValueError("Task cache configuration differs. Use a new output directory.")
         previous_seconds = previous.get("preparation_seconds_total", 0.0)
-    write_json(manifest_path, {"key": key, "settings": settings, "complete": False,
+        # Continue partial legacy caches in their original format.
+        storage = previous.get("storage", "npz")
+    write_json(manifest_path, {"key": key, "settings": settings, "storage": storage, "complete": False,
                                "preparation_seconds_total": previous_seconds})
     began, recipes, built = time.perf_counter(), [], 0
     for split, source, n in (("train", train, s["train_pairs"]), ("validation", valid, s["validation_pairs"])):
-        for i in periodic_progress(range(n), f"cache {split} task pairs", cfg["runtime"].get("log_interval_seconds", 300)):
-            clean_path, corrupt_path = directory / f"{split}_{i:04d}_clean.npz", directory / f"{split}_{i:04d}_corrupt.npz"
-            recipe_path = directory / f"{split}_{i:04d}.json"
-            if clean_path.exists() and corrupt_path.exists() and recipe_path.exists():
-                recipes.append(json.loads(recipe_path.read_text(encoding="utf-8")))
-                continue
-            task_seed = seed + 20000 if split == "train" else s["validation_seeds"][i % len(s["validation_seeds"])]
-            pair = generate_pair(source, train, model.cfg["window"], i, task_seed, s["families"])
-            built += 1
-            clean = extract_features(pair.clean, model, cfg["runtime"]["feature_batch_size"])
-            corrupt = extract_features(pair.corrupt, model, cfg["runtime"]["feature_batch_size"])
-            clean_valid = clean.mask.any(1) & (np.arange(len(clean)) >= clean.window)
-            corrupt_valid = corrupt.mask.any(1) & (np.arange(len(corrupt)) >= corrupt.window)
-            cw, pw = phase_weights(pair.labels, clean_valid, corrupt_valid)
-            clean.labels, corrupt.labels = np.zeros(len(clean), np.int8), pair.labels
-            clean.weights, corrupt.weights = cw, pw
-            clean.save(clean_path, key)
-            corrupt.save(corrupt_path, key)
-            recipe = {"split": split, **pair.recipe}
-            write_json(recipe_path, recipe)
-            recipes.append(recipe)
-        print(f"cache {split} complete pairs={n}", flush=True)
+        writer = (PackedTaskWriter(directory / split, key, train.z.shape[1],
+                                  cfg["runtime"].get("task_cache_checkpoint_pairs", 16))
+                  if storage == "packed" else None)
+        try:
+            for i in periodic_progress(range(n), f"cache {split} task pairs", cfg["runtime"].get("log_interval_seconds", 300)):
+                clean_path, corrupt_path = directory / f"{split}_{i:04d}_clean.npz", directory / f"{split}_{i:04d}_corrupt.npz"
+                recipe_path = directory / f"{split}_{i:04d}.json"
+                if writer is not None and writer.has_pair(i):
+                    recipes.append(writer.recipe(i))
+                    continue
+                if writer is None and clean_path.exists() and corrupt_path.exists() and recipe_path.exists():
+                    recipes.append(json.loads(recipe_path.read_text(encoding="utf-8")))
+                    continue
+                task_seed = seed + 20000 if split == "train" else s["validation_seeds"][i % len(s["validation_seeds"])]
+                pair = generate_pair(source, train, model.cfg["window"], i, task_seed, s["families"])
+                built += 1
+                clean = extract_features(pair.clean, model, cfg["runtime"]["feature_batch_size"])
+                corrupt = extract_features(pair.corrupt, model, cfg["runtime"]["feature_batch_size"])
+                clean_valid = clean.mask.any(1) & (np.arange(len(clean)) >= clean.window)
+                corrupt_valid = corrupt.mask.any(1) & (np.arange(len(corrupt)) >= corrupt.window)
+                cw, pw = phase_weights(pair.labels, clean_valid, corrupt_valid)
+                clean.labels, corrupt.labels = np.zeros(len(clean), np.int8), pair.labels
+                clean.weights, corrupt.weights = cw, pw
+                recipe = {"split": split, **pair.recipe}
+                if writer is None:
+                    clean.save(clean_path, key, compressed=cfg["runtime"].get("task_cache_compression", False))
+                    corrupt.save(corrupt_path, key, compressed=cfg["runtime"].get("task_cache_compression", False))
+                    write_json(recipe_path, recipe)
+                else:
+                    writer.append(i, clean, corrupt, recipe)
+                recipes.append(recipe)
+        finally:
+            if writer is not None:
+                writer.close()
+        print(f"cache {split} complete pairs={n} storage={storage}", flush=True)
     seconds = time.perf_counter() - began
-    size = sum(p.stat().st_size for p in directory.glob("*.npz"))
-    write_json(manifest_path, {"key": key, "settings": settings, "complete": True, "seconds_this_call": seconds,
+    size = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file() and p.suffix in {".npz", ".bin"})
+    write_json(manifest_path, {"key": key, "settings": settings, "storage": storage, "complete": True, "seconds_this_call": seconds,
                                "preparation_seconds_total": previous_seconds + (seconds if built else 0),
                                "bytes": size, "recipes": recipes})
     return key, seconds, size
 
 
 def _batch_blocks(sequences, start, stop, representation):
-    blocks = []
-    with torch.no_grad():
-        for seq in sequences:
-            if start < len(seq):
-                block = seq.block(start, stop, representation)
-            else:
-                # Use an existing sample only to obtain correct feature shapes, then erase it.
-                block = {k: torch.zeros_like(v[:0]) for k, v in seq.block(0, 1, representation).items()}
-            padded = {}
-            for k, value in block.items():
-                missing = stop - start - len(value)
-                padded[k] = torch.cat([value, value.new_zeros((missing, *value.shape[1:]))])
-            blocks.append(padded)
-    return {k: torch.stack([b[k] for b in blocks]) for k in blocks[0]}
+    return batch_feature_blocks(sequences, start, stop, representation)
 
 
-def detector_epoch(detector, representation, cache_dir, cache_key, indices, split, cfg, optimizer=None, epoch=None):
+def detector_epoch(detector, representation, cache_dir, cache_key, indices, split, cfg, optimizer=None, epoch=None, store=None):
+    owned = store is None
+    store = store or TaskFeatureStore(cache_dir, cache_key, cfg["runtime"].get("task_cache_memory_mb", 2048))
+    try:
+        return _detector_epoch(detector, representation, indices, split, cfg, store, optimizer, epoch)
+    finally:
+        if owned:
+            store.close()
+
+
+def _detector_epoch(detector, representation, indices, split, cfg, store, optimizer=None, epoch=None):
     training = optimizer is not None
     detector.train(training)
     s = cfg["stage2"]
@@ -297,33 +317,40 @@ def detector_epoch(detector, representation, cache_dir, cache_key, indices, spli
     for batch_start in periodic_progress(range(0, len(indices), s["batch_pairs"]), label,
                                          cfg["runtime"].get("log_interval_seconds", 300)):
         batch_indices = indices[batch_start:batch_start + s["batch_pairs"]]
-        sequences = [FeatureSequence.load(Path(cache_dir) / f"{split}_{i:04d}_{role}.npz", cache_key)
+        sequences = [store.get(split, i, role)
                      for i in batch_indices for role in ("clean", "corrupt")]
         state = None
         max_length = max(map(len, sequences))
         for start in range(0, max_length, s["block_length"]):
+            cooperate()
             stop = min(start + s["block_length"], max_length)
             block = _batch_blocks(sequences, start, stop, representation)
-            labels = torch.zeros(len(sequences), stop - start, device=device)
-            weights = torch.zeros_like(labels)
+            labels = np.zeros((len(sequences), stop - start), np.float32)
+            weights = np.zeros_like(labels)
             for i, seq in enumerate(sequences):
                 length = max(0, min(stop, len(seq)) - start)
                 if length:
-                    labels[i, :length] = torch.as_tensor(seq.labels[start:start + length], device=device)
-                    weights[i, :length] = torch.as_tensor(seq.weights[start:start + length], device=device)
+                    labels[i, :length] = seq.labels[start:start + length]
+                    weights[i, :length] = seq.weights[start:start + length]
+            has_weights = bool(weights.any())
+            labels, weights = torch.as_tensor(labels, device=device), torch.as_tensor(weights, device=device)
             if training:
                 optimizer.zero_grad(set_to_none=True)
             with torch.set_grad_enabled(training):
-                logits = []
-                for t in range(stop - start):
-                    out, state = detector.step({k: v[:, t] for k, v in block.items()}, state)
-                    logits.append(out["score"])
-                    if (weights[:, t] > 0).logical_and(~out["valid"]).any():
-                        raise RuntimeError("A task loss weight refers to an unscorable point.")
-                loss = (F.binary_cross_entropy_with_logits(torch.stack(logits, 1), labels, reduction="none") * weights).sum() / len(batch_indices)
+                if cfg["runtime"].get("detector_execution", "block") == "block":
+                    out, state = detector.forward_block(block, state)
+                else:
+                    outputs = []
+                    for t in range(stop - start):
+                        out, state = detector.step({k: v[:, t] for k, v in block.items()}, state)
+                        outputs.append(out)
+                    out = {k: torch.stack([item[k] for item in outputs], 1) for k in outputs[0]}
+                if (weights > 0).logical_and(~out["valid"]).any():
+                    raise RuntimeError("A task loss weight refers to an unscorable point.")
+                loss = (F.binary_cross_entropy_with_logits(out["score"], labels, reduction="none") * weights).sum() / len(batch_indices)
                 if not torch.isfinite(loss):
                     raise FloatingPointError("Non-finite detector loss.")
-                if training and weights.any():
+                if training and has_weights:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(detector.parameters(), 1)
                     optimizer.step()
@@ -341,12 +368,23 @@ def fit_detector(detector, representation, cfg, cache_dir, cache_key, directory,
     rng = np.random.default_rng(seed + 10000)
     best, stale, history = float("inf"), 0, []
     began = time.perf_counter()
+    store = TaskFeatureStore(cache_dir, cache_key, cfg["runtime"].get("task_cache_memory_mb", 2048))
+    try:
+        return _fit_detector_epochs(detector, representation, cfg, cache_dir, cache_key, directory,
+                                    run_key, rng, optimizer, best, stale, history, began, store)
+    finally:
+        store.close()
+
+
+def _fit_detector_epochs(detector, representation, cfg, cache_dir, cache_key, directory,
+                          run_key, rng, optimizer, best, stale, history, began, store):
+    s = cfg["stage2"]
     for epoch in range(s["epochs"]):
         epoch_began = time.perf_counter()
         train_loss = detector_epoch(detector, representation, cache_dir, cache_key,
-                                    rng.permutation(s["train_pairs"]), "train", cfg, optimizer, epoch=epoch + 1)
+                                    rng.permutation(s["train_pairs"]), "train", cfg, optimizer, epoch=epoch + 1, store=store)
         val_loss = detector_epoch(detector, representation, cache_dir, cache_key,
-                                  np.arange(s["validation_pairs"]), "validation", cfg, epoch=epoch + 1)
+                                  np.arange(s["validation_pairs"]), "validation", cfg, epoch=epoch + 1, store=store)
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "validation_loss": val_loss})
         print(f"stage2 epoch={epoch + 1} train={train_loss:.6f} validation={val_loss:.6f} "
               f"seconds={time.perf_counter() - epoch_began:.1f}", flush=True)
@@ -362,5 +400,9 @@ def fit_detector(detector, representation, cfg, cache_dir, cache_key, directory,
     detector.load_state_dict(load_torch_checkpoint(directory / "detector.pt", map_location=device)["model"])
     seconds = time.perf_counter() - began
     write_json(directory / "stage2_history.json", {"epochs": history, "seconds": seconds,
-                                                  "parameters": sum(p.numel() for p in detector.parameters())})
+        "complete": True, "key": run_key,
+        "parameters": sum(p.numel() for p in detector.parameters()),
+        "execution": cfg["runtime"].get("detector_execution", "block"),
+        "cache": {"storage": store.storage, "legacy_file_loads": store.loads,
+                  "legacy_memory_hits": store.hits, "memory_limit_mb": store.limit / 1024 ** 2}})
     return seconds

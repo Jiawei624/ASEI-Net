@@ -9,6 +9,7 @@ __pycache__/
 .test_standalone_runs/
 .test_cuda_runs/
 .test_log_runs/
+.test_perf_runs/
 *.pyc
 data/
 docs/

@@ -6,7 +6,7 @@ data:
   use_prepared_manifest: true
   archive: TAB_dataset.zip
   train_fraction: 0.8
-  datasets: [PSM, SMD, SWAT, GECCO, PUMP]
+  datasets: [PSM, SMD, SWAT, PUMP]
 model:
   window: auto
   d_model: auto
@@ -53,12 +53,23 @@ runtime:
   device: cuda:0
   feature_batch_size: 64
   threads: 4
+  interop_threads: 1
+  cpu_cores: 8
+  cpu_max_percent: 80
+  cpu_check_interval_seconds: 5
   output: outputs
+  run_subdir: runs
+  timestamp_utc_offset_hours: 8
   log_dir: logs
   log_file: main.log
   # Epoch summaries are always printed; 0 disables timed progress messages.
   log_interval_seconds: 300
-  seeds: [0, 1, 2, 3, 4]
+  detector_execution: block
+  task_cache_format: packed
+  task_cache_checkpoint_pairs: 16
+  task_cache_memory_mb: 2048
+  task_cache_compression: false
+  seeds: [41, 42, 43, 44, 45]
 reports:
   # Relative paths in this section are resolved under runtime.output.
   inventory: data_inventory.csv

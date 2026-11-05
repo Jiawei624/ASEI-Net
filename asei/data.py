@@ -9,8 +9,9 @@ import pandas as pd
 
 from .config import file_sha256
 from .data_process import read_data
+from .resources import cooperate
 
-DATASETS = ("PSM", "SMD", "SWAT", "GECCO", "PUMP")
+DATASETS = ("PSM", "SMD", "SWAT", "PUMP")
 
 
 @dataclass
@@ -106,7 +107,7 @@ def discover(data_root: str | Path, manifest=None, multivariate_only=False) -> l
         entities.append(Entity(ds, name, file_path.resolve(), int(length),
                                _bool(row.get("test_continuous", False)), val_path))
     if not entities:
-        raise ValueError("No PSM/SMD/SWAT/GECCO/PUMP entries found. Supply dataset names in a manifest.")
+        raise ValueError("No " + "/".join(DATASETS) + " entries found. Supply dataset names in a manifest.")
     return entities
 
 
@@ -160,13 +161,18 @@ class Standardizer:
 
 
 def load_entity(entity: Entity, fraction: float):
+    if not 0 < fraction < 1:
+        raise ValueError("train_fraction must be in (0, 1).")
+    cooperate()
     frame = read_frame(entity.path)
     boundary = entity.train_lens
     if not 0 < boundary < len(frame):
         raise ValueError(f"{entity.name}: train_lens is outside the series.")
     if frame["label"].iloc[:boundary].any():
-        raise ValueError(f"{entity.name}: official training prefix contains anomalies; do not delete and concatenate them.")
+        raise ValueError(f"{entity.name}: official training prefix contains anomalies; normal training and validation data are required.")
     n_fit = boundary if entity.validation_path else int(boundary * fraction)
+    if n_fit < 1 or (not entity.validation_path and n_fit == boundary):
+        raise ValueError(f"{entity.name}: training prefix is too short for a train/validation split.")
     columns = frame.columns.drop("label")
     x = frame.loc[:, columns].to_numpy(np.float64)
     keep = np.isfinite(x[:n_fit]).any(0)

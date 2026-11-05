@@ -1,7 +1,11 @@
 {
   "format": 1,
-  "description": "Exact source compatibility for progress-logging changes; numerical settings and algorithms are unchanged.",
+  "description": "Exact reviewed source aliases with compatible model parameters and task-feature semantics for normal-only training. Effective DataLoader workers participate in checkpoint identity; calibration also keys the execution backend.",
   "aliases": {
-    "6d82f9ea846084d7ead4eabb1c9d2e521f6c8b22f60268b531898750daae2abc": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d"
+    "6d82f9ea846084d7ead4eabb1c9d2e521f6c8b22f60268b531898750daae2abc": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d",
+    "4c1eff15d7acad27d5a749887c4bc57991103c43e42b62260249423481b2af12": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d",
+    "73e6338512305d5f357293f788ae3d362f98bf59b03f19e3f3b12f73cb48e90b": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d",
+    "3896bf9ae95924ca593e16e482b059e36e67d1ed2fc8b36b5ae12caa46fe331b": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d",
+    "8af1fec277dd65fa83f5ff60e6fafeccb9d9d7e35e61c86cbc1bc9d772b4f280": "60ca22a2393efe7f7abf46e0cfe30d49b9e9b2ba14a13660b4908c3c57cdce5d"
   }
 }

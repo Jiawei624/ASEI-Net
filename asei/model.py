@@ -9,6 +9,7 @@ import torch.nn.functional as F
 
 from .data import Record
 from .compat import transformer_encoder
+from .resources import cooperate
 
 
 def mlp(n_in, hidden, n_out):
@@ -46,6 +47,7 @@ class Descriptor(nn.Module):
         sums, squares = np.zeros((c, 5)), np.zeros((c, 5))
         counts = np.zeros(c, dtype=np.int64)
         for left in range(31, len(record.z), batch):
+            cooperate()
             seg, masks = segment_arrays(record, np.arange(left, min(left + batch, len(record.z))))
             amp, _ = self.raw(torch.from_numpy(seg).double())
             valid = masks.all(1)
@@ -315,3 +317,80 @@ class DualTrajectoryDetector(nn.Module):
                           marginal_difference=((chi - rm) * mv[..., None]).norm(dim=-1),
                           joint_difference=((chi - rj) * jv[..., None]).norm(dim=-1))
         return output, DetectorState(new_o, new_n)
+
+    def forward_block(self, f: dict, state: DetectorState | None = None, diagnostics=False):
+        """Batch the time-independent networks while retaining causal state updates."""
+        chi, prediction = f["chi"].float(), f["prediction"].float()
+        batch, length, channels, _ = chi.shape
+        if length == 0:
+            raise ValueError("A detector block must contain at least one time point.")
+        state = state or self.initial_state(batch, chi.device)
+        rm, rj = f["marginal"].float(), f["joint"].float()
+        mv, jv = f["m_valid"].bool(), f["j_valid"].bool()
+        rv = torch.full_like(mv, channels > 1 and "relation" in self.sources)
+        if "marginal" not in self.sources:
+            mv = torch.zeros_like(mv)
+        if "joint" not in self.sources:
+            jv = torch.zeros_like(jv)
+        rm, rj = rm * mv[..., None], rj * jv[..., None]
+        eps = f["residual"].float().clone()
+        eps[..., 1] *= rv
+        prediction = prediction.clone()
+        prediction[..., 1] *= rv
+        availability = torch.stack([rv, mv, jv], -1).float()
+        evidence = self.evidence(torch.cat([eps, (chi - rm) * mv[..., None],
+                                            (chi - rj) * jv[..., None], availability], -1))
+        identity = self.identity[None, None].expand(batch, length, -1, -1)
+        context = self.normal_context(torch.cat([rm, rj, identity, availability[..., 1:]], -1))
+        reference = torch.where(jv[..., None], rj, rm)
+        on = self.adapter(torch.cat([chi, prediction, identity], -1))
+        normal_input = self.adapter(torch.cat([reference, prediction, identity], -1))
+        usable = (mv | jv) & f["observed"].bool()
+        # Unbind once: repeated select-backward operations otherwise clear a full
+        # time-sized gradient buffer at every recurrent step.
+        evidence_steps = evidence.transpose(0, 1).contiguous().unbind(0)
+        context_steps = context.transpose(0, 1).contiguous().unbind(0)
+        on_steps = on.transpose(0, 1).contiguous().reshape(length, -1, 32).unbind(0)
+        normal_steps = normal_input.transpose(0, 1).contiguous().reshape(length, -1, 32).unbind(0)
+        usable_steps = usable.transpose(0, 1).unbind(0)
+        observed_states, normal_states, retentions = [], [], []
+        old_o, old_n = state.observed, state.normal
+        for t in range(length):
+            retain = torch.sigmoid(self.gate(torch.cat([evidence_steps[t], context_steps[t], old_o - old_n], -1)))
+            if self.variant in {"no_alignment", "single_gru"}:
+                retain = torch.ones_like(retain)
+            elif self.variant == "fixed_gate":
+                retain = torch.full_like(retain, self.fixed_retention)
+            target = torch.zeros_like(old_n) if self.variant == "zero_alignment" else old_n
+            aligned = retain * old_o + (1 - retain) * target
+            if self.normal_gru is None:
+                inputs = torch.cat([on_steps[t], normal_steps[t]], 0)
+                previous = torch.cat([aligned.reshape(-1, 32), old_n.reshape(-1, 32)], 0)
+                new_o, new_n = self.gru(inputs, previous).chunk(2, 0)
+                new_o, new_n = new_o.reshape(batch, channels, 32), new_n.reshape(batch, channels, 32)
+            else:
+                new_o = self.gru(on_steps[t], aligned.reshape(-1, 32)).reshape(batch, channels, 32)
+                new_n = self.normal_gru(normal_steps[t], old_n.reshape(-1, 32)).reshape(batch, channels, 32)
+            new_o, new_n = new_o * usable_steps[t][..., None], new_n * usable_steps[t][..., None]
+            if self.variant == "single_gru":
+                new_n = torch.zeros_like(new_n)
+            if self.variant == "mlp":
+                new_o, new_n = torch.zeros_like(new_o), torch.zeros_like(new_n)
+            observed_states.append(new_o)
+            normal_states.append(new_n)
+            if diagnostics:
+                retentions.append(retain)
+            old_o, old_n = new_o, new_n
+        observed, normal = torch.stack(observed_states, 1), torch.stack(normal_states, 1)
+        delta = observed - normal
+        logits = self.head(torch.cat([evidence, delta, normal], -1)).squeeze(-1)
+        scorable = f["observed"].bool() & f["prediction_ready"].bool()
+        score, attribution = logits.masked_fill(~scorable, -torch.inf).max(-1)
+        valid = scorable.any(-1)
+        output = {"score": torch.where(valid, score, torch.zeros_like(score)),
+                  "valid": valid, "attribution": attribution}
+        if diagnostics:
+            output.update(retention=torch.stack(retentions, 1).mean(-1), state_difference=delta.norm(dim=-1),
+                          marginal_difference=((chi - rm) * mv[..., None]).norm(dim=-1),
+                          joint_difference=((chi - rj) * jv[..., None]).norm(dim=-1))
+        return output, DetectorState(old_o, old_n)

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from .config import write_json
+from .data import DATASETS
 
 
 def flatten_numeric(data, prefix=""):
@@ -20,29 +21,41 @@ def flatten_numeric(data, prefix=""):
     return result
 
 
-def collect(root):
+def collect(root, seeds=None):
     rows = []
     for path in Path(root).rglob("result.json"):
         data = json.loads(path.read_text(encoding="utf-8"))
         if not {"dataset", "entity", "seed", "metrics", "variant"}.issubset(data):
             continue
+        if data["dataset"] not in DATASETS:
+            continue
+        if seeds is not None and data["seed"] not in seeds:
+            continue
         row = {k: data[k] for k in ("dataset", "entity", "seed", "variant")}
+        row["run_id"] = data.get("run_id", "legacy")
+        row["run_created_ns"] = int(data.get("run_created_ns", 0))
         row.update(flatten_numeric(data["metrics"]))
         row["path"] = str(path)
         rows.append(row)
     if not rows:
         raise ValueError("No completed result.json files found.")
     frame = pd.DataFrame(rows)
-    if frame.duplicated(["dataset", "entity", "seed", "variant"]).any():
-        raise ValueError("Duplicate entity/seed/variant results; select one output root.")
-    return frame
+    keys = ["dataset", "entity", "seed", "variant"]
+    if frame.duplicated(keys + ["run_id"]).any():
+        raise ValueError("Duplicate entity/seed/variant results within the same run; select one output root.")
+    keep = []
+    for _, group in frame.groupby(keys, sort=False):
+        if len(group) > 1 and not (group.run_created_ns > 0).any():
+            raise ValueError("Duplicate legacy entity/seed/variant results; select one output root.")
+        keep.append(group.sort_values(["run_created_ns", "run_id", "path"]).index[-1])
+    return frame.loc[keep].reset_index(drop=True)
 
 
-def aggregate(root, output):
+def aggregate(root, output, seeds=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    frame = collect(root)
-    keys = ["dataset", "entity", "seed", "variant", "path"]
+    frame = collect(root, seeds)
+    keys = ["dataset", "entity", "seed", "variant", "path", "run_id", "run_created_ns"]
     metrics = [c for c in frame if c not in keys]
     frame.to_csv(output / "entity_seed_results.csv", index=False)
     # Each entity contributes once per dataset/seed. Datasets contribute equally across datasets.
@@ -57,12 +70,15 @@ def aggregate(root, output):
     counts.to_csv(output / "coverage.csv", index=False)
     write_json(output / "aggregation.json", {"source": str(Path(root).resolve()), "runs": len(frame),
         "datasets": sorted(frame.dataset.unique().tolist()), "seeds": sorted(frame.seed.unique().tolist()),
+        "requested_seeds": list(seeds) if seeds is not None else None,
+        "selected_runs": sorted(frame.run_id.unique().tolist()),
+        "repeat_policy": "Latest completed result per dataset/entity/seed/variant; repeated runs are not additional seeds.",
         "policy": "entity macro within dataset, dataset macro across datasets, sample standard deviation over seeds; undefined values are excluded with counts, never imputed"})
     return output
 
 
-def paired_comparison(root, baseline_root, metric, variant, baseline_variant, samples=10000, seed=0):
-    left, right = collect(root), collect(baseline_root)
+def paired_comparison(root, baseline_root, metric, variant, baseline_variant, samples=10000, seed=0, seeds=None):
+    left, right = collect(root, seeds), collect(baseline_root, seeds)
     left, right = left[left.variant == variant], right[right.variant == baseline_variant]
     if metric not in left or metric not in right:
         raise ValueError(f"Metric is absent: {metric}")

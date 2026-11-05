@@ -4,13 +4,9 @@ import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import traceback
 
-import numpy as np
-import pandas as pd
-
-from .config import (DEFAULT_CONFIG, configure_cuda, load_config, log_path, project_path,
+from .config import (DEFAULT_CONFIG, configure_cuda, load_config, project_path,
                      report_path, resolve_paths, write_json)
-from .data import discover
-from .preparation import inspect_entities, save_prepared_manifest, training_manifest
+from .resources import configure_cpu
 
 
 def main():
@@ -25,15 +21,18 @@ def main():
         p.add_argument("--entities", "--data-name-list", nargs="+")
         if name == "run":
             p.add_argument("--output", help="Override runtime.output")
-            p.add_argument("--seeds", nargs="+", type=int, help="Override runtime.seeds")
-            p.add_argument("--device", help="Override logical runtime.device")
+            p.add_argument("--resume", help="Reuse a previous run ID; legacy reuses output directories created before timestamps")
+            p.add_argument("--seeds", "--seed", nargs="+", type=int, help="Override runtime.seeds (one or more seeds)")
+            device = p.add_mutually_exclusive_group()
+            device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1; uses logical cuda:0")
+            device.add_argument("--device", help="Override logical runtime.device; use cpu for CPU execution")
             p.add_argument("--stage", choices=["all", "representation", "cache", "detector", "calibrate", "evaluate"], default="all")
             p.add_argument("--variant", choices=["full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru"])
             p.add_argument("--sources", nargs="*", choices=["relation", "marginal", "joint"])
             p.add_argument("--skip-vus", action="store_true")
             p.add_argument("--all-label-metrics", "--all-tab-label-metrics", action="store_true")
             p.add_argument("--diagnostics", action="store_true")
-            p.add_argument("--log", action="store_true", help="Append stdout/stderr to the configured runtime log file")
+            p.add_argument("--log", action="store_true", help="Append training output to the configured log filename with its run timestamp")
         else:
             p.add_argument("--output", help="Override reports.inventory; the training output root is unchanged")
             p.add_argument("--read-data", action="store_true", help="Validate normality, channel schema and source hashes")
@@ -46,44 +45,42 @@ def main():
     p.add_argument("--metric", default="score.auc_pr")
     p.add_argument("--variant", default="full")
     p.add_argument("--baseline-variant", default="single_gru")
+    p.add_argument("--seeds", "--seed", nargs="+", type=int, help="Seeds to aggregate; otherwise use runtime.seeds")
     p = sub.add_parser("predict")
     p.add_argument("--config", "--config-path", default=str(DEFAULT_CONFIG))
     p.add_argument("--bundle", required=True)
     p.add_argument("--input-csv", required=True)
     p.add_argument("--output", help="Default: reports.predictions/<input stem>_alarms.csv")
-    p.add_argument("--device", help="Override logical runtime.device")
+    device = p.add_mutually_exclusive_group()
+    device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1")
+    device.add_argument("--device", help="Override logical runtime.device")
     args = parser.parse_args()
     cfg = load_config(args.config)
-    if args.command == "run" and args.log:
-        target = log_path(cfg)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        print("Log:", target, flush=True)
-        with open(target, "a", encoding="utf-8", buffering=1) as stream:
-            with redirect_stdout(stream), redirect_stderr(stream):
-                try:
-                    execute(args, cfg)
-                except Exception:
-                    traceback.print_exc()
-                    raise SystemExit(1)
-    else:
-        execute(args, cfg)
+    execute(args, cfg)
 
 
 def execute(args, cfg):
+    if args.command in {"run", "predict"}:
+        configure_cuda(cfg, gpu=args.gpu, device=args.device)
+    configure_cpu(cfg)
     if args.command == "aggregate":
         from .aggregate import aggregate, paired_comparison
+        from .runs import new_directory
         root = project_path(args.root) if args.root else project_path(cfg["runtime"]["output"])
-        output_path = project_path(args.output) if args.output else report_path(cfg, "summary", root)
-        output = aggregate(root, output_path)
+        output_path = project_path(args.output) if args.output else new_directory(report_path(cfg, "summary", root), cfg)
+        selected_seeds = args.seeds if args.seeds is not None else cfg["runtime"].get("seeds", [41, 42, 43, 44, 45])
+        output = aggregate(root, output_path, seeds=selected_seeds)
         if args.baseline_root:
-            result = paired_comparison(root, project_path(args.baseline_root), args.metric, args.variant, args.baseline_variant)
+            result = paired_comparison(root, project_path(args.baseline_root), args.metric, args.variant, args.baseline_variant,
+                                       seeds=selected_seeds)
             write_json(output / "paired_comparison.json", result)
         print(output)
         return
     if args.command == "predict":
-        cfg["runtime"]["device"] = args.device or cfg["runtime"]["device"]
-        configure_cuda(cfg)
+        import numpy as np
+        import pandas as pd
         from .pipeline import load_bundle
+        configure_cpu(cfg)  # Apply thread limits after importing PyTorch, too.
         source = project_path(args.input_csv)
         target = project_path(args.output) if args.output else report_path(cfg, "predictions") / (source.stem + "_alarms.csv")
         stream, names = load_bundle(project_path(args.bundle), cfg["runtime"]["device"])
@@ -93,6 +90,8 @@ def execute(args, cfg):
         pd.DataFrame(output).to_csv(target, index=False)
         print(target)
         return
+    from .data import DATASETS, discover
+    from .preparation import inspect_entities, save_prepared_manifest, training_manifest
     if args.data_root:
         cfg["data"]["root"] = args.data_root
     if args.manifest:
@@ -101,6 +100,9 @@ def execute(args, cfg):
         cfg["runtime"]["output"] = args.output
     cfg = resolve_paths(cfg)
     datasets = set(ds.upper() for ds in (args.datasets or cfg["data"]["datasets"]))
+    unsupported = datasets - set(DATASETS)
+    if unsupported:
+        raise SystemExit("Unsupported datasets: " + ", ".join(sorted(unsupported)) + ". Available: " + ", ".join(DATASETS))
     manifest = training_manifest(cfg, datasets, args.entities) if args.command == "run" else cfg["data"].get("manifest")
     entities = [e for e in discover(cfg["data"]["root"], manifest,
                                     multivariate_only=cfg["data"].get("multivariate_only", True))
@@ -120,8 +122,6 @@ def execute(args, cfg):
             if not frame.status.eq("eligible").any():
                 raise SystemExit("No eligible entity. See the inventory reasons before training.")
         return
-    if args.device:
-        cfg["runtime"]["device"] = args.device
     if args.variant:
         cfg["stage2"]["variant"] = args.variant
     if args.sources is not None:
@@ -130,13 +130,38 @@ def execute(args, cfg):
         cfg["evaluation"]["score_metrics"] = [m for m in cfg["evaluation"]["score_metrics"] if not m.startswith("VUS_")]
     if args.all_label_metrics:
         cfg["evaluation"]["supplementary_label_metrics"] = ["adjust_accuracy", "adjust_precision", "adjust_recall", "adjust_f_score", "precision_at_k"]
-    configure_cuda(cfg)
-    # CUDA visibility must be configured before importing PyTorch through the pipeline.
-    from .pipeline import run_entity
-    seeds = args.seeds if args.seeds is not None else cfg["runtime"].get("seeds", list(range(5)))
-    for entity in entities:
-        for seed in seeds:
-            run_entity(entity, cfg, seed, args.stage, args.diagnostics)
+    seeds = args.seeds if args.seeds is not None else cfg["runtime"].get("seeds", [41, 42, 43, 44, 45])
+    if args.stage not in {"all", "representation"} and not args.resume:
+        raise ValueError("--stage " + args.stage + " requires --resume <run_id>; use --resume legacy for older results.")
+    from .runs import start_run, run_log_path
+    cfg["runtime"]["seeds"] = list(seeds)
+    cfg["data"]["datasets"] = sorted(datasets)
+    directory = start_run(cfg, resume=args.resume)
+    print("Run ID:", cfg["runtime"]["run_id"], flush=True)
+    print("Run directory:", directory, flush=True)
+
+    def train():
+        # CUDA visibility was configured before importing PyTorch through the pipeline.
+        from .pipeline import run_entity
+        if args.log:
+            print("Run ID:", cfg["runtime"]["run_id"], "directory:", directory, flush=True)
+        for entity in entities:
+            for seed in seeds:
+                run_entity(entity, cfg, seed, args.stage, args.diagnostics)
+
+    if args.log:
+        target = run_log_path(cfg)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        print("Log:", target, flush=True)
+        with open(target, "a", encoding="utf-8", buffering=1) as stream:
+            with redirect_stdout(stream), redirect_stderr(stream):
+                try:
+                    train()
+                except Exception:
+                    traceback.print_exc()
+                    raise SystemExit(1)
+    else:
+        train()
 
 
 if __name__ == "__main__":

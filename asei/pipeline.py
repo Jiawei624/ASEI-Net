@@ -19,6 +19,8 @@ from .features import extract_features, FeatureSequence, score_features, Streami
 from .metrics import evaluate, threshold_from_normal
 from .model import NormalRepresentation, DualTrajectoryDetector
 from .training import build_task_cache, fit_representation, fit_detector, seed_everything
+from .resources import configure_cpu
+from .runs import training_root
 
 
 def get_device(name):
@@ -124,8 +126,8 @@ def load_bundle(path, device="cpu"):
 def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics=False):
     config = resolve_paths(copy.deepcopy(config))
     configure_cuda(config)
+    configure_cpu(config)
     seed_everything(seed)
-    torch.set_num_threads(config["runtime"]["threads"])
     device = get_device(config["runtime"]["device"])
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -135,24 +137,28 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     cfg = resolve_config(config, len(train.z), train.z.shape[1])
     w = cfg["model"]["window"]
     valid = validation_context(train, raw_valid, w, independent=entity.validation_path is not None)
-    directory = Path(cfg["runtime"]["output"]) / entity.dataset / entity.name / f"seed_{seed}"
+    directory = training_root(cfg, stage) / entity.dataset / entity.name / f"seed_{seed}"
     directory.mkdir(parents=True, exist_ok=True)
     code_key = implementation_fingerprint()
     runtime_packages = {name: metadata.version(name) for name in
                         ("numpy", "pandas", "torch", "scikit-learn", "scipy", "statsmodels", "PyYAML")}
     runtime_identity = {"packages": runtime_packages, "python": list(sys.version_info[:2]),
                         "torch_build": str(torch.__version__)}
-    normal_key = fingerprint({"implementation": code_key, "model": cfg["model"], "stage1": cfg["stage1"],
+    stage1_identity = dict(cfg["stage1"], workers=cfg["runtime"]["effective_cpu"]["workers"])
+    normal_key = fingerprint({"implementation": code_key, "model": cfg["model"], "stage1": stage1_identity,
                               "data": {k: v for k, v in provenance.items() if k != "source"},
                               "runtime": runtime_identity, "seed": seed})
+    representation_path = directory / "representation.pt"
+    checkpoint = _load_checkpoint(representation_path, normal_key, device) if representation_path.exists() else None
     write_json(directory / "resolved_config.json", cfg)
     write_json(directory / "data_provenance.json", provenance)
     representation = NormalRepresentation(cfg["model"]).to(device)
-    representation_path = directory / "representation.pt"
-    print(f"{entity.dataset}/{entity.name} seed={seed} device={device} W={w} C={train.z.shape[1]}", flush=True)
+    physical = cfg["runtime"].get("cuda_visible_devices") if device.type == "cuda" else None
+    print(f"{entity.dataset}/{entity.name} seed={seed} physical_gpu={physical} device={device} W={w} C={train.z.shape[1]}", flush=True)
     if stage in {"all", "representation"} and not representation_path.exists():
         fit_representation(representation, train, valid, cfg, directory, normal_key)
-    checkpoint = _load_checkpoint(representation_path, normal_key, device)
+    if checkpoint is None:
+        checkpoint = _load_checkpoint(representation_path, normal_key, device)
     representation.load_state_dict(checkpoint["model"])
     representation.eval()
     for parameter in representation.parameters():
@@ -183,26 +189,41 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     detector_dir = directory / "detectors" / variant_name
     detector_dir.mkdir(parents=True, exist_ok=True)
     detector_key = fingerprint({"representation": representation_key, "stage2": cfg["stage2"], "seed": seed})
+    detector_path = detector_dir / "detector.pt"
+    detector_history = detector_dir / "stage2_history.json"
+    if detector_path.exists():
+        _load_checkpoint(detector_path, detector_key, device)
     write_json(detector_dir / "resolved_config.json", cfg)
     # Initialization must not depend on whether earlier stages were loaded or trained in this process.
     seed_everything(seed + 10000)
     detector = DualTrajectoryDetector(representation.history.identity.weight, **detector_settings).to(device)
-    detector_path = detector_dir / "detector.pt"
-    if stage in {"all", "detector"} and not detector_path.exists():
+    completed = detector_path.exists() and detector_history.exists()
+    if completed:
+        history_record = json.loads(detector_history.read_text(encoding="utf-8"))
+        completed = history_record.get("complete", True) and history_record.get("key", detector_key) == detector_key
+    if stage in {"all", "detector"} and not completed:
+        if detector_history.exists():
+            detector_history.unlink()
         fit_detector(detector, representation, cfg, cache_dir, cache_key, detector_dir, detector_key, seed)
+    elif not completed:
+        raise ValueError("Detector training is incomplete; run --stage detector before calibration/evaluation.")
     detector.load_state_dict(_load_checkpoint(detector_path, detector_key, device)["model"])
     detector.eval()
     if stage == "detector":
         return detector_dir
     calibration_path = detector_dir / "calibration.json"
-    cal_key = fingerprint({"detector": file_sha256(detector_path), "data": normal_key, "calibration": cfg["calibration"]})
+    calibration_identity = {"detector": file_sha256(detector_path), "data": normal_key, "calibration": cfg["calibration"]}
+    if cfg["runtime"].get("detector_execution", "block") == "block":
+        calibration_identity["execution"] = "block"
+    cal_key = fingerprint(calibration_identity)
     normal_record, validation_start = _normal_calibration_record(train, valid, w, entity.validation_path is not None)
     if stage in {"all", "calibrate"}:
         normal_features, _ = _cached_features(normal_record, representation, cfg,
                                               directory / "normal_features.npz", representation_key + "normal")
         output = score_features(normal_features, representation, detector, cfg["stage2"]["block_length"],
                                 log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
-                                progress_label="calibration scoring blocks")
+                                progress_label="calibration scoring blocks",
+                                execution=cfg["runtime"].get("detector_execution", "block"))
         normal_scores = output["scores"][validation_start:]
         primary = threshold_from_normal(normal_scores, cfg["calibration"]["alpha"])
         calibration = {**primary, "key": cal_key, "validation_targets": len(normal_scores),
@@ -229,7 +250,8 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     inference_start = time.perf_counter()
     output = score_features(features, representation, detector, cfg["stage2"]["block_length"], diagnostics,
                             log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
-                            progress_label="test scoring blocks")
+                            progress_label="test scoring blocks",
+                            execution=cfg["runtime"].get("detector_execution", "block"))
     scores, ready = output["scores"][test_start:], output["valid"][test_start:]
     inference_seconds = time.perf_counter() - inference_start
     results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])
@@ -261,6 +283,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
                                 ("retention", "state_difference", "marginal_difference", "joint_difference")})
     np.savez_compressed(detector_dir / "predictions.npz", **prediction_data)
     write_json(detector_dir / "result.json", {"dataset": entity.dataset, "entity": entity.name, "seed": seed,
+               "run_id": cfg["runtime"]["run_id"], "run_created_ns": cfg["runtime"]["run_created_ns"],
                "variant": variant_name, "model_key": detector_key, "implementation_key": code_key,
                "test_points": len(labels), "calibration": calibration, "metrics": results,
                "sensitivity": sensitivity, "timing": timings,

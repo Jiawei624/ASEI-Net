@@ -1,2 +1,2 @@
 Server Machine：PSM、SMD
-Water treatment：SWAT、GECCO、PUMP
+Water treatment：SWAT、PUMP

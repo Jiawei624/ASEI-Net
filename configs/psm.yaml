@@ -1,0 +1,111 @@
+# Starting profile for one RTX 4080 SUPER (16 GB), FP32.
+# Official train/test points: 132481/87841; effective channels: 25.
+data:
+  root: dataset
+  manifest: null
+  multivariate_only: true
+  use_prepared_manifest: true
+  archive: TAB_dataset.zip
+  train_fraction: 0.8
+  datasets:
+  - PSM
+model:
+  window: 256
+  d_model: 96
+  heads: 4
+  layers: 2
+  dropout: 0.1
+  marginal_prototypes: 128
+  joint_prototypes: 256
+stage1:
+  epochs: 80
+  batch_size: 128
+  lr: 0.0003
+  weight_decay: 0.0001
+  warmup_epochs: 5
+  patience: 10
+  stride: 1
+  workers: 4
+stage2:
+  epochs: 50
+  batch_pairs: 32
+  lr: 0.001
+  patience: 8
+  block_length: 256
+  train_pairs: 1024
+  validation_pairs: 128
+  validation_seeds:
+  - 1001
+  - 1002
+  families:
+  - level
+  - variance
+  - temporal
+  - relation
+  variant: full
+  sources:
+  - relation
+  - marginal
+  - joint
+  fixed_retention: 0.9
+calibration:
+  alpha: 0.01
+  sensitivity_alphas:
+  - 0.005
+  - 0.001
+evaluation:
+  label_metrics:
+  - accuracy
+  - precision
+  - recall
+  - f_score
+  - rprecision
+  - rrecall
+  - rf
+  - affiliation_precision
+  - affiliation_recall
+  - affiliation_f
+  - add
+  score_metrics:
+  - auc_roc
+  - auc_pr
+  - R_AUC_ROC
+  - R_AUC_PR
+  - VUS_ROC
+  - VUS_PR
+  supplementary_label_metrics: []
+  recovery_confirmation: 8
+  latency_points: 256
+runtime:
+  cuda_visible_devices: '1'
+  cuda_device_order: PCI_BUS_ID
+  device: cuda:0
+  feature_batch_size: 256
+  threads: 4
+  interop_threads: 1
+  cpu_cores: 8
+  cpu_max_percent: 80
+  cpu_check_interval_seconds: 5
+  output: outputs
+  run_subdir: runs
+  timestamp_utc_offset_hours: 8
+  log_dir: logs
+  log_file: psm.log
+  log_interval_seconds: 300
+  detector_execution: block
+  task_cache_format: packed
+  task_cache_checkpoint_pairs: 16
+  task_cache_memory_mb: 2048
+  task_cache_compression: false
+  seeds:
+  - 41
+  - 42
+  - 43
+  - 44
+  - 45
+reports:
+  inventory: data_inventory.csv
+  eligible_manifest: eligible_manifest.csv
+  summary: summary
+  environment: environment.json
+  predictions: predictions

@@ -10,6 +10,8 @@ import sys
 
 import yaml
 
+from .resources import validate_cpu_config
+
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
 REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
@@ -27,6 +29,10 @@ def resolve_paths(cfg: dict) -> dict:
     if cfg["data"].get("manifest"):
         cfg["data"]["manifest"] = str(project_path(cfg["data"]["manifest"]))
     runtime = cfg["runtime"]
+    validate_cpu_config(runtime)
+    offset = float(runtime.get("timestamp_utc_offset_hours", 8))
+    if not math.isfinite(offset) or not -24 < offset < 24:
+        raise ValueError("runtime.timestamp_utc_offset_hours must be finite and between -24 and 24.")
     runtime["output"] = str(project_path(runtime["output"]))
     runtime["log_dir"] = str(project_path(runtime.get("log_dir", "logs")))
     try:
@@ -36,6 +42,14 @@ def resolve_paths(cfg: dict) -> dict:
     if not math.isfinite(interval) or interval < 0:
         raise ValueError("runtime.log_interval_seconds must be a finite nonnegative number.")
     runtime["log_interval_seconds"] = interval
+    if runtime.get("detector_execution", "block") not in {"block", "step"}:
+        raise ValueError("runtime.detector_execution must be block or step.")
+    if runtime.get("task_cache_format", "packed") not in {"packed", "npz"}:
+        raise ValueError("runtime.task_cache_format must be packed or npz.")
+    if not math.isfinite(float(runtime.get("task_cache_memory_mb", 2048))) or float(runtime.get("task_cache_memory_mb", 2048)) < 0:
+        raise ValueError("runtime.task_cache_memory_mb must be finite and nonnegative.")
+    if int(runtime.get("task_cache_checkpoint_pairs", 16)) < 1:
+        raise ValueError("runtime.task_cache_checkpoint_pairs must be positive.")
     reports = cfg.setdefault("reports", {})
     for name, value in REPORT_DEFAULTS.items():
         reports.setdefault(name, value)
@@ -53,9 +67,18 @@ def log_path(cfg: dict) -> Path:
     return (path if path.is_absolute() else project_path(cfg["runtime"]["log_dir"]) / path).resolve()
 
 
-def configure_cuda(cfg: dict):
+def configure_cuda(cfg: dict, gpu=None, device=None):
     """Apply configured device visibility before CUDA is initialized."""
     runtime = cfg["runtime"]
+    if gpu is not None:
+        if isinstance(gpu, bool) or not isinstance(gpu, int) or gpu < 0:
+            raise ValueError("--gpu must be a nonnegative physical GPU index.")
+        if device is not None:
+            raise ValueError("Choose --gpu or --device, not both.")
+        runtime["cuda_visible_devices"] = str(gpu)
+        runtime["device"] = "cuda:0"
+    elif device is not None:
+        runtime["device"] = device
     if str(runtime.get("device", "auto")) == "cpu":
         return
     settings = {}
@@ -141,7 +164,7 @@ def implementation_fingerprint() -> str:
              hashlib.sha256(p.read_text(encoding="utf-8").replace("\r\n", "\n").encode("utf-8")).hexdigest()
              for p in sorted((ROOT / "asei").rglob("*.py"))}
     identity = fingerprint({"source_files": files})
-    # Exact source aliases preserve checkpoints across reviewed logging-only changes.
+    # Exact source aliases preserve checkpoints across reviewed equivalent implementations.
     compatibility = ROOT / "configs" / "implementation_compatibility.json"
     if compatibility.is_file():
         record = json.loads(compatibility.read_text(encoding="utf-8"))
@@ -173,5 +196,7 @@ def write_json(path: str | Path, value):
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(clean(value), ensure_ascii=False, indent=2,
-                               allow_nan=False), encoding="utf-8")
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(clean(value), ensure_ascii=False, indent=2,
+                                    allow_nan=False), encoding="utf-8")
+    temporary.replace(path)
