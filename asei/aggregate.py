@@ -8,6 +8,8 @@ import pandas as pd
 
 from .config import write_json
 from .data import DATASETS
+from .results import collect_rows, METRIC_COLUMNS
+from .metrics import LABEL_METRIC_ORDER
 
 
 def flatten_numeric(data, prefix=""):
@@ -25,22 +27,24 @@ def flatten_numeric(data, prefix=""):
 
 def collect(root, seeds=None):
     rows = []
-    for path in Path(root).rglob("result.json"):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not {"dataset", "entity", "seed", "metrics", "variant"}.issubset(data):
-            continue
+    for data in collect_rows(root):
         if data["dataset"] not in DATASETS:
             continue
-        if seeds is not None and data["seed"] not in seeds:
+        if seeds is not None and int(data["seed"]) not in seeds:
             continue
         row = {k: data[k] for k in ("dataset", "entity", "seed", "variant")}
+        row["seed"] = int(row["seed"])
         row["run_id"] = data.get("run_id", "legacy")
-        row["run_created_ns"] = int(data.get("run_created_ns", 0))
-        row.update(flatten_numeric(data["metrics"]))
-        row["path"] = str(path)
+        row["run_created_ns"] = int(data.get("run_created_ns") or 0)
+        row["metrics_protocol"] = data["metrics_protocol"]
+        for name in METRIC_COLUMNS:
+            prefix = "label." if name in LABEL_METRIC_ORDER else "score."
+            value = data.get(name)
+            row[prefix + name] = float(value) if value not in (None, "") else float("nan")
+        row["path"] = data.get("_source", "")
         rows.append(row)
     if not rows:
-        raise ValueError("No completed result.json files found.")
+        raise ValueError("No completed detection results found.")
     frame = pd.DataFrame(rows)
     keys = ["dataset", "entity", "seed", "variant"]
     if frame.duplicated(keys + ["run_id"]).any():
@@ -57,25 +61,15 @@ def aggregate(root, output, seeds=None):
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
     frame = collect(root, seeds)
-    keys = ["dataset", "entity", "seed", "variant", "path", "run_id", "run_created_ns"]
+    keys = ["dataset", "entity", "seed", "variant", "path", "run_id", "run_created_ns", "metrics_protocol"]
     metrics = [c for c in frame if c not in keys]
-    frame.to_csv(output / "entity_seed_results.csv", index=False)
-    # Each entity contributes once per dataset/seed. Datasets contribute equally across datasets.
-    dataset_seed = frame.groupby(["variant", "dataset", "seed"])[metrics].mean()
-    dataset_seed.to_csv(output / "dataset_seed_macro.csv")
-    summary = dataset_seed.groupby(["variant", "dataset"]).agg(["mean", "std", "count"])
-    summary.to_csv(output / "dataset_summary.csv")
-    cross = dataset_seed.groupby(["variant", "seed"])[metrics].mean()
-    cross.to_csv(output / "cross_dataset_seed_macro.csv")
-    cross.groupby("variant").agg(["mean", "std", "count"]).to_csv(output / "cross_dataset_summary.csv")
-    counts = frame.groupby(["variant", "dataset", "seed"]).size().rename("entities").reset_index()
-    counts.to_csv(output / "coverage.csv", index=False)
-    write_json(output / "aggregation.json", {"source": str(Path(root).resolve()), "runs": len(frame),
-        "datasets": sorted(frame.dataset.unique().tolist()), "seeds": sorted(frame.seed.unique().tolist()),
-        "requested_seeds": list(seeds) if seeds is not None else None,
-        "selected_runs": sorted(frame.run_id.unique().tolist()),
-        "repeat_policy": "Latest completed result per dataset/entity/seed/variant; repeated runs are not additional seeds.",
-        "policy": "entity macro within dataset, dataset macro across datasets, sample standard deviation over seeds; undefined values are excluded with counts, never imputed"})
+    # Keep seed-level rows and separate metric protocols; average entities equally.
+    groups = frame.groupby(["dataset", "seed", "variant", "metrics_protocol"], sort=True)
+    summary = groups[metrics].mean().reset_index()
+    summary = summary.rename(columns={name: name.split(".", 1)[1] for name in metrics})
+    summary["entities"] = groups.size().to_numpy()
+    summary["run_ids"] = groups.run_id.agg(lambda values: ";".join(sorted(set(values)))).to_numpy()
+    summary.to_csv(output / "dataset_metrics.csv", index=False, encoding="utf-8-sig")
     return output
 
 

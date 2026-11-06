@@ -16,12 +16,12 @@ from .config import (configure_cuda, file_sha256, fingerprint, implementation_fi
 from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
-from .metrics import evaluate, threshold_from_normal, point_adjusted_predictions
-from .forecast_metrics import evaluate_forecasts
+from .metrics import evaluate, threshold_from_normal, point_adjusted_predictions, METRICS_PROTOCOL
 from .model import NormalRepresentation, DualTrajectoryDetector
 from .training import build_task_cache, fit_representation, fit_detector, seed_everything
 from .resources import configure_cpu
 from .runs import training_root
+from .results import write_run_result, remove_run_result, prune_intermediates
 
 
 def get_device(name):
@@ -59,7 +59,8 @@ def _cached_features(record, model, cfg, path, key):
     sequence = extract_features(record, model, cfg["runtime"]["feature_batch_size"],
                                 log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
                                 progress_label=path.stem + " batches")
-    sequence.save(path, key)
+    if cfg["runtime"].get("keep_intermediates", False):
+        sequence.save(path, key)
     return sequence, time.perf_counter() - start
 
 
@@ -97,12 +98,15 @@ def _latency(model, detector, scaler, threshold, record, points):
             "p95_ms": float(np.percentile(timings, 95)), "scope": "raw-sample preprocessing through final alarm, sequential batch=1"}
 
 
-def save_bundle(path, representation, detector, scaler, calibration, cfg, provenance):
+def save_bundle(path, representation, detector, scaler, calibration, cfg, provenance, experiment=None):
+    path = Path(path)
+    temporary = path.with_name(path.name + ".tmp")
     torch.save({"format": 1, "model_config": cfg["model"], "representation": representation.state_dict(),
                 "detector": detector.state_dict(),
                 "detector_config": {k: cfg["stage2"].get(k) for k in ("variant", "fixed_retention", "sources")},
                 "scaler": scaler.as_dict(), "threshold": calibration["threshold"],
-                "channel_names": provenance["channels"]}, path)
+                "channel_names": provenance["channels"], "experiment": experiment}, temporary)
+    temporary.replace(path)
 
 
 def load_bundle(path, device="cpu"):
@@ -122,6 +126,100 @@ def load_bundle(path, device="cpu"):
         for parameter in module.parameters():
             parameter.requires_grad_(False)
     return StreamingDetector(model, detector, scaler, checkpoint["threshold"]), checkpoint["channel_names"]
+
+
+def _variant_name(cfg):
+    name = cfg["stage2"]["variant"]
+    if cfg["stage2"].get("sources") != ["relation", "marginal", "joint"]:
+        name += "_" + ("_".join(cfg["stage2"].get("sources", [])) or "self")
+    return name
+
+
+def _calibrate_model(entity, train, valid, representation, detector, cfg, directory, representation_key, cal_key):
+    normal_record, validation_start = _normal_calibration_record(
+        train, valid, cfg["model"]["window"], entity.validation_path is not None)
+    normal_features, _ = _cached_features(normal_record, representation, cfg,
+        directory / "normal_features.npz", representation_key + "normal")
+    output = score_features(normal_features, representation, detector, cfg["stage2"]["block_length"],
+        log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
+        progress_label="calibration scoring blocks", execution=cfg["runtime"].get("detector_execution", "block"))
+    normal_scores = output["scores"][validation_start:]
+    calibration = {**threshold_from_normal(normal_scores, cfg["calibration"]["alpha"]), "key": cal_key,
+                   "validation_targets": len(normal_scores), "scorable_fraction": float(np.isfinite(normal_scores).mean())}
+    return calibration, normal_scores
+
+
+def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenance, cfg, seed,
+                       representation, detector, directory, detector_dir, calibration, experiment, diagnostics):
+    if entity.test_continuous:
+        normal_record, _ = _normal_calibration_record(train, valid, cfg["model"]["window"], entity.validation_path is not None)
+        past = train if entity.validation_path is not None else normal_record
+        test = Record(np.concatenate([past.z, raw_test.z]), np.concatenate([past.mask, raw_test.mask]))
+        test_start = len(past.z)
+    else:
+        test, test_start = raw_test, 0
+    features, feature_seconds = _cached_features(test, representation, cfg, directory / "test_features.npz",
+                                                 experiment["representation_key"] + "test")
+    began = time.perf_counter()
+    output = score_features(features, representation, detector, cfg["stage2"]["block_length"], diagnostics,
+        log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300), progress_label="test scoring blocks",
+        execution=cfg["runtime"].get("detector_execution", "block"))
+    scores, ready = output["scores"][test_start:], output["valid"][test_start:]
+    inference_seconds = time.perf_counter() - began
+    print(f"evaluation label_metrics={len(cfg['evaluation']['label_metrics'])} "
+          f"score_metrics={len(cfg['evaluation']['score_metrics'])}", flush=True)
+    results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])
+    histories = {}
+    for name, file in (("representation", directory / "stage1_history.json"),
+                       ("detector", detector_dir / "stage2_history.json"),
+                       ("cache", directory / "task_cache/manifest.json")):
+        if file.exists():
+            histories[name] = json.loads(file.read_text(encoding="utf-8"))
+    old_timing = (experiment.get("result") or {}).get("timing", {})
+    device = next(representation.parameters()).device
+    timings = {"stage1_seconds": histories.get("representation", {}).get("seconds", old_timing.get("stage1_seconds")),
+               "stage2_seconds": histories.get("detector", {}).get("seconds", old_timing.get("stage2_seconds")),
+               "cache_preparation_seconds": histories.get("cache", {}).get("preparation_seconds_total", old_timing.get("cache_preparation_seconds")),
+               "cache_bytes": histories.get("cache", {}).get("bytes", old_timing.get("cache_bytes")),
+               "test_feature_seconds_this_call": feature_seconds, "detector_inference_seconds": inference_seconds,
+               "peak_cuda_bytes_this_call": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None}
+    measured = [timings[k] for k in ("stage1_seconds", "stage2_seconds", "cache_preparation_seconds")]
+    timings["total_training_seconds"] = sum(measured) if all(v is not None for v in measured) else None
+    keep = cfg["runtime"].get("keep_intermediates", False)
+    if keep and cfg["evaluation"].get("latency_points", 0) > 0:
+        timings["latency"] = _latency(representation, detector, scaler, calibration["threshold"], raw_test,
+                                     cfg["evaluation"]["latency_points"])
+    run_directory = Path(cfg["runtime"]["run_directory"])
+    result = {"dataset": entity.dataset, "entity": entity.name, "seed": seed,
+        "run_id": cfg["runtime"]["run_id"], "run_created_ns": cfg["runtime"]["run_created_ns"],
+        "variant": _variant_name(cfg), "model_key": experiment["detector_key"],
+        "implementation_key": experiment["implementation_key"], "metrics_protocol": METRICS_PROTOCOL,
+        "test_points": len(labels), "calibration": calibration, "metrics": results, "timing": timings,
+        "model_file": (detector_dir / "bundle.pt").relative_to(run_directory).as_posix(),
+        "environment": {"python": sys.version, "torch": str(torch.__version__), "numpy": np.__version__,
+            "platform": platform.platform(), "device": str(device), "cuda": torch.version.cuda,
+            "packages": experiment["packages"]}, "config": cfg}
+    experiment.update(result=result, calibration=calibration, calibration_config=copy.deepcopy(cfg["calibration"]),
+                      execution=cfg["runtime"].get("detector_execution", "block"))
+    # Histories are small metadata inside the selected model, never extra final files.
+    summaries = experiment.setdefault("training_history", {})
+    for name in ("representation", "detector"):
+        if name in histories:
+            summaries[name] = {k: histories[name][k] for k in ("epochs", "seconds") if k in histories[name]}
+    save_bundle(detector_dir / "bundle.pt", representation, detector, scaler, calibration, cfg, provenance, experiment)
+    csv_path = write_run_result(run_directory, result)
+    if keep:
+        prediction_data = {"scores": scores, "valid": ready, "alarms": alarms, "labels": labels,
+                           "point_adjusted_alarms": point_adjusted_predictions(labels, alarms)}
+        if diagnostics:
+            prediction_data.update({k: output[k][test_start:] for k in
+                ("retention", "state_difference", "marginal_difference", "joint_difference")})
+        np.savez_compressed(detector_dir / "predictions.npz", **prediction_data)
+        write_json(detector_dir / "result.json", result)
+    else:
+        prune_intermediates(directory, detector_dir)
+    print(f"saved metrics {csv_path}; best model {detector_dir / 'bundle.pt'}", flush=True)
+    return detector_dir
 
 
 def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics=False):
@@ -151,12 +249,32 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
                               "runtime": runtime_identity, "seed": seed})
     representation_path = directory / "representation.pt"
     checkpoint = _load_checkpoint(representation_path, normal_key, device) if representation_path.exists() else None
+    variant_name = _variant_name(cfg)
+    detector_dir = directory / "detectors" / variant_name
+    selected_bundle = None
+    representation_key = None
+    if checkpoint is None:
+        # A completed compact experiment stores both best networks in one bundle.
+        paths = sorted(directory.glob("detectors/*/bundle.pt"),
+                       key=lambda p: p.parent != detector_dir)
+        for path in paths:
+            saved = load_torch_checkpoint(path, map_location=device)
+            identity = saved.get("experiment") or {}
+            if identity.get("normal_key") != normal_key:
+                continue
+            checkpoint = {"key": normal_key, "model": saved["representation"]}
+            representation_key = identity["representation_key"]
+            if path.parent == detector_dir:
+                selected_bundle = saved
+            break
+        if paths and checkpoint is None:
+            raise ValueError("Saved model configuration/data differ; start a new run instead of replacing this experiment.")
     write_json(directory / "resolved_config.json", cfg)
     write_json(directory / "data_provenance.json", provenance)
     representation = NormalRepresentation(cfg["model"]).to(device)
     physical = cfg["runtime"].get("cuda_visible_devices") if device.type == "cuda" else None
     print(f"{entity.dataset}/{entity.name} seed={seed} physical_gpu={physical} device={device} W={w} C={train.z.shape[1]}", flush=True)
-    if stage in {"all", "representation"} and not representation_path.exists():
+    if stage in {"all", "representation"} and checkpoint is None:
         fit_representation(representation, train, valid, cfg, directory, normal_key)
     if checkpoint is None:
         checkpoint = _load_checkpoint(representation_path, normal_key, device)
@@ -166,7 +284,53 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
         parameter.requires_grad_(False)
     if stage == "representation":
         return directory
-    representation_key = fingerprint({"normal": normal_key, "checkpoint": file_sha256(representation_path)})
+    if representation_key is None:
+        representation_key = fingerprint({"normal": normal_key, "checkpoint": file_sha256(representation_path)})
+    if selected_bundle is None and (detector_dir / "bundle.pt").exists():
+        saved = load_torch_checkpoint(detector_dir / "bundle.pt", map_location=device)
+        identity = saved.get("experiment") or {}
+        if identity.get("normal_key") == normal_key and identity.get("representation_key") == representation_key:
+            selected_bundle = saved
+    detector_settings = {k: cfg["stage2"].get(k) for k in ("variant", "fixed_retention", "sources")}
+    detector_key = fingerprint({"representation": representation_key, "stage2": cfg["stage2"], "seed": seed})
+    experiment = {"normal_key": normal_key, "representation_key": representation_key, "detector_key": detector_key,
+        "implementation_key": code_key, "packages": runtime_packages, "data_provenance": provenance}
+    if selected_bundle is not None:
+        saved_identity = selected_bundle["experiment"]
+        if saved_identity.get("detector_key") != detector_key:
+            raise ValueError("Completed detector parameters differ; start a new run for changed training settings.")
+        if stage in {"all", "evaluate", "calibrate", "detector"}:
+            if stage == "detector":
+                return detector_dir
+            detector = DualTrajectoryDetector(representation.history.identity.weight, **detector_settings).to(device)
+            detector.load_state_dict(selected_bundle["detector"])
+            detector.eval()
+            experiment = saved_identity
+            calibration = experiment["calibration"]
+            compatible = (experiment.get("calibration_config") == cfg["calibration"]
+                          and experiment.get("execution") == cfg["runtime"].get("detector_execution", "block"))
+            if stage == "calibrate":
+                calibration, _ = _calibrate_model(entity, train, valid, representation, detector, cfg,
+                    directory, representation_key, fingerprint({"model": detector_key, "calibration": cfg["calibration"],
+                                                               "execution": cfg["runtime"].get("detector_execution", "block")}))
+                experiment.update(calibration=calibration, calibration_config=copy.deepcopy(cfg["calibration"]),
+                                  execution=cfg["runtime"].get("detector_execution", "block"), result=None)
+                save_bundle(detector_dir / "bundle.pt", representation, detector, scaler, calibration, cfg, provenance, experiment)
+                remove_run_result(cfg["runtime"]["run_directory"], entity.dataset, entity.name, seed, variant_name)
+                return detector_dir
+            if not compatible:
+                raise ValueError("Calibration configuration differs; run --stage calibrate before evaluation.")
+            previous = experiment.get("result")
+            same_metrics = previous and previous.get("metrics_protocol") == METRICS_PROTOCOL and (
+                set(previous["metrics"].get("score", {})) == set(cfg["evaluation"]["score_metrics"]))
+            if stage == "all" and same_metrics:
+                csv_path = write_run_result(cfg["runtime"]["run_directory"], previous)
+                if not cfg["runtime"].get("keep_intermediates", False):
+                    prune_intermediates(directory, detector_dir)
+                print(f"completed model reused; metrics {csv_path}", flush=True)
+                return detector_dir
+            return _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenance, cfg, seed,
+                representation, detector, directory, detector_dir, calibration, experiment, diagnostics)
     cache_dir = directory / "task_cache"
     if stage in {"all", "cache"}:
         cache_key, _, _ = build_task_cache(representation, train, valid, cfg, cache_dir, seed, representation_key)
@@ -183,13 +347,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
         cache_key = None
     if stage == "cache":
         return cache_dir
-    detector_settings = {k: cfg["stage2"].get(k) for k in ("variant", "fixed_retention", "sources")}
-    variant_name = cfg["stage2"]["variant"]
-    if cfg["stage2"].get("sources") != ["relation", "marginal", "joint"]:
-        variant_name += "_" + ("_".join(cfg["stage2"].get("sources", ["relation", "marginal", "joint"])) or "self")
-    detector_dir = directory / "detectors" / variant_name
     detector_dir.mkdir(parents=True, exist_ok=True)
-    detector_key = fingerprint({"representation": representation_key, "stage2": cfg["stage2"], "seed": seed})
     detector_path = detector_dir / "detector.pt"
     detector_history = detector_dir / "stage2_history.json"
     if detector_path.exists():
@@ -217,92 +375,20 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
     if cfg["runtime"].get("detector_execution", "block") == "block":
         calibration_identity["execution"] = "block"
     cal_key = fingerprint(calibration_identity)
-    normal_record, validation_start = _normal_calibration_record(train, valid, w, entity.validation_path is not None)
     if stage in {"all", "calibrate"}:
-        normal_features, _ = _cached_features(normal_record, representation, cfg,
-                                              directory / "normal_features.npz", representation_key + "normal")
-        output = score_features(normal_features, representation, detector, cfg["stage2"]["block_length"],
-                                log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
-                                progress_label="calibration scoring blocks",
-                                execution=cfg["runtime"].get("detector_execution", "block"))
-        normal_scores = output["scores"][validation_start:]
-        primary = threshold_from_normal(normal_scores, cfg["calibration"]["alpha"])
-        calibration = {**primary, "key": cal_key, "validation_targets": len(normal_scores),
-                       "scorable_fraction": float(np.isfinite(normal_scores).mean()),
-                       "sensitivity": [threshold_from_normal(normal_scores, a) for a in cfg["calibration"]["sensitivity_alphas"]]}
+        calibration, normal_scores = _calibrate_model(entity, train, valid, representation, detector, cfg,
+                                                     directory, representation_key, cal_key)
         write_json(calibration_path, calibration)
-        np.savez_compressed(detector_dir / "normal_validation_scores.npz", scores=normal_scores)
-        save_bundle(detector_dir / "bundle.pt", representation, detector, scaler, calibration, cfg, provenance)
+        if cfg["runtime"].get("keep_intermediates", False):
+            np.savez_compressed(detector_dir / "normal_validation_scores.npz", scores=normal_scores)
+        experiment.update(calibration=calibration, calibration_config=copy.deepcopy(cfg["calibration"]),
+                          execution=cfg["runtime"].get("detector_execution", "block"), result=None)
+        save_bundle(detector_dir / "bundle.pt", representation, detector, scaler, calibration, cfg, provenance, experiment)
     else:
         calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
         if calibration["key"] != cal_key:
             raise ValueError("Calibration differs from the detector or configuration; run --stage calibrate.")
     if stage == "calibrate":
         return detector_dir
-    if entity.test_continuous:
-        # Use only past observed samples. Labels are never passed to this computation.
-        past = train if entity.validation_path is not None else normal_record
-        test = Record(np.concatenate([past.z, raw_test.z]), np.concatenate([past.mask, raw_test.mask]))
-        test_start = len(past.z)
-    else:
-        test, test_start = raw_test, 0
-    features, feature_seconds = _cached_features(test, representation, cfg, directory / "test_features.npz",
-                                                 representation_key + "test")
-    inference_start = time.perf_counter()
-    output = score_features(features, representation, detector, cfg["stage2"]["block_length"], diagnostics,
-                            log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 300),
-                            progress_label="test scoring blocks",
-                            execution=cfg["runtime"].get("detector_execution", "block"))
-    scores, ready = output["scores"][test_start:], output["valid"][test_start:]
-    inference_seconds = time.perf_counter() - inference_start
-    results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])
-    forecast_diagnostics = None
-    regression_names = cfg["evaluation"].get("regression_metrics", [])
-    if regression_names:
-        results["regression"], forecast_diagnostics = evaluate_forecasts(
-            features, train, scaler, regression_names, test_start,
-            cfg["evaluation"].get("regression_seasonality", 1), provenance["channels"])
-    sensitivity = []
-    for point in calibration["sensitivity"]:
-        from .metrics import event_metrics
-        sensitivity.append({**point, **event_metrics(labels, ready & (scores > point["threshold"]), ready,
-                                                       cfg["evaluation"]["recovery_confirmation"])})
-    histories = {}
-    for name, file in (("representation", directory / "stage1_history.json"),
-                       ("detector", detector_dir / "stage2_history.json"), ("cache", cache_dir / "manifest.json")):
-        if file.exists():
-            histories[name] = json.loads(file.read_text(encoding="utf-8"))
-    timings = {"stage1_seconds": histories.get("representation", {}).get("seconds"),
-               "stage2_seconds": histories.get("detector", {}).get("seconds"),
-               "cache_preparation_seconds": histories.get("cache", {}).get("preparation_seconds_total"),
-               "cache_bytes": histories.get("cache", {}).get("bytes"),
-               "test_feature_seconds_this_call": feature_seconds,
-               "detector_inference_seconds": inference_seconds,
-               "latency": _latency(representation, detector, scaler, calibration["threshold"], raw_test,
-                                     cfg["evaluation"]["latency_points"]),
-               "peak_cuda_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None}
-    measured_training = [timings[k] for k in ("stage1_seconds", "stage2_seconds", "cache_preparation_seconds")]
-    timings["total_training_seconds"] = sum(measured_training) if all(v is not None for v in measured_training) else None
-    prediction_data = {"scores": scores, "valid": ready, "alarms": alarms, "labels": labels,
-                       "point_adjusted_alarms": point_adjusted_predictions(labels, alarms),
-                       "attribution": output["attribution"][test_start:]}
-    if diagnostics:
-        prediction_data.update({k: output[k][test_start:] for k in
-                                ("retention", "state_difference", "marginal_difference", "joint_difference")})
-    np.savez_compressed(detector_dir / "predictions.npz", **prediction_data)
-    write_json(detector_dir / "result.json", {"dataset": entity.dataset, "entity": entity.name, "seed": seed,
-               "run_id": cfg["runtime"]["run_id"], "run_created_ns": cfg["runtime"]["run_created_ns"],
-               "variant": variant_name, "model_key": detector_key, "implementation_key": code_key,
-               "test_points": len(labels), "calibration": calibration, "metrics": results,
-               "forecast_diagnostics": forecast_diagnostics,
-               "sensitivity": sensitivity, "timing": timings,
-               "environment": {"python": sys.version, "torch": torch.__version__, "numpy": np.__version__,
-                               "platform": platform.platform(), "device": str(device),
-                               "cuda": torch.version.cuda,
-                               "cudnn": torch.backends.cudnn.version(),
-                               "accelerator": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-                               "packages": runtime_packages},
-               "parameters": {"representation": sum(p.numel() for p in representation.parameters()),
-                              "detector": sum(p.numel() for p in detector.parameters())}, "config": cfg})
-    print(f"saved {detector_dir / 'result.json'}", flush=True)
-    return detector_dir
+    return _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenance, cfg, seed,
+        representation, detector, directory, detector_dir, calibration, experiment, diagnostics)

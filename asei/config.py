@@ -50,6 +50,8 @@ def resolve_paths(cfg: dict) -> dict:
         raise ValueError("runtime.task_cache_memory_mb must be finite and nonnegative.")
     if int(runtime.get("task_cache_checkpoint_pairs", 16)) < 1:
         raise ValueError("runtime.task_cache_checkpoint_pairs must be positive.")
+    if not isinstance(runtime.get("keep_intermediates", False), bool):
+        raise ValueError("runtime.keep_intermediates must be a boolean.")
     reports = cfg.setdefault("reports", {})
     for name, value in REPORT_DEFAULTS.items():
         reports.setdefault(name, value)
@@ -142,7 +144,14 @@ def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
         raise ValueError("Invalid fixed retention or validation seeds.")
     if set(s2.get("sources", [])) - {"relation", "marginal", "joint"}:
         raise ValueError("Unknown detector evidence source.")
-    from .metrics import LABEL_METRICS, SCORE_METRICS, REGRESSION_METRICS
+    from .metrics import (LABEL_METRICS, SCORE_METRICS, REGRESSION_METRICS,
+                          LABEL_METRIC_ORDER, SCORE_METRIC_ORDER)
+    # Apply the same detection protocol even when resuming an older configuration.
+    cfg["evaluation"]["label_metrics"] = list(LABEL_METRIC_ORDER)
+    cfg["evaluation"]["score_metrics"] = [name for name in SCORE_METRIC_ORDER
+        if not (cfg["evaluation"].get("skip_vus", False) and name.startswith("VUS_"))]
+    cfg["evaluation"]["regression_metrics"] = []
+    cfg["evaluation"]["supplementary_label_metrics"] = []
     for key, allowed in (("label_metrics", LABEL_METRICS), ("supplementary_label_metrics", LABEL_METRICS),
                          ("score_metrics", SCORE_METRICS), ("regression_metrics", REGRESSION_METRICS)):
         names = cfg["evaluation"].get(key, [])

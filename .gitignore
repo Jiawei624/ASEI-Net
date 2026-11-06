@@ -17,6 +17,7 @@ dataset/
 outputs/
 tests/
 logs/
+result/
 *.zip
 In1_2_2.md
 metrics.txt

@@ -50,9 +50,7 @@ stage2:
   fixed_retention: 0.9
 calibration:
   alpha: 0.01
-  sensitivity_alphas:
-  - 0.005
-  - 0.001
+  sensitivity_alphas: []
 evaluation:
   label_metrics:
   - accuracy
@@ -79,10 +77,9 @@ evaluation:
   - VUS_ROC
   - VUS_PR
   supplementary_label_metrics: []
-  regression_metrics: [mae, mse, rmse, mape, smape, mase, wape, msmape, mae_norm, mse_norm, rmse_norm, mape_norm, smape_norm, mase_norm, wape_norm, msmape_norm]
-  regression_seasonality: 1
+  regression_metrics: []
   recovery_confirmation: 8
-  latency_points: 256
+  latency_points: 0
 runtime:
   cuda_visible_devices: '1'
   cuda_device_order: PCI_BUS_ID
@@ -94,6 +91,7 @@ runtime:
   cpu_max_percent: 80
   cpu_check_interval_seconds: 5
   output: outputs
+  keep_intermediates: false
   run_subdir: runs
   timestamp_utc_offset_hours: 8
   log_dir: logs

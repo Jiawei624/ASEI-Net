@@ -163,19 +163,8 @@ def rf(actual: np.ndarray, predicted: np.ndarray, **kwargs):
 
 
 def precision_at_k(actual: np.ndarray, predicted: np.ndarray, **kwargs):
-    (
-        AUC_ROC,
-        Precision,
-        Recall,
-        F,
-        Rrecall,
-        ExistenceReward,
-        OverlapReward,
-        Rprecision,
-        RF,
-        Precision_at_k,
-    ) = metricor_grader.metric_new(actual, predicted, plot_ROC=False)
-    return Precision_at_k
+    from ..metrics import precision_at_k as topk_precision
+    return topk_precision(actual, kwargs.get("scores", predicted))
 
 def affiliation_f(actual: np.ndarray, predicted: np.ndarray, **kwargs):
     events_pred = convert_vector_to_events(predicted)

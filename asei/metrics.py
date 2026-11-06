@@ -6,6 +6,12 @@ import numpy as np
 
 from .tasks import event_ranges
 
+METRICS_PROTOCOL = "detection22_score_topk_v2"
+LABEL_METRIC_ORDER = ("accuracy", "precision", "recall", "f_score", "adjust_accuracy", "adjust_precision",
+                      "adjust_recall", "adjust_f_score", "rprecision", "rrecall", "rf", "precision_at_k",
+                      "affiliation_precision", "affiliation_recall", "affiliation_f", "add")
+SCORE_METRIC_ORDER = ("auc_roc", "auc_pr", "R_AUC_ROC", "R_AUC_PR", "VUS_ROC", "VUS_PR")
+
 LABEL_METRICS = {"accuracy", "precision", "recall", "f_score", "adjust_accuracy", "adjust_precision",
                  "adjust_recall", "adjust_f_score", "rprecision", "rrecall", "rf", "precision_at_k",
                  "affiliation_precision", "affiliation_recall", "affiliation_f", "add"}
@@ -104,7 +110,23 @@ def _safe_metric(name, function, errors):
         return float("nan")
 
 
-def label_metrics(actual, predicted, names, errors):
+def precision_at_k(actual, scores):
+    """Top-K score precision; boundary ties receive their expected contribution."""
+    actual, scores = np.asarray(actual), np.asarray(scores, np.float64)
+    if actual.ndim != 1 or actual.shape != scores.shape or not len(actual):
+        raise ValueError("Precision at K requires equally sized, nonempty vectors.")
+    if not np.isin(actual, [0, 1]).all() or not np.isfinite(scores).all():
+        raise ValueError("Precision at K requires binary labels and finite scores.")
+    k = int(actual.sum())
+    if not k:
+        return float("nan")
+    boundary = np.partition(scores, len(scores) - k)[len(scores) - k]
+    above, tied = scores > boundary, scores == boundary
+    remaining = k - int(above.sum())
+    return float((actual[above].sum() + remaining * actual[tied].mean()) / k)
+
+
+def label_metrics(actual, predicted, names, errors, scores=None):
     unknown = set(names) - LABEL_METRICS
     if unknown:
         raise ValueError(f"Unsupported label metrics: {unknown}")
@@ -113,9 +135,11 @@ def label_metrics(actual, predicted, names, errors):
     actual, predicted = _binary_pair(actual, predicted)
     adjusted = None
     shared = {}
-    range_index = {"rrecall": 4, "rprecision": 7, "rf": 8, "precision_at_k": 9}
+    range_index = {"rrecall": 4, "rprecision": 7, "rf": 8}
 
     def native_value(name):
+        if name == "precision_at_k":
+            return precision_at_k(actual, predicted if scores is None else scores)
         if name in range_index:
             if "range" not in shared:
                 shared["range"] = module.metricor_grader.metric_new(actual.copy(), predicted.copy(), plot_ROC=False)
@@ -179,25 +203,24 @@ def evaluate(actual, scores, valid, threshold, cfg):
         raise ValueError("Ready scores and threshold must be finite.")
     predicted = (valid & (scores > threshold)).astype(np.int8)
     errors = {}
-    labels = label_metrics(actual, predicted, cfg["label_metrics"], errors)
-    supplementary = label_metrics(actual, predicted, cfg.get("supplementary_label_metrics", []), errors)
     if valid.any():
         floor = np.nextafter(scores[valid].min(), -np.inf)
         full_scores = np.where(valid, scores, floor)
         ranking = score_metrics(actual, full_scores, cfg["score_metrics"], errors)
-        ready_errors = {}
-        ready = score_metrics(actual[valid], scores[valid], ["auc_roc", "auc_pr"], ready_errors)
-        errors.update({"ready_" + k: v for k, v in ready_errors.items()})
     else:
+        full_scores = np.zeros(len(actual), np.float64)
         ranking = {n: float("nan") for n in cfg["score_metrics"]}
-        ready = {n: float("nan") for n in ("auc_roc", "auc_pr")}
         errors["scores"] = "No scorable test point."
-    return {"label": labels, "score": ranking, "ready_score": ready, "supplementary": supplementary,
-            "event": event_metrics(actual, predicted, valid, cfg["recovery_confirmation"]),
+    labels = label_metrics(actual, predicted, cfg["label_metrics"], errors, full_scores)
+    if not valid.any() and "precision_at_k" in labels:
+        labels["precision_at_k"] = float("nan")
+        errors["precision_at_k"] = "No scorable test point."
+    return {"label": labels, "score": ranking,
             "undefined_or_warnings": errors,
-            "score_convention": "Full time axis; unavailable scores rank below all finite scores. Ready AP/AUC use observed ready points only.",
+            "protocol": METRICS_PROTOCOL,
+            "score_convention": "Full time axis; unavailable scores rank below all finite scores. Precision at K uses continuous scores with fractional boundary ties.",
             "point_adjustment_in_primary_metrics": bool(POINT_ADJUSTED_METRICS.intersection(labels)),
-            "label_convention": "Only adjust_* metrics use point-adjusted alarms; other label metrics and ADD use original alarms."}, predicted
+            "label_convention": "Only adjust_* metrics use point-adjusted alarms; precision_at_k ranks continuous scores; all other label metrics and ADD use original alarms."}, predicted
 
 
 def regression_metrics(actual, predicted, names=("mae", "mse", "rmse"), **kwargs):
