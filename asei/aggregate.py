@@ -46,7 +46,7 @@ def collect(root, seeds=None):
     if not rows:
         raise ValueError("No completed detection results found.")
     frame = pd.DataFrame(rows)
-    keys = ["dataset", "entity", "seed", "variant"]
+    keys = ["dataset", "entity", "seed", "variant", "metrics_protocol"]
     if frame.duplicated(keys + ["run_id"]).any():
         raise ValueError("Duplicate entity/seed/variant results within the same run; select one output root.")
     keep = []
@@ -79,6 +79,8 @@ def paired_comparison(root, baseline_root, metric, variant, baseline_variant, sa
     if metric not in left or metric not in right:
         raise ValueError(f"Metric is absent: {metric}")
     joined = left.merge(right, on=["dataset", "entity", "seed"], suffixes=("_method", "_baseline"))
+    if (joined.metrics_protocol_method != joined.metrics_protocol_baseline).any():
+        raise ValueError("Paired comparisons require the same metrics protocol on both sides.")
     joined["difference"] = joined[metric + "_method"] - joined[metric + "_baseline"]
     joined = joined[np.isfinite(joined.difference)]
     if joined.empty:

@@ -10,3 +10,6 @@ tqdm>=4.64.0
 
 # YAML configuration reader.
 PyYAML>=5.1
+
+# Dataset downloader (scripts/download_data.py).
+gdown

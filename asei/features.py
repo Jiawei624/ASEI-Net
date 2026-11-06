@@ -148,6 +148,8 @@ def score_features(sequence: FeatureSequence, representation, detector, block_le
         block = sequence.block(start, min(n, start + block_length), representation)
         if execution == "block":
             out, state = detector.forward_block({k: v[None] for k, v in block.items()}, state, diagnostics)
+            if not torch.isfinite(out["score"][out["valid"]]).all():
+                raise FloatingPointError("Non-finite detector score at a scorable point.")
             stop = start + len(block["chi"])
             ready = out["valid"][0].cpu().numpy()
             scores[start:stop] = np.where(ready, out["score"][0].cpu().numpy(), np.nan)
@@ -158,6 +160,8 @@ def score_features(sequence: FeatureSequence, representation, detector, block_le
         else:
             for t in range(len(block["chi"])):
                 out, state = detector.step({k: v[t:t + 1] for k, v in block.items()}, state, diagnostics)
+                if not torch.isfinite(out["score"][out["valid"]]).all():
+                    raise FloatingPointError("Non-finite detector score at a scorable point.")
                 i = start + t
                 if out["valid"].item():
                     scores[i] = out["score"].item()
@@ -209,6 +213,8 @@ class StreamingDetector:
                  "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
                  "observed": observed, "prediction_ready": torch.ones_like(observed)}
             out, self.state = self.detector.step(f, self.state, diagnostics)
+            if not torch.isfinite(out["score"][out["valid"]]).all():
+                raise FloatingPointError("Non-finite detector score at a scorable point.")
             if out["valid"].item():
                 result.update(score=out["score"].item(), valid=True,
                               alarm=out["score"].item() > self.threshold,

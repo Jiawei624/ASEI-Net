@@ -12,7 +12,7 @@ def is_st(data: pd.DataFrame) -> bool:
     :param data: The series data.
     :return: Are all values in 'cols' column are in spatial-temporal format.
     """
-    return data.shape[1] == 4
+    return {"date", "id", "cols", "data"}.issubset(data.columns)
 
 
 def read_data(path: str, nrows=None) -> Union[pd.DataFrame, np.ndarray]:
@@ -40,56 +40,41 @@ def process_data_df(data: pd.DataFrame, nrows=None) -> pd.DataFrame:
     :param data: Data frame to read.
     :return:  The DataFrame of the content of the data file.
     """
-    label_exists = "label" in data["cols"].values
-
-    all_points = data.shape[0]
-
-    columns = data.columns
-
-    if columns[0] == "date":
-        n_points = data.iloc[:, 2].value_counts().max()
+    if data.empty or "cols" not in data or data["cols"].isna().any():
+        raise ValueError("Long-format data requires nonempty, named channels.")
+    value_columns = [name for name in data if name not in {"cols", "date"}]
+    if len(value_columns) != 1:
+        raise ValueError("Long-format data requires one value column, cols and optional date.")
+    value = value_columns[0]
+    names = data["cols"].unique().tolist()
+    # TAB files have millions of rows in contiguous channel blocks. Avoid a
+    # full-table pivot/copy while still accepting interleaved long-format rows.
+    channel_values = data["cols"].to_numpy()
+    edges = np.r_[0, np.flatnonzero(channel_values[1:] != channel_values[:-1]) + 1, len(data)]
+    if len(edges) - 1 == len(names):
+        groups = ((channel_values[left], data.iloc[left:right]) for left, right in zip(edges[:-1], edges[1:]))
     else:
-        n_points = data.iloc[:, 1].value_counts().max()
-
-    is_univariate = n_points == all_points
-
-    n_cols = all_points // n_points
-    df = pd.DataFrame()
-
-    cols_name = data["cols"].unique()
-
-    if columns[0] == "date" and not is_univariate:
-        df["date"] = data.iloc[:n_points, 0]
-        col_data = {
-            cols_name[j]: data.iloc[j * n_points : (j + 1) * n_points, 1].tolist()
-            for j in range(n_cols)
-        }
-        df = pd.concat([df, pd.DataFrame(col_data)], axis=1)
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-
-    elif columns[0] != "date" and not is_univariate:
-        col_data = {
-            cols_name[j]: data.iloc[j * n_points : (j + 1) * n_points, 0].tolist()
-            for j in range(n_cols)
-        }
-        df = pd.concat([df, pd.DataFrame(col_data)], axis=1)
-
-    elif columns[0] == "date" and is_univariate:
-        df["date"] = data.iloc[:, 0]
-        df[cols_name[0]] = data.iloc[:, 1]
-
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-
+        groups = data.groupby("cols", sort=False)
+    if "date" in data:
+        timeline, columns = None, {}
+        for name, group in groups:
+            times = pd.DatetimeIndex(pd.to_datetime(group["date"], errors="raise"))
+            if times.hasnans or not times.is_unique:
+                raise ValueError("Duplicate or missing channel timestamps in long-format data.")
+            if timeline is None:
+                timeline = times.sort_values()
+            order = times.get_indexer(timeline)
+            if len(times) != len(timeline) or (order < 0).any():
+                raise ValueError("Long-format channels must share the same timestamp grid.")
+            columns[name] = group[value].to_numpy()[order]
+        df = pd.DataFrame(columns, index=timeline)
+        df.index.name = "date"
     else:
-        df[cols_name[0]] = data.iloc[:, 0]
-
-    if label_exists:
-        # Get the column name of the last column
-        last_col_name = df.columns[-1]
-        # Renaming the last column as "label"
-        df.rename(columns={last_col_name: "label"}, inplace=True)
+        columns = {name: group[value].to_numpy() for name, group in groups}
+        if len({len(group) for group in columns.values()}) != 1:
+            raise ValueError("Long-format channels have unequal lengths.")
+        df = pd.DataFrame(columns)
+    df.columns.name = None
 
     if nrows is not None and isinstance(nrows, int) and df.shape[0] >= nrows:
         df = df.iloc[:nrows, :]
