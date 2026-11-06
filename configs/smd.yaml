@@ -10,8 +10,8 @@ data:
   datasets:
   - SMD
 model:
-  window: 256
-  d_model: 96
+  window: 128
+  d_model: 64
   heads: 4
   layers: 2
   dropout: 0.1
@@ -23,17 +23,17 @@ stage1:
   lr: 0.0003
   weight_decay: 0.0001
   warmup_epochs: 5
-  patience: 10
-  stride: 1
+  patience: 8
+  stride: 2
   workers: 4
 stage2:
-  epochs: 50
+  epochs: 60
   batch_pairs: 32
-  lr: 0.001
-  patience: 8
+  lr: 0.0003
+  patience: 10
   block_length: 256
-  train_pairs: 1024
-  validation_pairs: 128
+  train_pairs: 2048
+  validation_pairs: 256
   validation_seeds:
   - 1001
   - 1002
