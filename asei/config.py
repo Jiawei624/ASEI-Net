@@ -14,6 +14,7 @@ from .resources import validate_cpu_config
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
+TAB_ANOMALY_RATIOS = (0.1, 0.5, 1., 2., 3., 5., 10., 15., 20., 25.)
 REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
                    "summary": "summary", "environment": "environment.json", "predictions": "predictions"}
 
@@ -52,9 +53,35 @@ def resolve_paths(cfg: dict) -> dict:
         raise ValueError("runtime.task_cache_checkpoint_pairs must be positive.")
     if not isinstance(runtime.get("keep_intermediates", False), bool):
         raise ValueError("runtime.keep_intermediates must be a boolean.")
+    if not isinstance(runtime.get("reuse_clean_features", True), bool):
+        raise ValueError("runtime.reuse_clean_features must be boolean.")
     reports = cfg.setdefault("reports", {})
     for name, value in REPORT_DEFAULTS.items():
         reports.setdefault(name, value)
+    calibration = cfg.setdefault("calibration", {})
+    calibration.setdefault("method", "normal_validation")
+    if calibration["method"] == "tab_anomaly_ratio":
+        ratios = calibration.setdefault("anomaly_ratios", list(TAB_ANOMALY_RATIOS))
+        if isinstance(ratios, (int, float)):
+            ratios = calibration["anomaly_ratios"] = [ratios]
+        default_ratio = 1. if isinstance(ratios, (list, tuple)) and 1. in ratios else (ratios[0] if isinstance(ratios, (list, tuple)) and ratios else 1.)
+        calibration.setdefault("prediction_ratio", default_ratio)
+    elif calibration["method"] == "normal_validation":
+        calibration.setdefault("alpha", .01)
+    else:
+        raise ValueError("calibration.method must be tab_anomaly_ratio or normal_validation.")
+    if cfg.get("stage2", {}).get("method") == "in_1_2_3":
+        cfg["data"].setdefault("selection_fraction", .5)
+        s = cfg["stage2"]
+        for key, default in dict(cell="contractive", eta=.2, rho=.95, energy_weight=1., beta_init=2.,
+                lambda_ref=.1, lambda_sep=.1, lambda_tail=.1, gamma_max=.25, tail_margin=.5,
+                tail_fraction=.01, hard_negative_fraction=.25, discrete_max_values=16,
+                donor_candidates=16, boundary_blend=4).items():
+            s.setdefault(key, default)
+        teacher = cfg.setdefault("teacher", {})
+        for key, default in dict(epochs=10, patience=3, lr=.0003, batch_sequences=16,
+                sequence_length=512, train_sequences=512, validation_sequences=64).items():
+            teacher.setdefault(key, default)
     return cfg
 
 
@@ -105,6 +132,10 @@ def load_config(path: str | Path) -> dict:
 
 def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
     cfg = resolve_paths(copy.deepcopy(cfg))
+    if not isinstance(cfg["data"].get("separate_calibration", False), bool):
+        raise ValueError("data.separate_calibration must be boolean.")
+    if "selection_fraction" in cfg["data"] and not 0 < cfg["data"]["selection_fraction"] < 1:
+        raise ValueError("data.selection_fraction must be in (0,1).")
     m = cfg["model"]
     if n_train < 65:
         raise ValueError("At least 65 normal training samples are required.")
@@ -126,15 +157,57 @@ def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
             raise ValueError("Prototype capacity must be positive.")
     m["channels"] = channels
     s2 = cfg["stage2"]
+    for section in ("stage2", "teacher"):
+        if section in cfg and cfg[section].get("optimizer_update", "block") not in {"block", "task_batch"}:
+            raise ValueError(section + ".optimizer_update must be block or task_batch.")
+    method = s2.get("method", "in_1_2_2")
+    if method not in {"in_1_2_2", "in_1_2_3"}:
+        raise ValueError("stage2.method must be in_1_2_2 or in_1_2_3.")
+    if method == "in_1_2_3":
+        m["energy_normalization"] = True
+        if not 0 < cfg["data"]["selection_fraction"] < 1:
+            raise ValueError("data.selection_fraction must be in (0,1).")
+        if s2["cell"] not in {"contractive", "gru"} or not 0 < s2["eta"] <= 1 or not 0 < s2["rho"] < 1:
+            raise ValueError("Invalid recurrent cell or contraction parameters.")
+        for key in ("energy_weight", "beta_init", "gamma_max"):
+            if not math.isfinite(s2[key]) or s2[key] <= 0:
+                raise ValueError("stage2." + key + " must be finite and positive.")
+        for key in ("lambda_ref", "lambda_sep", "lambda_tail", "tail_margin"):
+            if not math.isfinite(s2[key]) or s2[key] < 0:
+                raise ValueError("stage2." + key + " must be finite and nonnegative.")
+        if not 0 < s2["tail_fraction"] <= 1 or not 0 <= s2["hard_negative_fraction"] <= 1:
+            raise ValueError("Invalid normal tail or hard-negative fraction.")
+        for key in ("discrete_max_values", "donor_candidates", "boundary_blend"):
+            value = s2[key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == "boundary_blend" else 1):
+                raise ValueError("Invalid stage2." + key)
+        for key in ("epochs", "patience", "batch_sequences", "sequence_length", "train_sequences", "validation_sequences"):
+            value = cfg["teacher"][key]
+            if isinstance(value, bool) or not isinstance(value, int) or value < (2 if key == "sequence_length" else 1):
+                raise ValueError("Invalid teacher." + key)
+        if not math.isfinite(cfg["teacher"]["lr"]) or cfg["teacher"]["lr"] <= 0:
+            raise ValueError("teacher.lr must be finite and positive.")
     s2.setdefault("sources", ["relation", "marginal", "joint"])
     if s2["train_pairs"] == "auto":
         s2["train_pairs"] = 1024 if n_train >= 100000 else 512
     if not 0 < cfg["data"]["train_fraction"] < 1:
         raise ValueError("train_fraction must be in (0, 1).")
-    if not 0 < cfg["calibration"]["alpha"] < 1:
-        raise ValueError("alpha must be in (0, 1).")
-    if s2["variant"] not in {"full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru"}:
+    if cfg["calibration"]["method"] == "normal_validation":
+        if not 0 < cfg["calibration"]["alpha"] < 1:
+            raise ValueError("alpha must be in (0, 1).")
+    else:
+        from .metrics import anomaly_ratios
+        cal = cfg["calibration"]
+        cal["anomaly_ratios"] = anomaly_ratios(cal["anomaly_ratios"])
+        if isinstance(cal["prediction_ratio"], bool) or cal["prediction_ratio"] not in cal["anomaly_ratios"]:
+            raise ValueError("calibration.prediction_ratio must be one of anomaly_ratios.")
+    variants = {"full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru"}
+    if method == "in_1_2_3":
+        variants |= {"no_teacher", "no_separation", "no_tail", "no_energy"}
+    if s2["variant"] not in variants:
         raise ValueError("Unknown detector variant.")
+    if not s2["families"] or set(s2["families"]) - {"level", "variance", "temporal", "relation"}:
+        raise ValueError("Invalid synthetic task families.")
     for section, names in (("stage1", ("epochs", "batch_size", "stride", "patience")),
                             ("stage2", ("epochs", "batch_pairs", "block_length", "train_pairs", "validation_pairs", "patience")),
                             ("runtime", ("feature_batch_size", "threads"))):

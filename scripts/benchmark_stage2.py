@@ -30,7 +30,7 @@ def main():
     configure_cuda(cfg, gpu=args.gpu, device=args.device)
     configure_cpu(cfg)
     import torch
-    from asei.model import DualTrajectoryDetector
+    from asei.model import make_detector
     from asei.pipeline import get_device
 
     device = get_device(cfg["runtime"]["device"])
@@ -43,12 +43,11 @@ def main():
     batch, channels = 2 * pairs, args.channels
     identity_dim = cfg["model"]["d_model"]
     identity_dim = 96 if identity_dim == "auto" else identity_dim
-    model = DualTrajectoryDetector(torch.randn(channels, identity_dim, device=device),
-                                   variant=cfg["stage2"]["variant"], sources=cfg["stage2"]["sources"],
-                                   fixed_retention=cfg["stage2"]["fixed_retention"]).to(device).train()
+    model = make_detector(torch.randn(channels, identity_dim, device=device), cfg["stage2"]).to(device).train()
     shape = (batch, length, channels)
     f = {name: torch.randn(*shape, 37, device=device) for name in ("chi", "marginal", "joint")}
     f.update(prediction=torch.randn(*shape, 2, device=device), residual=torch.randn(*shape, 2, device=device))
+    f["energy"] = torch.rand(*shape, 2, device=device)
     f.update({name: torch.ones(*shape, dtype=torch.bool, device=device)
               for name in ("m_valid", "j_valid", "observed", "prediction_ready")})
 
@@ -95,6 +94,7 @@ def main():
                    device=str(device), torch=str(torch.__version__), pairs=pairs, channels=channels, length=length,
                    max_score_difference=max_difference, allow_tf32=bool(tf32),
                    accelerator=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+                   method=cfg["stage2"].get("method", "in_1_2_2"), cell=cfg["stage2"].get("cell", "gru"),
                    scope="Synthetic detector forward/backward only; excludes data loading and frozen feature extraction.")
     output = (project_path(args.output) if args.output else Path(cfg["runtime"]["output"]) / "benchmarks" /
               (Path(args.config).stem + "_stage2.json"))

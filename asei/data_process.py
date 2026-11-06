@@ -24,7 +24,9 @@ def read_data(path: str, nrows=None) -> Union[pd.DataFrame, np.ndarray]:
     :param path: The path to the data file.
     :return:  The content of the data file.
     """
-    data = pd.read_csv(path)
+    # Numeric channel names coexist with "label" in TAB. Chunked inference can
+    # otherwise split channel 0 into the integer 0 and string "0" on large files.
+    data = pd.read_csv(path, dtype={"cols": str})
     if is_st(data):
         return process_data_np(data, nrows)
     else:

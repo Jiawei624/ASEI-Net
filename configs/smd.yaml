@@ -27,6 +27,8 @@ stage1:
   stride: 2
   workers: 4
 stage2:
+  optimizer_update: task_batch
+  method: in_1_2_3
   epochs: 60
   batch_pairs: 32
   lr: 0.0003
@@ -48,9 +50,12 @@ stage2:
   - marginal
   - joint
   fixed_retention: 0.9
+teacher:
+  optimizer_update: task_batch
 calibration:
-  alpha: 0.01
-  sensitivity_alphas: []
+  method: tab_anomaly_ratio
+  anomaly_ratios: [0.1, 0.5, 1.0, 2, 3, 5, 10, 15, 20, 25]
+  prediction_ratio: 1.0
 evaluation:
   label_metrics:
   - accuracy

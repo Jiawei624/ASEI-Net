@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from .data import Record
 from .compat import transformer_encoder
 from .resources import cooperate
+from .state import ContractiveCell, recurrent_cell
 
 
 def mlp(n_in, hidden, n_out):
@@ -151,10 +152,10 @@ class PrototypeMemory(nn.Module):
                  + 0.25 * (qj - pj.detach()).square().mean(-1))
         mv = complete & self.m_active.any(-1)[None]
         jv = complete.all(-1) & self.j_active.any()
-        loss = (mloss * mv).sum() / mv.sum().clamp_min(1)
-        loss = loss + (jloss * jv).sum() / jv.sum().clamp_min(1)
+        sums, counts = torch.stack([(mloss * mv).sum(), (jloss * jv).sum()]), torch.stack([mv.sum(), jv.sum()])
+        loss = (sums / counts.clamp_min(1)).sum()
         return loss, {"qm": qm.detach(), "qj": qj.detach(), "mi": mi.detach(), "ji": ji.detach(),
-                      "mv": mv, "jv": jv}
+                      "mv": mv, "jv": jv, "loss_sums": sums.detach(), "loss_counts": counts.detach()}
 
     @torch.no_grad()
     def cache_decoders(self, identity):
@@ -191,6 +192,13 @@ class NormalRepresentation(nn.Module):
         self.relation = nn.Parameter(a, requires_grad=c > 1)
         self.register_buffer("off_diagonal", ~torch.eye(c, dtype=torch.bool))
         self.memory = PrototypeMemory(c, d, cfg["marginal_prototypes"], cfg["joint_prototypes"])
+        if cfg.get("energy_normalization", False):
+            self.register_buffer("energy_scale", torch.ones(c, 2))
+
+    def energy_components(self, chi, marginal, joint):
+        energy = torch.stack([self.memory.reconstruction_loss(marginal, chi),
+                              self.memory.reconstruction_loss(joint, chi)], -1)
+        return energy / self.energy_scale if hasattr(self, "energy_scale") else energy
 
     def predict(self, history, masks):
         h = self.history(history, masks)
@@ -212,7 +220,7 @@ class NormalRepresentation(nn.Module):
         b = self.relation
         low = b.masked_fill(~self.off_diagonal, torch.inf).amin(1) - cap
         high = b.masked_fill(~self.off_diagonal, -torch.inf).amax(1)
-        for _ in range(50):
+        for _ in range(32):
             mid = (low + high) / 2
             total = ((b - mid[:, None]).clamp(0, cap) * self.off_diagonal).sum(1)
             low = torch.where(total > 1, mid, low)
@@ -225,9 +233,12 @@ class NormalRepresentation(nn.Module):
         errors = F.huber_loss(predictions[..., :branches],
                               batch["target"][..., None].expand_as(predictions[..., :branches]), reduction="none")
         observed = batch["target_mask"]
-        forecast_loss = (errors.mean(-1) * observed).sum() / observed.sum().clamp_min(1)
+        forecast_sum, forecast_count = (errors.mean(-1) * observed).sum(), observed.sum()
+        forecast_loss = forecast_sum / forecast_count.clamp_min(1)
         chi = self.descriptor(batch["segment"])
         proto_loss, usage = self.memory.loss(chi, batch["segment_mask"].all(1), self.history.identity.weight)
+        usage["normal_loss_sums"] = torch.cat([forecast_sum.detach()[None], usage["loss_sums"]])
+        usage["normal_loss_counts"] = torch.cat([forecast_count.detach()[None], usage["loss_counts"]])
         return forecast_loss + proto_loss, usage
 
 
@@ -394,3 +405,141 @@ class DualTrajectoryDetector(nn.Module):
                           marginal_difference=((chi - rm) * mv[..., None]).norm(dim=-1),
                           joint_difference=((chi - rj) * jv[..., None]).norm(dim=-1))
         return output, DetectorState(old_o, old_n)
+
+
+DETECTOR_FIELDS = ("variant", "fixed_retention", "sources", "method", "cell", "eta", "rho", "energy_weight", "beta_init")
+
+
+def detector_settings(stage2):
+    return {name: stage2[name] for name in DETECTOR_FIELDS if name in stage2}
+
+
+def make_detector(identity, settings):
+    settings = detector_settings(settings)
+    method = settings.pop("method", "in_1_2_2")
+    if method == "in_1_2_3":
+        return ReferenceConsistentDetector(identity, **settings)
+    if method != "in_1_2_2":
+        raise ValueError("Unknown detection method: " + str(method))
+    return DualTrajectoryDetector(identity, **{k: v for k, v in settings.items()
+        if k in {"variant", "fixed_retention", "sources"}})
+
+
+class ReferenceConsistentDetector(DualTrajectoryDetector):
+    """Paired normal-state learning with bounded dynamics and positive energy readout."""
+
+    def __init__(self, identity, variant="full", fixed_retention=.9, sources=None,
+                 cell="contractive", eta=.2, rho=.95, energy_weight=1., beta_init=2.):
+        super().__init__(identity, variant, fixed_retention, sources)
+        self.gru = recurrent_cell(cell, eta, rho)
+        if variant == "independent_gru":
+            self.normal_gru = recurrent_cell(cell, eta, rho)
+        self.energy_weight = float(energy_weight) if variant != "no_energy" else 0.
+        self.raw_beta = nn.Parameter(torch.tensor(float(np.log(np.expm1(beta_init)))))
+
+    @torch.no_grad()
+    def project(self):
+        for cell in (self.gru, self.normal_gru):
+            if isinstance(cell, ContractiveCell):
+                cell.project()
+
+    def _prepare(self, f):
+        chi, prediction = f["chi"].float(), f["prediction"].float().clone()
+        mv = f["m_valid"].bool() & ("marginal" in self.sources)
+        jv = f["j_valid"].bool() & ("joint" in self.sources)
+        rv = torch.full_like(mv, len(self.identity) > 1 and "relation" in self.sources)
+        rm, rj = f["marginal"].float() * mv[..., None], f["joint"].float() * jv[..., None]
+        eps = f["residual"].float().clone()
+        eps[..., 1] *= rv
+        prediction[..., 1] *= rv
+        availability = torch.stack([rv, mv, jv], -1).float()
+        dm, dj = (chi - rm) * mv[..., None], (chi - rj) * jv[..., None]
+        evidence = self.evidence(torch.cat([eps, dm, dj, availability], -1))
+        identity = self.identity.expand(*chi.shape[:-2], -1, -1)
+        context = self.normal_context(torch.cat([rm, rj, identity, availability[..., 1:]], -1))
+        reference = torch.where(jv[..., None], rj, rm)
+        if "energy" in f:
+            components = f["energy"].float()
+        else:  # Synthetic operator probes can use unit scales.
+            components = torch.stack([PrototypeMemory.reconstruction_loss(rm, chi),
+                                      PrototypeMemory.reconstruction_loss(rj, chi)], -1)
+        energy = (components * availability[..., 1:]).sum(-1) / availability[..., 1:].sum(-1).clamp_min(1)
+        scorable = f["observed"].bool() & f["prediction_ready"].bool()
+        on = self.adapter(torch.cat([chi, prediction, identity], -1))
+        normal_input = self.adapter(torch.cat([reference, prediction, identity], -1))
+        if isinstance(self.gru, ContractiveCell):
+            on = self.gru.input(on)
+        normal_cell = self.normal_gru if self.normal_gru is not None else self.gru
+        if isinstance(normal_cell, ContractiveCell):
+            normal_input = normal_cell.input(normal_input)
+        return dict(evidence=evidence, context=context, energy=energy,
+            on=on, normal_input=normal_input,
+            usable=(mv | jv) & scorable, scorable=scorable,
+            marginal_difference=dm.norm(dim=-1), joint_difference=dj.norm(dim=-1))
+
+    def _advance(self, p, state):
+        if self.variant == "mlp":
+            zeros = torch.zeros_like(state.observed)
+            return DetectorState(zeros, zeros.clone()), torch.ones_like(zeros)
+        old_o, old_n = state.observed, state.normal
+        retain = torch.sigmoid(self.gate(torch.cat([p["evidence"], p["context"], old_o - old_n], -1)))
+        if self.variant in {"no_alignment", "single_gru"}:
+            retain = torch.ones_like(retain)
+        elif self.variant == "fixed_gate":
+            retain = torch.full_like(retain, self.fixed_retention)
+        target = torch.zeros_like(old_n) if self.variant == "zero_alignment" else old_n
+        aligned = retain * old_o + (1 - retain) * target
+        cell = self.normal_gru if self.normal_gru is not None else self.gru
+        update_o = self.gru.forward_projected if isinstance(self.gru, ContractiveCell) else self.gru
+        if self.normal_gru is None:
+            inputs = torch.cat([p["on"].reshape(-1, 32), p["normal_input"].reshape(-1, 32)], 0)
+            previous = torch.cat([aligned.reshape(-1, 32), old_n.reshape(-1, 32)], 0)
+            new_o, new_n = update_o(inputs, previous).chunk(2, 0)
+            new_o, new_n = new_o.reshape_as(old_o), new_n.reshape_as(old_n)
+        else:
+            update_n = cell.forward_projected if isinstance(cell, ContractiveCell) else cell
+            new_o = update_o(p["on"].reshape(-1, 32), aligned.reshape(-1, 32)).reshape_as(old_o)
+            new_n = update_n(p["normal_input"].reshape(-1, 32), old_n.reshape(-1, 32)).reshape_as(old_n)
+        new_o, new_n = new_o * p["usable"][..., None], new_n * p["usable"][..., None]
+        if self.variant in {"single_gru", "mlp"}:
+            new_n = torch.zeros_like(new_n)
+        if self.variant == "mlp":
+            new_o = torch.zeros_like(new_o)
+        return DetectorState(new_o, new_n), retain
+
+    def _readout(self, p, observed, normal, retention, diagnostics, return_aux):
+        delta = observed - normal
+        learned = self.head(torch.cat([p["evidence"], delta, normal], -1)).squeeze(-1)
+        logits = self.energy_weight * torch.log1p(p["energy"]) + F.softplus(learned) - F.softplus(self.raw_beta)
+        score, attribution = logits.masked_fill(~p["scorable"], -torch.inf).max(-1)
+        valid = p["scorable"].any(-1)
+        out = dict(score=torch.where(valid, score, torch.zeros_like(score)), valid=valid, attribution=attribution)
+        if diagnostics:
+            out.update(retention=retention.mean(-1), state_difference=delta.norm(dim=-1),
+                marginal_difference=p["marginal_difference"], joint_difference=p["joint_difference"],
+                prototype_energy=p["energy"])
+        if return_aux:
+            out.update(normal_state=normal, state_delta=delta, energy=p["energy"], reference_valid=p["usable"])
+        return out
+
+    def step(self, f, state=None, diagnostics=False, return_aux=False):
+        p = self._prepare(f)
+        state = state or self.initial_state(f["chi"].shape[0], f["chi"].device)
+        state, retention = self._advance(p, state)
+        return self._readout(p, state.observed, state.normal, retention, diagnostics, return_aux), state
+
+    def forward_block(self, f, state=None, diagnostics=False, return_aux=False):
+        if not f["chi"].shape[1]:
+            raise ValueError("A detector block must contain at least one time point.")
+        p = self._prepare(f)
+        state = state or self.initial_state(f["chi"].shape[0], f["chi"].device)
+        # Unbind once to avoid quadratic select-backward buffers.
+        steps = {name: value.transpose(0, 1).contiguous().unbind(0) for name, value in p.items()}
+        observed, normal, retentions = [], [], []
+        for t in range(f["chi"].shape[1]):
+            state, retention = self._advance({name: values[t] for name, values in steps.items()}, state)
+            observed.append(state.observed)
+            normal.append(state.normal)
+            retentions.append(retention)
+        return self._readout(p, torch.stack(observed, 1), torch.stack(normal, 1),
+                             torch.stack(retentions, 1), diagnostics, return_aux), state

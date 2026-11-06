@@ -41,6 +41,7 @@ class FeatureSequence:
         current = torch.as_tensor(self.z[indices], device=device)
         ready = torch.as_tensor(indices >= self.window, device=device)[:, None].expand_as(mi)
         return {"chi": chi, "prediction": pred, "residual": current[..., None] - pred,
+                "energy": model.energy_components(chi, rm, rj),
                 "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
                 "observed": torch.as_tensor(self.mask[indices], device=device), "prediction_ready": ready}
 
@@ -101,10 +102,12 @@ def batch_feature_blocks(sequences, start, stop, model):
     rm, rj, mv, jv = model.memory.references(torch.as_tensor(mi.reshape(-1, channels), device=device),
                                            torch.as_tensor(ji.reshape(-1), device=device))
     pred = torch.as_tensor(prediction, device=device)
+    rm = rm.reshape(batch, length, channels, 37)
+    rj = rj.reshape(batch, length, channels, 37)
     return {"chi": chi, "prediction": pred,
+            "energy": model.energy_components(chi, rm, rj),
             "residual": torch.as_tensor(current, device=device)[..., None] - pred,
-            "marginal": rm.reshape(batch, length, channels, 37),
-            "joint": rj.reshape(batch, length, channels, 37),
+            "marginal": rm, "joint": rj,
             "m_valid": mv.reshape(batch, length, channels), "j_valid": jv.reshape(batch, length, channels),
             "observed": torch.as_tensor(observed, device=device),
             "prediction_ready": torch.as_tensor(ready, device=device)}
@@ -112,24 +115,77 @@ def batch_feature_blocks(sequences, start, stop, model):
 
 @torch.no_grad()
 def extract_features(record: Record, model: NormalRepresentation, batch_size=64,
-                     log_interval_seconds=0, progress_label="feature extraction batches") -> FeatureSequence:
+                     log_interval_seconds=0, progress_label="feature extraction batches",
+                     reference=None, statistics=None) -> FeatureSequence:
     model.eval()
     device = next(model.parameters()).device
     n, c = record.z.shape
     w = model.cfg["window"]
     predictions = np.zeros((n, c, 2), np.float32)
     mi, ji = np.full((n, c), -1, np.int32), np.full(n, -1, np.int32)
+    changed = None
+    if reference is not None:
+        if reference.z.shape != record.z.shape or reference.window != w:
+            raise ValueError("Feature reuse needs the same time/channel shape and window.")
+        same = np.all(reference.z == record.z, axis=1) & np.all(reference.mask == record.mask, axis=1)
+        changed = np.r_[0, np.cumsum(~same, dtype=np.int64)]
+        predictions[:] = reference.prediction
+        mi[:], ji[:] = reference.marginal_index, reference.joint_index
+    counts = dict(predicted_targets=0, queried_targets=0, reused_predictions=0, reused_queries=0)
     for left in periodic_progress(range(w, n, batch_size), progress_label, log_interval_seconds):
         indices = np.arange(left, min(left + batch_size, n))
-        hidx = indices[:, None] + np.arange(-w, 0)
-        segment, smask = segment_arrays(record, indices)
-        pred = model.predict(torch.as_tensor(record.z[hidx], device=device),
-                             torch.as_tensor(record.mask[hidx], device=device))
-        chi = model.descriptor(torch.as_tensor(segment, device=device))
-        im, ij = model.memory.query(chi, torch.as_tensor(smask.all(1), device=device), model.history.identity.weight)
-        predictions[indices] = pred.cpu().numpy()
-        mi[indices], ji[indices] = im.cpu().numpy(), ij.cpu().numpy()
+        prediction_indices = indices if changed is None else indices[(changed[indices] - changed[indices - w]) > 0]
+        query_indices = indices if changed is None else indices[(changed[indices + 1] - changed[indices - 31]) > 0]
+        if len(prediction_indices):
+            hidx = prediction_indices[:, None] + np.arange(-w, 0)
+            pred = model.predict(torch.as_tensor(record.z[hidx], device=device),
+                                 torch.as_tensor(record.mask[hidx], device=device))
+            predictions[prediction_indices] = pred.cpu().numpy()
+        if len(query_indices):
+            segment, smask = segment_arrays(record, query_indices)
+            chi = model.descriptor(torch.as_tensor(segment, device=device))
+            im, ij = model.memory.query(chi, torch.as_tensor(smask.all(1), device=device), model.history.identity.weight)
+            mi[query_indices], ji[query_indices] = im.cpu().numpy(), ij.cpu().numpy()
+        counts["predicted_targets"] += len(prediction_indices)
+        counts["queried_targets"] += len(query_indices)
+        counts["reused_predictions"] += len(indices) - len(prediction_indices)
+        counts["reused_queries"] += len(indices) - len(query_indices)
+    if statistics is not None:
+        statistics.update(counts)
     return FeatureSequence(record.z, record.mask, predictions, mi, ji, w)
+
+
+def slice_normal_features(sequence, start, stop):
+    """Reuse frozen, window-local features with the task's own zero-state warmup."""
+    if not 0 <= start < stop <= len(sequence):
+        raise ValueError("Invalid source interval for normal feature reuse.")
+    prediction = sequence.prediction[start:stop].copy()
+    marginal, joint = sequence.marginal_index[start:stop].copy(), sequence.joint_index[start:stop].copy()
+    prediction[:sequence.window] = 0
+    marginal[:sequence.window], joint[:sequence.window] = -1, -1
+    return FeatureSequence(sequence.z[start:stop], sequence.mask[start:stop], prediction, marginal, joint, sequence.window)
+
+
+def feature_summary(sequence):
+    """Reference availability over targets, excluding the fixed history warmup."""
+    joint = sequence.joint_index[sequence.window:]
+    available = joint >= 0
+    edges = np.diff(np.r_[0, (~available).astype(np.int8), 0])
+    gaps = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+    marginal = sequence.marginal_index[sequence.window:]
+    return {"target_points": len(joint), "joint_coverage": float(available.mean()) if len(joint) else None,
+            "longest_joint_unavailable": int(gaps.max()) if len(gaps) else 0,
+            "used_joint_codes": len(np.unique(joint[available])),
+            "marginal_coverage_by_channel": (marginal >= 0).mean(0).tolist() if len(joint) else [],
+            "used_marginal_codes_by_channel": [len(np.unique(column[column >= 0])) for column in marginal.T]}
+
+
+def attribution_summary(attribution, valid, channels):
+    attribution, valid = np.asarray(attribution), np.asarray(valid, bool)
+    selected = attribution[valid & (attribution >= 0)]
+    counts = np.bincount(selected, minlength=channels)
+    return {"scored_points": int(valid.sum()), "max_channel_counts": counts.tolist(),
+            "max_channel_fractions": (counts / max(1, len(selected))).tolist()}
 
 
 @torch.no_grad()
@@ -143,6 +199,8 @@ def score_features(sequence: FeatureSequence, representation, detector, block_le
     attribution = np.full(n, -1, np.int32)
     extra = {k: np.zeros((n, c), np.float32) for k in
              ("retention", "state_difference", "marginal_difference", "joint_difference")} if diagnostics else {}
+    if diagnostics and hasattr(detector, "energy_weight"):
+        extra["prototype_energy"] = np.zeros((n, c), np.float32)
     state = None
     for start in periodic_progress(range(0, n, block_length), progress_label, log_interval_seconds):
         block = sequence.block(start, min(n, start + block_length), representation)
@@ -210,6 +268,7 @@ class StreamingDetector:
             rm, rj, mv, jv = self.representation.memory.references(mi, ji)
             observed = torch.as_tensor(mask[None], device=self.device)
             f = {"chi": chi, "prediction": pred, "residual": torch.as_tensor(z[None, :, None], device=self.device) - pred,
+                 "energy": self.representation.energy_components(chi, rm, rj),
                  "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
                  "observed": observed, "prediction_ready": torch.ones_like(observed)}
             out, self.state = self.detector.step(f, self.state, diagnostics)

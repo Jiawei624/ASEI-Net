@@ -10,6 +10,10 @@ from .data import Record
 TASK_SUPERVISION_PROTOCOL = "causal_event_prefix_v2"
 
 
+class TaskGenerationError(ValueError):
+    """A sampled task layout could not produce an observed change."""
+
+
 def event_ranges(labels):
     values = np.asarray(labels, dtype=bool)
     edges = np.diff(np.pad(values.astype(np.int8), (1, 1)))
@@ -84,7 +88,8 @@ class TaskPair:
 
 
 def generate_pair(source: Record, donor: Record, window: int, index: int, seed: int,
-                  families=("level", "variance", "temporal", "relation")) -> TaskPair:
+                  families=("level", "variance", "temporal", "relation"),
+                  hard_anchors=None, hard_fraction=0., relation_sampler=None, allowed_channels=None) -> TaskPair:
     rng = np.random.default_rng(np.random.SeedSequence([seed, index]))
     c = source.z.shape[1]
     families = [f for f in families if c > 1 or f != "relation"]
@@ -104,7 +109,7 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
     # Keep the original draws for tasks that already succeed, including cached
     # prefixes. Sparse actuator changes need a second pass over variable channels.
     for attempt in range(160):
-        variable_fallback = attempt >= 80 and family in {"temporal", "relation"}
+        variable_fallback = attempt >= 80 and (family == "temporal" or (family == "relation" and relation_sampler is None))
         gap_options = [g for g in (4, 16, 64) if g + layout * min_event + suffix + prefix <= max_span]
         gap = int(rng.choice(gap_options)) if layout == 2 else 0
         budget = (max_span - suffix - prefix - gap) // layout
@@ -114,10 +119,14 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
             raise ValueError("Normal record too short for configured task layout.")
         # Short complete spans remain usable when missing observations prevent
         # longer events. Four points is already in the configured duration grid.
-        lengths = ([min_event] * layout if variable_fallback and attempt >= 120
+        lengths = ([min_event] * layout if attempt >= 120 and (variable_fallback or relation_sampler is not None)
                    else [int(rng.choice(choices)) for _ in range(layout)])
         span = prefix + sum(lengths) + gap + suffix
         target_origin = int(rng.integers(target_begin, len(source.z) - span + 1))
+        hard_sample = hard_anchors is not None and len(hard_anchors) and rng.random() < hard_fraction
+        if hard_sample:
+            target_origin = int(np.clip(int(rng.choice(hard_anchors)) - prefix,
+                                        target_begin, len(source.z) - span))
         origin, stop = target_origin - window, target_origin + span
         clean = source.z[origin:stop].copy()
         masks = source.mask[origin:stop].copy()
@@ -126,6 +135,8 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
         for length in lengths:
             end = start + length
             eligible = np.flatnonzero(masks[start:end].all(0))
+            if allowed_channels is not None:
+                eligible = eligible[np.asarray(allowed_channels, bool)[eligible]]
             if variable_fallback and len(eligible):
                 local = clean[start:end, eligible]
                 eligible = eligible[(np.ptp(local, axis=0) > 1e-6)
@@ -141,6 +152,7 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
             affected = rng.choice(eligible, size=int(rng.choice(counts)), replace=False)
             reference = clean[start:end, affected].copy()
             donor_start = None
+            metadata = {}
             if family == "level":
                 magnitude = np.exp(rng.uniform(np.log(0.2), np.log(3), len(affected)))
                 magnitude *= rng.choice([-1, 1], len(affected))
@@ -157,6 +169,13 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
                 subtype = "shift" if rng.random() < 0.5 else "reorder"
                 permutation = np.roll(np.arange(length), int(rng.integers(1, length))) if subtype == "shift" else rng.permutation(length)
                 replacement = reference[permutation]
+            elif relation_sampler is not None:
+                sampled = relation_sampler(clean, masks, start, end, affected, rng)
+                if sampled is None:
+                    failed = True
+                    break
+                replacement, metadata = sampled
+                subtype, donor_start = "normal_donor", metadata["donor_start"]
             else:
                 subtype = "matched_donor"
                 replacement = reference.copy()
@@ -182,7 +201,7 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
             corrupt[start:end, affected] = replacement
             labels[start:end] = 1
             recipes.append({"start": start, "stop": end, "channels": affected.tolist(),
-                            "subtype": subtype, "donor_start": donor_start})
+                            "subtype": subtype, "donor_start": donor_start, **metadata})
             start = end + gap
         if failed:
             continue
@@ -197,7 +216,153 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
                   "recovery_suffix": suffix, "events": recipes, "attempt": attempt}
         if attempt >= 80:
             recipe["fallback"] = "variable_channels" if variable_fallback else "additional_attempts"
+        if hard_anchors is not None:
+            recipe["hard_normal_source"] = bool(hard_sample)
         return TaskPair(Record(clean, masks.copy(), window), Record(corrupt, masks, window), labels, recipe)
-    raise ValueError(f"Cannot construct a changed {family} task from observed normal data "
+    raise TaskGenerationError(f"Cannot construct a changed {family} task from observed normal data "
                      f"(seed={seed}, index={index}, attempts=160); this task needs observed, "
                      "locally varying channels and, for relation tasks, a usable normal donor.")
+
+
+REFERENCE_TASK_PROTOCOL = "support_preserving_pairs_v2"
+
+
+class NormalTaskPolicy:
+    """Channel supports come exclusively from the normal fit record."""
+
+    def __init__(self, fit, max_values=16, channel_types=None, channel_names=None):
+        channel_types = channel_types or {}
+        names = channel_names or [str(i) for i in range(fit.z.shape[1])]
+        unknown = set(channel_types) - set(names)
+        if unknown:
+            raise ValueError("Unknown channel type names: " + ", ".join(sorted(unknown)))
+        self.supports = []
+        for i, name in enumerate(names):
+            values = np.unique(fit.z[fit.mask[:, i], i])
+            kind = channel_types.get(name, "auto")
+            if kind not in {"auto", "continuous", "discrete"}:
+                raise ValueError("Channel type must be auto, continuous or discrete.")
+            discrete = kind == "discrete" or (kind == "auto" and len(values) <= max_values)
+            self.supports.append(values if discrete else None)
+
+    def hard_anchors(self, source, window):
+        difference = np.abs(np.diff(source.z.astype(np.float64), axis=0, prepend=source.z[:1]))
+        seen = source.mask & np.roll(source.mask, 1, axis=0)
+        seen[0] = False
+        difficulty = (np.minimum(difference, 10) * seen).sum(-1) / seen.sum(-1).clip(min=1)
+        # Rare normal discrete states also supply difficult, legitimate negatives.
+        for c, support in enumerate(self.supports):
+            if support is None or len(support) < 2:
+                continue
+            values, counts = np.unique(source.z[source.mask[:, c], c], return_counts=True)
+            if len(values):
+                positions = np.searchsorted(values, source.z[:, c]).clip(max=len(values) - 1)
+                difficulty += source.mask[:, c] * (-np.log(counts[positions] / counts.sum())) / source.z.shape[1]
+        begin = max(window, source.target_start)
+        candidates = np.arange(begin, len(source.z))
+        if not len(candidates):
+            return candidates
+        return candidates[difficulty[candidates] >= np.quantile(difficulty[candidates], .95)]
+
+
+def observable_channel_mask(clean, corrupt, labels, events, tolerance=1e-6):
+    changed = clean.mask & corrupt.mask & (np.abs(corrupt.z.astype(np.float64) - clean.z) > tolerance)
+    result = np.zeros_like(changed)
+    for event in events:
+        start, stop = event["start"], event["stop"]
+        channels = event.get("channels", [])
+        if channels:
+            result[start:stop, channels] = np.maximum.accumulate(changed[start:stop, channels], axis=0)
+    return result & np.asarray(labels, bool)[:, None]
+
+
+def generate_reference_pair(source, donor, window, index, seed, families, policy,
+                            hard_anchors=None, hard_fraction=.25, donor_candidates=16, boundary_blend=4):
+    rng = np.random.default_rng(np.random.SeedSequence([seed, index, 919]))
+    family_count = len([f for f in families if source.z.shape[1] > 1 or f != "relation"])
+    if not family_count:
+        raise ValueError("No valid task family.")
+    allowed = np.array([support is None or len(support) > 1 for support in policy.supports])
+    if not allowed.any():
+        raise TaskGenerationError("Normal fit record has no changeable channel for support-preserving tasks.")
+
+    def relation_sampler(clean, masks, start, stop, channels, task_rng):
+        reference = clean[start:stop, channels].astype(np.float64)
+        length = stop - start
+        unaffected = np.setdiff1d(np.arange(source.z.shape[1]), channels)
+        best, selected, donor_start = float("inf"), None, None
+        ref_mean, ref_std = reference.mean(0), reference.std(0)
+        ref_shape = (reference - ref_mean) / ref_std.clip(min=1e-3)
+        for _ in range(donor_candidates):
+            left = int(task_rng.integers(0, len(donor.z) - length + 1))
+            if not donor.mask[left:left + length, channels].all():
+                continue
+            values = donor.z[left:left + length, channels].astype(np.float64)
+            if not np.any(np.abs(values - reference) > 1e-6):
+                continue
+            mean, std = values.mean(0), values.std(0)
+            cost = np.square(mean - ref_mean).mean() + np.square(std - ref_std).mean()
+            cost += .25 * np.square((values - mean) / std.clip(min=1e-3) - ref_shape).mean()
+            if len(unaffected):
+                complete = donor.mask[left:left + length, unaffected].all(0) & masks[start:stop, unaffected].all(0)
+                if complete.any():
+                    dc = donor.z[left:left + length, unaffected][:, complete]
+                    sc = clean[start:stop, unaffected][:, complete]
+                    cost += np.square(dc.mean(0, dtype=np.float64) - sc.mean(0, dtype=np.float64)).mean()
+            if cost < best:
+                best, selected, donor_start = float(cost), values.astype(clean.dtype), left
+        return None if selected is None else (selected, {"donor_start": donor_start, "donor_match_cost": best})
+
+    for retry in range(64):
+        # A multiple of the family/layout cycle preserves the requested task stratum.
+        base_index = index + retry * 2 * family_count
+        try:
+            pair = generate_pair(source, donor, window, base_index, seed, families, hard_anchors, hard_fraction,
+                                 relation_sampler=relation_sampler, allowed_channels=allowed)
+        except TaskGenerationError:
+            continue
+        corrupt = pair.clean.z.copy()
+        family = pair.recipe["family"]
+        failed = False
+        for event in pair.recipe["events"]:
+            start, stop = event["start"], event["stop"]
+            length, channels = stop - start, event["channels"]
+            changed_channels = []
+            reference = pair.clean.z[start:stop, channels]
+            replacement = pair.corrupt.z[start:stop, channels].copy()
+            for j, c in enumerate(channels):
+                support = policy.supports[c]
+                if support is not None:
+                    if len(support) < 2:
+                        replacement[:, j] = reference[:, j]
+                    elif family in {"level", "variance"}:
+                        alternatives = support[np.abs(support - reference[0, j]) > 1e-6]
+                        state = reference[0, j] if family == "variance" or not len(alternatives) else rng.choice(alternatives)
+                        replacement[:, j] = state
+                    # Temporal permutations and unscaled donors preserve discrete support.
+                elif family == "relation" and boundary_blend:
+                    blend = min(int(boundary_blend), length // 4)
+                    if blend:
+                        ramp = np.arange(1, blend + 1, dtype=np.float32) / (blend + 1)
+                        replacement[:blend, j] = reference[:blend, j] + ramp * (replacement[:blend, j] - reference[:blend, j])
+                        replacement[-blend:, j] = reference[-blend:, j] + ramp[::-1] * (replacement[-blend:, j] - reference[-blend:, j])
+                if np.any(np.abs(replacement[:, j] - reference[:, j]) > 1e-6):
+                    changed_channels.append(c)
+            if not changed_channels:
+                failed = True
+                break
+            corrupt[start:stop, channels] = replacement
+            event["channels"] = changed_channels
+            if family == "relation":
+                blend = min(int(boundary_blend), length // 4)
+                event["interior"] = [start + blend, stop - blend]
+        if failed:
+            continue
+        last = pair.clean.z[0].copy()
+        for t in range(len(corrupt)):
+            last = np.where(pair.corrupt.mask[t], corrupt[t], last)
+            corrupt[t] = last
+        pair.corrupt = Record(corrupt, pair.corrupt.mask, window)
+        pair.recipe.update(index=index, base_index=base_index, support_retry=retry, task_protocol=REFERENCE_TASK_PROTOCOL)
+        return pair
+    raise TaskGenerationError(f"Cannot construct a support-preserving task (seed={seed}, index={index}).")

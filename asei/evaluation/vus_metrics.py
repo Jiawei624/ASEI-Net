@@ -197,6 +197,21 @@ class metricor:
 
         Nr = len(range_label)  # total # of real anomaly segments
 
+        if not Nr:
+            return 0, 0, 0
+        if self.bias == "flat":
+            bounds = np.asarray(range_label, dtype=np.int64)
+            hits = np.searchsorted(p, bounds[:, 1], side="right") - np.searchsorted(p, bounds[:, 0])
+            existence = np.count_nonzero(hits)
+            overlap = 0.
+            if range_pred:
+                predicted = np.asarray(range_pred, dtype=np.int64)
+                cardinality = (np.searchsorted(predicted[:, 0], bounds[:, 1], side="right")
+                               - np.searchsorted(predicted[:, 1], bounds[:, 0]))
+                overlap = np.sum(np.divide(hits / (bounds[:, 1] - bounds[:, 0] + 1), cardinality,
+                                           out=np.zeros(Nr, dtype=float), where=cardinality > 0))
+            return (alpha * existence + (1 - alpha) * overlap) / Nr, existence / Nr, overlap / Nr
+
         ExistenceReward = self.existence_reward(range_label, p)
 
         OverlapReward = 0
@@ -214,32 +229,8 @@ class metricor:
         input: arrays of binary values 
         output: list of ordered pair [[a0,b0], [a1,b1]... ] of the inputs
         """
-        L = []
-        i = 0
-        j = 0
-        while j < len(label):
-            # print(i)
-            while label[i] == 0:
-                i += 1
-                if i >= len(label):
-                    break
-            j = i + 1
-            # print('j'+str(j))
-            if j >= len(label):
-                if j == len(label):
-                    L.append((i, j - 1))
-
-                break
-            while label[j] != 0:
-                j += 1
-                if j >= len(label):
-                    L.append((i, j - 1))
-                    break
-            if j >= len(label):
-                break
-            L.append((i, j - 1))
-            i = j
-        return L
+        edges = np.diff(np.r_[0, (np.asarray(label) != 0).astype(np.int8), 0])
+        return list(zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1) - 1))
 
     def existence_reward(self, labels, preds):
         """
@@ -263,6 +254,8 @@ class metricor:
         return count
 
     def extend_postive_range(self, x, window=5):
+        # Preserve TAB commit 5a7e6f8, including its inclusive-end extension.
+        # Changing e to e+1 changes the external metric protocol.
         label = x.copy().astype(float)
         L = self.range_convers_new(label)  # index of non-zero segments
         length = len(label)
@@ -336,55 +329,53 @@ class metricor:
     def RangeAUC(
         self, labels, score, window=0, percentage=0, plot_ROC=False, AUC_type="window"
     ):
-        # AUC_type='window'/'percentage'
-        score_sorted = -np.sort(-score)
-
+        ranked = self._ranked_thresholds(score)
         P = np.sum(labels)
-        # print(np.sum(labels))
         if AUC_type == "window":
             labels = self.extend_postive_range(labels, window=window)
         else:
             labels = self.extend_postive_range_individual(labels, percentage=percentage)
 
-        # print(np.sum(labels))
-        L = self.range_convers_new(labels)
-        TPR_list = [0]
-        FPR_list = [0]
-        Precision_list = [1]
-
-        for i in np.linspace(0, len(score) - 1, 250).astype(int):
-            threshold = score_sorted[i]
-            # print('thre='+str(threshold))
-            pred = score >= threshold
-            TPR, FPR, Precision = self.TPR_FPR_RangeAUC(labels, pred, P, L)
-
-            TPR_list.append(TPR)
-            FPR_list.append(FPR)
-            Precision_list.append(Precision)
-
-        TPR_list.append(1)
-        FPR_list.append(1)  # otherwise, range-AUC will stop earlier than (1,1)
-
-        tpr = np.array(TPR_list)
-        fpr = np.array(FPR_list)
-        prec = np.array(Precision_list)
-
-        width = fpr[1:] - fpr[:-1]
-        height = (tpr[1:] + tpr[:-1]) / 2
-        AUC_range = np.sum(width * height)
-
-        width_PR = tpr[1:-1] - tpr[:-2]
-        height_PR = (prec[1:] + prec[:-1]) / 2
-        AP_range = np.sum(width_PR * height_PR)
-
+        AUC_range, AP_range, fpr, tpr, prec = self._ranked_range_curve(labels, P, ranked)
         if plot_ROC:
             return AUC_range, AP_range, fpr, tpr, prec
-
         return AUC_range
+
+    @staticmethod
+    def _ranked_thresholds(score):
+        """The same 250 thresholds and >= tie rule as TAB, sorted only once."""
+        score = np.asarray(score)
+        order = np.argsort(-score, kind="stable")
+        descending = score[order]
+        thresholds = descending[np.linspace(0, len(score) - 1, 250).astype(int)]
+        counts = np.searchsorted(-descending, -thresholds, side="right")
+        ranks = np.empty(len(score) + 1, dtype=np.int64)
+        ranks[order] = np.arange(len(score))
+        ranks[-1] = len(score)  # sentinel for a segment ending at the last point
+        return order, counts, ranks
+
+    def _ranked_range_curve(self, labels, positives, ranked):
+        """Prefix sums replace 250 complete scans without changing the curve."""
+        order, counts, ranks = ranked
+        labels = np.asarray(labels, dtype=np.float64)
+        tp = np.cumsum(labels[order], dtype=np.float64)[counts - 1]
+        segments = np.asarray(self.range_convers_new(labels), dtype=np.int64)
+        if not len(segments):
+            raise ValueError("Range AUC requires an anomaly segment.")
+        edges = np.column_stack((segments[:, 0], segments[:, 1] + 1)).ravel()
+        first_hits = np.sort(np.minimum.reduceat(ranks, edges)[::2])
+        existence = np.searchsorted(first_hits, counts, side="left") / len(segments)
+        p_new = (positives + labels.sum()) / 2
+        tpr = np.r_[0., np.minimum(tp / p_new, 1.) * existence, 1.]
+        fpr = np.r_[0., (counts - tp) / (len(labels) - p_new), 1.]
+        precision = np.r_[1., tp / counts]
+        auc = np.sum(np.diff(fpr) * (tpr[1:] + tpr[:-1]) / 2)
+        ap = np.sum(np.diff(tpr[:-1]) * (precision[1:] + precision[:-1]) / 2)
+        return auc, ap, fpr, tpr, precision
 
     # TPR_FPR_window
     def RangeAUC_volume(self, labels_original, score, windowSize):
-        score_sorted = -np.sort(-score)
+        ranked = self._ranked_thresholds(score)
 
         tpr_3d = []
         fpr_3d = []
@@ -399,41 +390,13 @@ class metricor:
         for window in window_3d:
             labels = self.extend_postive_range(labels_original, window)
 
-            # print(np.sum(labels))
-            L = self.range_convers_new(labels)
-            TPR_list = [0]
-            FPR_list = [0]
-            Precision_list = [1]
-
-            for i in np.linspace(0, len(score) - 1, 250).astype(int):
-                threshold = score_sorted[i]
-                # print('thre='+str(threshold))
-                pred = score >= threshold
-                TPR, FPR, Precision = self.TPR_FPR_RangeAUC(labels, pred, P, L)
-
-                TPR_list.append(TPR)
-                FPR_list.append(FPR)
-                Precision_list.append(Precision)
-
-            TPR_list.append(1)
-            FPR_list.append(1)  # otherwise, range-AUC will stop earlier than (1,1)
-
-            tpr = np.array(TPR_list)
-            fpr = np.array(FPR_list)
-            prec = np.array(Precision_list)
+            AUC_range, AP_range, fpr, tpr, prec = self._ranked_range_curve(labels, P, ranked)
 
             tpr_3d.append(tpr)
             fpr_3d.append(fpr)
             prec_3d.append(prec)
 
-            width = fpr[1:] - fpr[:-1]
-            height = (tpr[1:] + tpr[:-1]) / 2
-            AUC_range = np.sum(width * height)
             auc_3d.append(AUC_range)
-
-            width_PR = tpr[1:-1] - tpr[:-2]
-            height_PR = (prec[1:] + prec[:-1]) / 2
-            AP_range = np.sum(width_PR * height_PR)
             ap_3d.append(AP_range)
 
         return (

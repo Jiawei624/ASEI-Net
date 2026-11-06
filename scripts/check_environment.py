@@ -123,14 +123,14 @@ def check_imports(seed=0):
     return result
 
 
-def model_training_probe(device, seed=42):
+def model_training_probe(device, seed=42, settings=None):
     """Exercise both training stages on synthetic inputs, without saving models."""
     import numpy as np
     import torch
     import torch.nn.functional as F
     from asei.data import Record
     from asei.features import extract_features, batch_feature_blocks
-    from asei.model import NormalRepresentation, DualTrajectoryDetector
+    from asei.model import NormalRepresentation, make_detector
 
     torch.manual_seed(seed)
     z = np.random.default_rng(seed).normal(size=(40, 3)).astype(np.float32)
@@ -160,7 +160,7 @@ def model_training_probe(device, seed=42):
     model.memory.cache_decoders(model.history.identity.weight)
     sequence = extract_features(record, model, batch_size=8)
     block = batch_feature_blocks([sequence, sequence], 32, 40, model)
-    detector = DualTrajectoryDetector(model.history.identity.weight).to(device).train()
+    detector = make_detector(model.history.identity.weight, settings or {}).to(device).train()
     output, _ = detector.forward_block(block)
     if not output["valid"].all():
         raise RuntimeError("Invalid detector output in model training probe.")
@@ -169,8 +169,21 @@ def model_training_probe(device, seed=42):
     stage2_loss = F.binary_cross_entropy_with_logits(output["score"], labels)
     stage2_loss.backward()
     stage2_gradients = finite_gradients(detector, stage2_loss)
+    if hasattr(detector, "project"):
+        detector.project()  # Exercise SVD on the selected device, including CUDA.
+    teacher_probe = {}
+    if settings and settings.get("method") == "in_1_2_3":
+        from asei.teacher import make_teacher
+        from asei.state import balanced_description_loss
+        teacher = make_teacher(model, settings).to(device)
+        hidden, _, usable = teacher.forward_block(block)
+        teacher_loss = (balanced_description_loss(teacher.current_head(hidden), block["chi"]) * usable).sum() / usable.sum().clamp_min(1)
+        teacher_loss.backward()
+        teacher_gradients = finite_gradients(teacher, teacher_loss)
+        teacher.project()
+        teacher_probe = {"teacher_loss": float(teacher_loss.detach().cpu()), "teacher_gradient_tensors": teacher_gradients}
     return {"stage1_loss": float(loss.detach().cpu()), "stage2_loss": float(stage2_loss.detach().cpu()),
-            "stage1_gradient_tensors": stage1_gradients, "stage2_gradient_tensors": stage2_gradients}
+            "stage1_gradient_tensors": stage1_gradients, "stage2_gradient_tensors": stage2_gradients, **teacher_probe}
 
 
 def check_gpu(cfg, physical_gpu, seed=42):
@@ -181,7 +194,7 @@ def check_gpu(cfg, physical_gpu, seed=42):
         configure_cpu(cfg)
         device = get_device(cfg["runtime"]["device"])
         torch.cuda.reset_peak_memory_stats(device)
-        probe = model_training_probe(device, seed)
+        probe = model_training_probe(device, seed, cfg["stage2"])
         torch.cuda.synchronize(device)
         return {"ok": True, "physical_gpu": physical_gpu, "logical_device": str(device), "seed": seed,
                 "name": torch.cuda.get_device_name(device), "cuda": torch.version.cuda,

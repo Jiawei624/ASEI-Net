@@ -163,6 +163,13 @@ class TaskFeatureStore:
             self.bytes += size
         return sequence
 
+    def recipe(self, split, index):
+        if self.storage == "packed":
+            if split not in self.readers:
+                self.readers[split] = PackedTaskReader(self.directory / split, self.key)
+            return self.readers[split].record["recipes"][int(index)]
+        return json.loads((self.directory / f"{split}_{index:04d}.json").read_text(encoding="utf-8"))
+
     def close(self):
         self.cache.clear()
         self.bytes = 0

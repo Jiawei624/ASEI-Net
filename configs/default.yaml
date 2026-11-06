@@ -25,9 +25,11 @@ stage1:
   stride: 1
   workers: 0
 stage2:
+  optimizer_update: task_batch
+  method: in_1_2_3
   epochs: 50
   batch_pairs: 8
-  lr: 0.001
+  lr: 0.0003
   patience: 8
   block_length: 256
   train_pairs: auto
@@ -37,9 +39,34 @@ stage2:
   variant: full
   sources: [relation, marginal, joint]
   fixed_retention: 0.9
+  cell: contractive
+  eta: 0.2
+  rho: 0.95
+  energy_weight: 1.0
+  beta_init: 2.0
+  lambda_ref: 0.1
+  lambda_sep: 0.1
+  lambda_tail: 0.1
+  gamma_max: 0.25
+  tail_margin: 0.5
+  tail_fraction: 0.01
+  hard_negative_fraction: 0.25
+  discrete_max_values: 16
+  donor_candidates: 16
+  boundary_blend: 4
+teacher:
+  optimizer_update: task_batch
+  epochs: 10
+  patience: 3
+  lr: 0.0003
+  batch_sequences: 16
+  sequence_length: 512
+  train_sequences: 512
+  validation_sequences: 64
 calibration:
-  alpha: 0.01
-  sensitivity_alphas: []
+  method: tab_anomaly_ratio
+  anomaly_ratios: [0.1, 0.5, 1.0, 2, 3, 5, 10, 15, 20, 25]
+  prediction_ratio: 1.0
 evaluation:
   label_metrics: [accuracy, precision, recall, f_score, adjust_accuracy, adjust_precision, adjust_recall, adjust_f_score, rprecision, rrecall, rf, precision_at_k, affiliation_precision, affiliation_recall, affiliation_f, add]
   score_metrics: [auc_roc, auc_pr, R_AUC_ROC, R_AUC_PR, VUS_ROC, VUS_PR]
