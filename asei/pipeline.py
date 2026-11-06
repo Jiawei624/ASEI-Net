@@ -16,9 +16,11 @@ from .config import (configure_cuda, file_sha256, fingerprint, implementation_fi
 from .compat import load_torch_checkpoint
 from .data import Entity, Record, Standardizer, load_entity, validation_context
 from .features import extract_features, FeatureSequence, score_features, StreamingDetector
-from .metrics import evaluate, threshold_from_normal, point_adjusted_predictions, METRICS_PROTOCOL
+from .metrics import (evaluate, threshold_from_normal, point_adjusted_predictions,
+                      event_metrics, METRICS_PROTOCOL)
 from .model import NormalRepresentation, DualTrajectoryDetector
-from .training import build_task_cache, fit_representation, fit_detector, seed_everything
+from .training import (build_task_cache, fit_representation, fit_detector,
+                       seed_everything, task_cache_key)
 from .resources import configure_cpu
 from .runs import training_root
 from .results import write_run_result, remove_run_result, prune_intermediates
@@ -169,6 +171,9 @@ def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenanc
     print(f"evaluation label_metrics={len(cfg['evaluation']['label_metrics'])} "
           f"score_metrics={len(cfg['evaluation']['score_metrics'])}", flush=True)
     results, alarms = evaluate(labels, scores, ready, calibration["threshold"], cfg["evaluation"])
+    if diagnostics:
+        results["event"] = event_metrics(labels, alarms, ready,
+            confirmation=cfg["evaluation"].get("recovery_confirmation", 8))
     histories = {}
     for name, file in (("representation", directory / "stage1_history.json"),
                        ("detector", detector_dir / "stage2_history.json"),
@@ -195,6 +200,7 @@ def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenanc
         "variant": _variant_name(cfg), "model_key": experiment["detector_key"],
         "implementation_key": experiment["implementation_key"], "metrics_protocol": METRICS_PROTOCOL,
         "test_points": len(labels), "calibration": calibration, "metrics": results, "timing": timings,
+        "diagnostics": bool(diagnostics),
         "model_file": (detector_dir / "bundle.pt").relative_to(run_directory).as_posix(),
         "environment": {"python": sys.version, "torch": str(torch.__version__), "numpy": np.__version__,
             "platform": platform.platform(), "device": str(device), "cuda": torch.version.cuda,
@@ -212,6 +218,7 @@ def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenanc
         prediction_data = {"scores": scores, "valid": ready, "alarms": alarms, "labels": labels,
                            "point_adjusted_alarms": point_adjusted_predictions(labels, alarms)}
         if diagnostics:
+            prediction_data["attribution"] = output["attribution"][test_start:]
             prediction_data.update({k: output[k][test_start:] for k in
                 ("retention", "state_difference", "marginal_difference", "joint_difference")})
         np.savez_compressed(detector_dir / "predictions.npz", **prediction_data)
@@ -224,6 +231,8 @@ def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenanc
 
 def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics=False):
     config = resolve_paths(copy.deepcopy(config))
+    if diagnostics:
+        config["runtime"]["keep_intermediates"] = True
     configure_cuda(config)
     configure_cpu(config)
     seed_everything(seed)
@@ -323,7 +332,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
             previous = experiment.get("result")
             same_metrics = previous and previous.get("metrics_protocol") == METRICS_PROTOCOL and (
                 set(previous["metrics"].get("score", {})) == set(cfg["evaluation"]["score_metrics"]))
-            if stage == "all" and same_metrics:
+            if stage == "all" and same_metrics and not cfg["runtime"].get("keep_intermediates", False):
                 csv_path = write_run_result(cfg["runtime"]["run_directory"], previous)
                 if not cfg["runtime"].get("keep_intermediates", False):
                     prune_intermediates(directory, detector_dir)
@@ -339,7 +348,7 @@ def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics
         if not manifest.get("complete"):
             raise ValueError("Task cache is incomplete; run --stage cache.")
         expected_settings = {k: cfg["stage2"][k] for k in ("families", "train_pairs", "validation_pairs", "validation_seeds")}
-        expected_key = fingerprint({"version": 1, "representation": representation_key, "seed": seed, "tasks": expected_settings})
+        expected_key = task_cache_key(representation_key, seed, expected_settings)
         if manifest["key"] != expected_key:
             raise ValueError("Task cache does not match the frozen representation and task settings.")
         cache_key = manifest["key"]

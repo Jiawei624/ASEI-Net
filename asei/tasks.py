@@ -7,21 +7,56 @@ import numpy as np
 from .data import Record
 
 
+TASK_SUPERVISION_PROTOCOL = "causal_event_prefix_v2"
+
+
 def event_ranges(labels):
     values = np.asarray(labels, dtype=bool)
     edges = np.diff(np.pad(values.astype(np.int8), (1, 1)))
     return list(zip(np.flatnonzero(edges == 1).tolist(), np.flatnonzero(edges == -1).tolist()))
 
 
-def phase_weights(labels, clean_valid, corrupt_valid):
+def observable_positive_mask(clean: Record, corrupt: Record, labels, tolerance=1e-6):
+    """Supervise an event only after its first observed change from the clean pair.
+
+    Event boundaries remain intact for delay/coverage evaluation. Later unchanged
+    samples stay positive because their observed history can reveal the event.
+    """
+    labels = np.asarray(labels, bool)
+    if clean.z.shape != corrupt.z.shape or clean.mask.shape != clean.z.shape or corrupt.mask.shape != clean.z.shape:
+        raise ValueError("Paired records must have the same observation shape.")
+    if labels.shape != (len(clean.z),):
+        raise ValueError("Event labels must preserve the paired time axis.")
+    changed = np.any(clean.mask & corrupt.mask &
+                     (np.abs(corrupt.z.astype(np.float64) - clean.z) > tolerance), axis=1)
+    usable = np.zeros(len(labels), bool)
+    for start, stop in event_ranges(labels):
+        usable[start:stop] = np.maximum.accumulate(changed[start:stop])
+    return usable
+
+
+def phase_weights(labels, clean_valid, corrupt_valid, positive_valid=None):
     """Weights over a pair sum to one; positives and negatives each sum to 1/2."""
     labels = np.asarray(labels, bool)
+    clean_valid, corrupt_valid = np.asarray(clean_valid, bool), np.asarray(corrupt_valid, bool)
+    if labels.ndim != 1 or clean_valid.shape != labels.shape or corrupt_valid.shape != labels.shape:
+        raise ValueError("Labels and scoring masks must preserve the same one-dimensional time axis.")
+    eligible = corrupt_valid.copy()
+    if positive_valid is not None:
+        positive_valid = np.asarray(positive_valid, bool)
+        if positive_valid.shape != labels.shape:
+            raise ValueError("Positive supervision mask must preserve the event time axis.")
+        eligible &= positive_valid
     events = event_ranges(labels)
     positive = np.zeros(len(labels), np.float64)
     for start, stop in events:
-        cut = min(start + 8, stop)
-        phases = [np.arange(start, cut), np.arange(cut, stop)]
-        phases = [p[corrupt_valid[p]] for p in phases if len(p)]
+        observed = np.flatnonzero(eligible[start:stop])
+        if not len(observed):
+            raise ValueError("No scorable positive sample for an injected event.")
+        onset = start + int(observed[0]) if positive_valid is not None else start
+        cut = min(onset + 8, stop)
+        phases = [np.arange(onset, cut), np.arange(cut, stop)]
+        phases = [p[eligible[p]] for p in phases if len(p)]
         phases = [p for p in phases if len(p)]
         if not phases:
             raise ValueError("No scorable positive sample for an injected event.")

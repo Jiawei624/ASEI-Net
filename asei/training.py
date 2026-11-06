@@ -16,7 +16,8 @@ from .data import Record
 from .features import extract_features, FeatureSequence, batch_feature_blocks
 from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
 from .progress import periodic_progress
-from .tasks import generate_pair, phase_weights
+from .tasks import (generate_pair, phase_weights, observable_positive_mask,
+                    TASK_SUPERVISION_PROTOCOL)
 from .resources import cooperate
 
 
@@ -230,12 +231,17 @@ def fit_representation(model, train, valid, cfg, directory, run_key):
     return elapsed
 
 
+def task_cache_key(representation_key, seed, settings):
+    return fingerprint({"version": 2, "supervision": TASK_SUPERVISION_PROTOCOL,
+                        "representation": representation_key, "seed": seed, "tasks": settings})
+
+
 def build_task_cache(model, train, valid, cfg, directory, seed, representation_key):
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     s = cfg["stage2"]
     settings = {k: s[k] for k in ("families", "train_pairs", "validation_pairs", "validation_seeds")}
-    key = fingerprint({"version": 1, "representation": representation_key, "seed": seed, "tasks": settings})
+    key = task_cache_key(representation_key, seed, settings)
     manifest_path = directory / "manifest.json"
     previous_seconds = 0.0
     storage = cfg["runtime"].get("task_cache_format", "packed")
@@ -247,6 +253,7 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
         # Continue partial legacy caches in their original format.
         storage = previous.get("storage", "npz")
     write_json(manifest_path, {"key": key, "settings": settings, "storage": storage, "complete": False,
+                               "supervision_protocol": TASK_SUPERVISION_PROTOCOL,
                                "preparation_seconds_total": previous_seconds})
     began, recipes, built = time.perf_counter(), [], 0
     for split, source, n in (("train", train, s["train_pairs"]), ("validation", valid, s["validation_pairs"])):
@@ -270,10 +277,14 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
                 corrupt = extract_features(pair.corrupt, model, cfg["runtime"]["feature_batch_size"])
                 clean_valid = clean.mask.any(1) & (np.arange(len(clean)) >= clean.window)
                 corrupt_valid = corrupt.mask.any(1) & (np.arange(len(corrupt)) >= corrupt.window)
-                cw, pw = phase_weights(pair.labels, clean_valid, corrupt_valid)
+                positive_valid = observable_positive_mask(pair.clean, pair.corrupt, pair.labels)
+                cw, pw = phase_weights(pair.labels, clean_valid, corrupt_valid, positive_valid)
                 clean.labels, corrupt.labels = np.zeros(len(clean), np.int8), pair.labels
                 clean.weights, corrupt.weights = cw, pw
-                recipe = {"split": split, **pair.recipe}
+                recipe = {"split": split, **pair.recipe,
+                          "supervision_protocol": TASK_SUPERVISION_PROTOCOL,
+                          "unidentifiable_positive_points": int(np.count_nonzero(
+                              pair.labels.astype(bool) & corrupt_valid & ~positive_valid))}
                 if writer is None:
                     clean.save(clean_path, key, compressed=cfg["runtime"].get("task_cache_compression", False))
                     corrupt.save(corrupt_path, key, compressed=cfg["runtime"].get("task_cache_compression", False))
@@ -288,6 +299,7 @@ def build_task_cache(model, train, valid, cfg, directory, seed, representation_k
     seconds = time.perf_counter() - began
     size = sum(p.stat().st_size for p in directory.rglob("*") if p.is_file() and p.suffix in {".npz", ".bin"})
     write_json(manifest_path, {"key": key, "settings": settings, "storage": storage, "complete": True, "seconds_this_call": seconds,
+                               "supervision_protocol": TASK_SUPERVISION_PROTOCOL,
                                "preparation_seconds_total": previous_seconds + (seconds if built else 0),
                                "bytes": size, "recipes": recipes})
     return key, seconds, size

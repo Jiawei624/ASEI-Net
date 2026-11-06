@@ -61,6 +61,10 @@ def _binary_pair(actual, predicted):
 def event_metrics(actual, predicted, valid=None, confirmation=8):
     actual, predicted = _binary_pair(actual, predicted)
     valid = np.ones(len(actual), bool) if valid is None else np.asarray(valid, bool)
+    if valid.shape != actual.shape:
+        raise ValueError("Readiness must preserve the event time axis.")
+    if isinstance(confirmation, (bool, np.bool_)) or not isinstance(confirmation, (int, np.integer)) or confirmation < 1:
+        raise ValueError("Recovery confirmation must be a positive integer.")
     events = event_ranges(actual)
     coverage, detected, later_coverage, recovery, censored = [], [], [], [], 0
     for i, (start, stop) in enumerate(events):
