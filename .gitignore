@@ -18,6 +18,7 @@ outputs/
 tests/
 logs/
 result/
+ccfa-workfiles/
 *.zip
 In1_2_2.md
 metrics.txt
