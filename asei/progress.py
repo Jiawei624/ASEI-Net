@@ -7,6 +7,24 @@ import time
 from .resources import cooperate
 
 
+class Progress:
+    """Timed block-level progress, with explicit phase transitions."""
+    def __init__(self, description, total, interval_seconds=30):
+        self.description, self.total = description, total
+        self.interval = float(interval_seconds)
+        self.began = self.last = time.perf_counter()
+        print(f"{description} start total={total}", flush=True)
+
+    def update(self, completed, force=False):
+        now = time.perf_counter()
+        if force or completed == self.total or (self.interval and now - self.last >= self.interval):
+            elapsed = now - self.began
+            remaining = elapsed * (self.total - completed) / max(1, completed)
+            print(f"{self.description} progress={completed}/{self.total} "
+                  f"elapsed={elapsed:.1f}s remaining={remaining:.1f}s", flush=True)
+            self.last = now
+
+
 def periodic_progress(iterable, description, interval_seconds=0):
     """Yield items unchanged; callers report completion or an epoch summary."""
     interval = float(interval_seconds)

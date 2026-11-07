@@ -1,4 +1,4 @@
-"""Measure the detector's forward/backward throughput without dataset training."""
+"""Measure causal detector forward/backward, including frozen reference replay."""
 from __future__ import annotations
 
 import argparse
@@ -9,47 +9,57 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from asei.config import DEFAULT_CONFIG, configure_cuda, load_config, project_path, write_json
+from asei.config import DEFAULT_CONFIG, configure_cuda, load_config, resolve_config, project_path, write_json
 from asei.resources import configure_cpu
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", "--config-path", default=str(DEFAULT_CONFIG))
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
     parser.add_argument("--channels", type=int, required=True)
     parser.add_argument("--pairs", type=int)
     parser.add_argument("--length", type=int)
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
+    parser.add_argument("--discrete-channels", type=int, default=0)
     device_args = parser.add_mutually_exclusive_group()
-    device_args.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index")
+    device_args.add_argument("--gpu", type=int)
     device_args.add_argument("--device")
     parser.add_argument("--output")
     args = parser.parse_args()
     cfg = load_config(args.config)
     configure_cuda(cfg, gpu=args.gpu, device=args.device)
     configure_cpu(cfg)
+    import numpy as np
     import torch
-    from asei.model import make_detector
+    from asei.data import Record
+    from asei.features import DescriptorSchema
+    from asei.normal import NormalModel
+    from asei.model import DualTrajectoryDetector
     from asei.pipeline import get_device
 
+    configure_cpu(cfg)
     device = get_device(cfg["runtime"]["device"])
     pairs = args.pairs if args.pairs is not None else cfg["stage2"]["batch_pairs"]
     length = args.length if args.length is not None else cfg["stage2"]["block_length"]
-    if min(args.channels, pairs, length, args.steps) < 1 or args.warmup < 0:
-        raise ValueError("Benchmark dimensions and steps must be positive; warmup must be nonnegative.")
-    configure_cpu(cfg)
+    if min(args.channels, pairs, length, args.steps) < 1 or args.warmup < 0 or not 0 <= args.discrete_channels <= args.channels:
+        raise ValueError("Invalid benchmark dimensions, steps or discrete-channel count.")
+    window = cfg["model"]["window"]
+    window = 128 if window == "auto" else window
+    n = max(512, window + length + 64)
+    cfg = resolve_config(cfg, n, args.channels)
     torch.manual_seed(42)
-    batch, channels = 2 * pairs, args.channels
-    identity_dim = cfg["model"]["d_model"]
-    identity_dim = 96 if identity_dim == "auto" else identity_dim
-    model = make_detector(torch.randn(channels, identity_dim, device=device), cfg["stage2"]).to(device).train()
-    shape = (batch, length, channels)
-    f = {name: torch.randn(*shape, 37, device=device) for name in ("chi", "marginal", "joint")}
-    f.update(prediction=torch.randn(*shape, 2, device=device), residual=torch.randn(*shape, 2, device=device))
-    f["energy"] = torch.rand(*shape, 2, device=device)
-    f.update({name: torch.ones(*shape, dtype=torch.bool, device=device)
-              for name in ("m_valid", "j_valid", "observed", "prediction_ready")})
+    values = np.random.default_rng(42).normal(size=(n, args.channels)).astype(np.float32)
+    for i in range(args.discrete_channels):
+        values[:, i] = (np.arange(n) // (7 + i)) % 3
+    record = Record(values, np.ones_like(values, bool))
+    normal = NormalModel(DescriptorSchema.fit(record).metadata, cfg).to(device)
+    normal.memory.fit(record, pool_size=512)
+    model = DualTrajectoryDetector(normal, cfg["stage2"]).to(device).train()
+    batch = 2 * pairs
+    raw = normal.schema.block([record] * batch, [0] * batch, length)
+    cached_record = Record(values, record.mask, routing=model.routing(record, cfg["stage2"]["block_length"]))
+    cached = normal.schema.block([cached_record] * batch, [0] * batch, length)
 
     def synchronize():
         if device.type == "cuda":
@@ -57,26 +67,25 @@ def main():
 
     def run(execution):
         model.zero_grad(set_to_none=True)
-        if execution == "block":
-            output, _ = model.forward_block(f)
-            scores = output["score"]
-        else:
+        if execution == "step":
             state, outputs = None, []
             for t in range(length):
-                output, state = model.step({k: v[:, t] for k, v in f.items()}, state)
-                outputs.append(output["score"])
+                out, state = model.step({k: v[:, t] for k, v in raw.items()}, state)
+                outputs.append(out["dynamic"])
             scores = torch.stack(outputs, 1)
+        else:
+            scores = model.forward_block(cached if execution == "cached" else raw)[0]["dynamic"]
         scores.square().mean().backward()
         return scores.detach()
 
     reference = run("step")
-    optimized = run("block")
-    tf32 = device.type == "cuda" and torch.backends.cuda.matmul.allow_tf32
-    torch.testing.assert_close(reference, optimized, atol=3e-4 if tf32 else 3e-5, rtol=3e-3 if tf32 else 3e-4)
-    max_difference = float((reference - optimized).abs().max().cpu())
-    del reference, optimized
+    differences = {}
+    for execution in ("block", "cached"):
+        output = run(execution)
+        torch.testing.assert_close(reference, output, atol=3e-4, rtol=3e-3)
+        differences[execution] = float((reference - output).abs().max().cpu())
     results = {}
-    for execution in ("step", "block"):
+    for execution in ("step", "block", "cached"):
         for _ in range(args.warmup):
             run(execution)
         synchronize()
@@ -87,20 +96,17 @@ def main():
             run(execution)
         synchronize()
         seconds = time.perf_counter() - began
-        results[execution] = {"seconds_per_batch": seconds / args.steps,
-            "sequence_points_per_second": batch * length * args.steps / seconds,
-            "peak_cuda_bytes": torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None}
-    results.update(speedup=results["step"]["seconds_per_batch"] / results["block"]["seconds_per_batch"],
-                   device=str(device), torch=str(torch.__version__), pairs=pairs, channels=channels, length=length,
-                   max_score_difference=max_difference, allow_tf32=bool(tf32),
-                   accelerator=torch.cuda.get_device_name(device) if device.type == "cuda" else None,
-                   method=cfg["stage2"].get("method", "in_1_2_2"), cell=cfg["stage2"].get("cell", "gru"),
-                   scope="Synthetic detector forward/backward only; excludes data loading and frozen feature extraction.")
-    output = (project_path(args.output) if args.output else Path(cfg["runtime"]["output"]) / "benchmarks" /
-              (Path(args.config).stem + "_stage2.json"))
-    write_json(output, results)
-    print(results)
-    print("Benchmark report:", output)
+        results[execution] = dict(seconds_per_batch=seconds / args.steps,
+            sequence_points_per_second=batch * length * args.steps / seconds,
+            peak_cuda_bytes=torch.cuda.max_memory_allocated(device) if device.type == "cuda" else None)
+        print(f"{execution} seconds_per_batch={seconds / args.steps:.6f}", flush=True)
+    results.update(device=str(device), torch=str(torch.__version__), pairs=pairs, channels=args.channels,
+                   length=length, max_score_difference=differences,
+                   cached_speedup=results["step"]["seconds_per_batch"] / results["cached"]["seconds_per_batch"],
+                   scope="Synthetic forward/backward. Step/block include frozen retrieval; cached reuses exact routing. Excludes forecasting and disk I/O.")
+    target = project_path(args.output) if args.output else Path(cfg["runtime"]["output"]) / "benchmarks" / "stage2.json"
+    write_json(target, results)
+    print("Benchmark report:", target)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@ import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from model_probe import model_training_probe
 
 
 def canonical_name(name):
@@ -88,102 +91,12 @@ def check_imports(seed=0):
     if not all(row["ok"] for row in result.values()):
         return result
     try:
-        import numpy as np
         import torch
-        sys.path.insert(0, str(ROOT))
-        from asei.data import Record
-        from asei.model import NormalRepresentation, DualTrajectoryDetector
-
         torch.set_num_threads(1)
-        torch.manual_seed(seed)
-        z = np.random.default_rng(seed).normal(size=(40, 2)).astype(np.float32)
-        model = NormalRepresentation({"channels": 2, "window": 32, "d_model": 16, "heads": 4,
-                                      "layers": 1, "dropout": 0.0,
-                                      "marginal_prototypes": 4, "joint_prototypes": 4}).eval()
-        with torch.no_grad():
-            model.descriptor.fit(Record(z, np.ones_like(z, bool)))
-            model.memory.cache_decoders(model.history.identity.weight)
-            history = torch.from_numpy(z[:32][None])
-            prediction = model.predict(history, torch.ones_like(history, dtype=torch.bool))
-            chi = model.descriptor(torch.from_numpy(z[1:33][None]))
-            observed = torch.ones(1, 2, dtype=torch.bool)
-            mi, ji = model.memory.query(chi, observed, model.history.identity.weight)
-            rm, rj, mv, jv = model.memory.references(mi, ji)
-            detector = DualTrajectoryDetector(model.history.identity.weight).eval()
-            output, _ = detector.step({"chi": chi, "prediction": prediction,
-                "residual": torch.from_numpy(z[32][None, :, None]) - prediction,
-                "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
-                "observed": observed, "prediction_ready": observed})
-            if not output["valid"].all() or not torch.isfinite(output["score"]).all():
-                raise RuntimeError("Non-finite or invalid model probe output.")
-            np.testing.assert_array_equal(torch.from_numpy(z).numpy(), z)
-        result["cpu_model_and_numpy_bridge"] = {"ok": True}
+        result["cpu_model_and_numpy_bridge"] = {"ok": True, **model_training_probe("cpu", seed)}
     except Exception as exc:
         result["cpu_model_and_numpy_bridge"] = {"ok": False, "error": type(exc).__name__ + ": " + str(exc)}
     return result
-
-
-def model_training_probe(device, seed=42, settings=None):
-    """Exercise both training stages on synthetic inputs, without saving models."""
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-    from asei.data import Record
-    from asei.features import extract_features, batch_feature_blocks
-    from asei.model import NormalRepresentation, make_detector
-
-    torch.manual_seed(seed)
-    z = np.random.default_rng(seed).normal(size=(40, 3)).astype(np.float32)
-    record = Record(z, np.ones_like(z, bool))
-    model = NormalRepresentation({"channels": 3, "window": 32, "d_model": 16, "heads": 4,
-                                  "layers": 1, "dropout": 0.0,
-                                  "marginal_prototypes": 4, "joint_prototypes": 4}).to(device)
-    model.descriptor.fit(record)
-    history = torch.as_tensor(z[:32][None], device=device)
-    segment = torch.as_tensor(z[1:33][None], device=device)
-    target = torch.as_tensor(z[32][None], device=device)
-    loss, _ = model.normal_loss({"history": history, "history_mask": torch.ones_like(history, dtype=torch.bool),
-        "target": target, "target_mask": torch.ones_like(target, dtype=torch.bool),
-        "segment": segment, "segment_mask": torch.ones_like(segment, dtype=torch.bool)})
-    loss.backward()
-
-    def finite_gradients(module, value):
-        gradients = [p.grad for p in module.parameters() if p.grad is not None]
-        if not torch.isfinite(value).all() or not gradients or not all(torch.isfinite(g).all() for g in gradients):
-            raise RuntimeError("Non-finite loss or gradients in model training probe.")
-        return len(gradients)
-
-    stage1_gradients = finite_gradients(model, loss)
-    model.eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
-    model.memory.cache_decoders(model.history.identity.weight)
-    sequence = extract_features(record, model, batch_size=8)
-    block = batch_feature_blocks([sequence, sequence], 32, 40, model)
-    detector = make_detector(model.history.identity.weight, settings or {}).to(device).train()
-    output, _ = detector.forward_block(block)
-    if not output["valid"].all():
-        raise RuntimeError("Invalid detector output in model training probe.")
-    labels = torch.zeros_like(output["score"])
-    labels[1] = 1
-    stage2_loss = F.binary_cross_entropy_with_logits(output["score"], labels)
-    stage2_loss.backward()
-    stage2_gradients = finite_gradients(detector, stage2_loss)
-    if hasattr(detector, "project"):
-        detector.project()  # Exercise SVD on the selected device, including CUDA.
-    teacher_probe = {}
-    if settings and settings.get("method") == "in_1_2_3":
-        from asei.teacher import make_teacher
-        from asei.state import balanced_description_loss
-        teacher = make_teacher(model, settings).to(device)
-        hidden, _, usable = teacher.forward_block(block)
-        teacher_loss = (balanced_description_loss(teacher.current_head(hidden), block["chi"]) * usable).sum() / usable.sum().clamp_min(1)
-        teacher_loss.backward()
-        teacher_gradients = finite_gradients(teacher, teacher_loss)
-        teacher.project()
-        teacher_probe = {"teacher_loss": float(teacher_loss.detach().cpu()), "teacher_gradient_tensors": teacher_gradients}
-    return {"stage1_loss": float(loss.detach().cpu()), "stage2_loss": float(stage2_loss.detach().cpu()),
-            "stage1_gradient_tensors": stage1_gradients, "stage2_gradient_tensors": stage2_gradients, **teacher_probe}
 
 
 def check_gpu(cfg, physical_gpu, seed=42):

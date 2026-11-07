@@ -1,9 +1,10 @@
-"""Shared recurrent dynamics and the training-only normal-state teacher."""
+"""Shared contractive normal dynamics."""
 from __future__ import annotations
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+from typing import List
 
 
 class ContractiveCell(nn.Module):
@@ -36,57 +37,38 @@ class ContractiveCell(nn.Module):
         return 1 - self.eta + self.eta * self.rho
 
 
-def recurrent_cell(kind, eta=0.2, rho=0.95):
-    if kind == "contractive":
-        return ContractiveCell(32, eta, rho)
-    if kind == "gru":
-        return nn.GRUCell(32, 32)
-    raise ValueError("Unknown recurrent cell: " + str(kind))
+@torch.jit.script
+def normal_scan(inputs: torch.Tensor, state: torch.Tensor, valid: torch.Tensor,
+                weight: torch.Tensor, bias: torch.Tensor, eta: float):
+    outputs = torch.jit.annotate(List[torch.Tensor], [])
+    for t in range(inputs.size(1)):
+        state = (1 - eta) * state + eta * torch.tanh(F.linear(state, weight, bias) + inputs[:, t])
+        state = state.masked_fill(~valid[:, t, :, None], 0)
+        outputs.append(state)
+    return torch.stack(outputs, 1), state
 
 
-class NormalStateTeacher(nn.Module):
-    """Reads only normal references/predictions; future descriptions are targets."""
-
-    def __init__(self, identity, cell="contractive", eta=0.2, rho=0.95, sources=None):
-        super().__init__()
-        self.sources = set(["relation", "marginal", "joint"] if sources is None else sources)
-        self.register_buffer("identity", identity.detach().clone())
-        self.adapter = nn.Sequential(nn.Linear(39 + identity.shape[-1], 64), nn.GELU(), nn.Linear(64, 32))
-        self.gru = recurrent_cell(cell, eta, rho)
-        self.current_head = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 37))
-        self.next_head = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 37))
-
-    def forward_block(self, features, state=None):
-        prediction = features["prediction"].float().clone()
-        if "relation" not in self.sources or len(self.identity) < 2:
-            prediction[..., 1] = 0
-        mv = features["m_valid"].bool() & ("marginal" in self.sources)
-        jv = features["j_valid"].bool() & ("joint" in self.sources)
-        reference = torch.where(jv[..., None], features["joint"], features["marginal"] * mv[..., None])
-        usable = (mv | jv) & features["observed"].bool() & features["prediction_ready"].bool()
-        batch, length, channels, _ = reference.shape
-        identity = self.identity[None, None].expand(batch, length, -1, -1)
-        inputs = self.adapter(torch.cat([reference, prediction, identity], -1))
-        if isinstance(self.gru, ContractiveCell):
-            inputs = self.gru.input(inputs)
-        inputs = inputs.transpose(0, 1).contiguous().unbind(0)
-        masks = usable.transpose(0, 1).unbind(0)
-        if state is None:
-            state = reference.new_zeros(batch, channels, 32)
-        outputs = []
-        for inputs_t, valid_t in zip(inputs, masks):
-            update = self.gru.forward_projected if isinstance(self.gru, ContractiveCell) else self.gru
-            state = update(inputs_t.reshape(-1, 32), state.reshape(-1, 32)).reshape(batch, channels, 32)
-            state = state * valid_t[..., None]
-            outputs.append(state)
-        return torch.stack(outputs, 1), state, usable
-
-    @torch.no_grad()
-    def project(self):
-        if isinstance(self.gru, ContractiveCell):
-            self.gru.project()
-
-
-def balanced_description_loss(predicted, target):
-    errors = F.huber_loss(predicted, target, reduction="none")
-    return .5 * (errors[..., :5].mean(-1) + errors[..., 5:].mean(-1))
+@torch.jit.script
+def observed_scan(inputs: torch.Tensor, normals: torch.Tensor, previous_normal: torch.Tensor,
+                  observed: torch.Tensor, gate_base: torch.Tensor, gate_delta: torch.Tensor,
+                  valid: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,
+                  eta: float, mode: int, fixed: float):
+    outputs = torch.jit.annotate(List[torch.Tensor], [])
+    gates = torch.jit.annotate(List[torch.Tensor], [])
+    for t in range(inputs.size(1)):
+        delta = observed - previous_normal
+        if mode == 1:
+            retention = torch.ones_like(delta)
+        elif mode == 2:
+            retention = torch.zeros_like(delta)
+        elif mode == 3:
+            retention = torch.full_like(delta, fixed)
+        else:
+            retention = torch.sigmoid(gate_base[:, t] + F.linear(delta, gate_delta))
+        aligned = previous_normal + retention * delta
+        observed = (1 - eta) * aligned + eta * torch.tanh(F.linear(aligned, weight, bias) + inputs[:, t])
+        observed = observed.masked_fill(~valid[:, t, :, None], 0)
+        previous_normal = normals[:, t]
+        outputs.append(observed)
+        gates.append(retention)
+    return torch.stack(outputs, 1), torch.stack(gates, 1), observed

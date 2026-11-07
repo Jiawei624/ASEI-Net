@@ -1,293 +1,176 @@
+"""Typed, causal descriptors computed per block rather than T*C*38 caches."""
 from __future__ import annotations
-
-from dataclasses import dataclass
-from pathlib import Path
 
 import numpy as np
 import torch
+from torch import nn
+import torch.nn.functional as F
 
-from .data import Record, Standardizer
-from .model import NormalRepresentation, DualTrajectoryDetector, segment_arrays
+from .data import Record
+from .tasks import NormalTaskPolicy
 from .progress import periodic_progress
 
 
-@dataclass
-class FeatureSequence:
-    """Compact frozen evidence. Descriptor differences are reconstructed on demand."""
-
-    z: np.ndarray
-    mask: np.ndarray
-    prediction: np.ndarray
-    marginal_index: np.ndarray
-    joint_index: np.ndarray
-    window: int
-    labels: np.ndarray | None = None
-    weights: np.ndarray | None = None
-
-    def __len__(self):
-        return len(self.z)
-
-    def block(self, start, stop, model: NormalRepresentation):
-        device = next(model.parameters()).device
-        indices = np.arange(start, min(stop, len(self)))
-        segment_indices = indices[:, None] + np.arange(-31, 1)
-        seg = self.z[segment_indices.clip(min=0)].copy()
-        seg[segment_indices < 0] = 0
-        chi = model.descriptor(torch.as_tensor(seg, device=device))
-        mi = torch.as_tensor(self.marginal_index[indices].astype(np.int64), device=device)
-        ji = torch.as_tensor(self.joint_index[indices].astype(np.int64), device=device)
-        rm, rj, mv, jv = model.memory.references(mi, ji)
-        pred = torch.as_tensor(self.prediction[indices], device=device)
-        current = torch.as_tensor(self.z[indices], device=device)
-        ready = torch.as_tensor(indices >= self.window, device=device)[:, None].expand_as(mi)
-        return {"chi": chi, "prediction": pred, "residual": current[..., None] - pred,
-                "energy": model.energy_components(chi, rm, rj),
-                "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
-                "observed": torch.as_tensor(self.mask[indices], device=device), "prediction_ready": ready}
-
-    def save(self, path, key, compressed=True):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(".tmp")
-        with open(temporary, "wb") as stream:
-            writer = np.savez_compressed if compressed else np.savez
-            writer(stream, z=self.z, mask=self.mask, prediction=self.prediction,
-                   marginal_index=self.marginal_index, joint_index=self.joint_index,
-                   window=np.int64(self.window), labels=self.labels if self.labels is not None else [],
-                   weights=self.weights if self.weights is not None else [], key=np.array(key))
-        temporary.replace(path)
+class DescriptorSchema(nn.Module):
+    def __init__(self, metadata):
+        super().__init__()
+        self.metadata = metadata
+        self.channels = len(metadata["supports"])
+        self.q = 1 + max([len(s) for s in metadata["supports"] if s is not None] + [1])
+        self.cat_indices = [i for i, s in enumerate(metadata["supports"]) if s is not None]
+        self.num_indices = [i for i in range(self.channels) if i not in self.cat_indices]
+        values = torch.zeros(self.channels, self.q)
+        known = torch.zeros(self.channels, self.q, dtype=torch.bool)
+        for i, support in enumerate(metadata["supports"]):
+            if support is not None:
+                values[i, 1:len(support) + 1] = torch.tensor(support)
+                known[i, 1:len(support) + 1] = True
+        allowed = known.clone()
+        allowed[:, 0] = True  # Explicit unknown symbol, never nearest-state clipping.
+        self.register_buffer("vocabulary", values)
+        self.register_buffer("known", known)
+        self.register_buffer("allowed", allowed)
+        self.register_buffer("categorical", torch.tensor([s is not None for s in metadata["supports"]]))
+        self.register_buffer("amp_mean", torch.tensor(metadata["amp_mean"], dtype=torch.float32))
+        self.register_buffer("amp_scale", torch.tensor(metadata["amp_scale"], dtype=torch.float32))
 
     @classmethod
-    def load(cls, path, key=None):
-        with np.load(path, allow_pickle=False) as data:
-            if key is not None and data["key"].item() != key:
-                raise ValueError(f"Stale feature cache: {path}. Use a new output directory.")
-            return cls(data["z"], data["mask"], data["prediction"], data["marginal_index"],
-                       data["joint_index"], int(data["window"]),
-                       data["labels"] if data["labels"].size else None,
-                       data["weights"] if data["weights"].size else None)
+    def fit(cls, record, max_values=16, channel_types=None, channel_names=None, batch_size=1024):
+        policy = NormalTaskPolicy(record, max_values, channel_types, channel_names)
+        c = record.z.shape[1]
+        sums, squares, counts = np.zeros((c, 6)), np.zeros((c, 6)), np.zeros(c)
+        for start in range(31, len(record.z), batch_size):
+            ix = np.arange(start, min(start + batch_size, len(record.z)))[:, None] + np.arange(-31, 1)
+            z, seen = record.z[ix].astype(np.float64), record.mask[ix].all(1)
+            mean8, mean32 = z[:, -8:].mean(1), z.mean(1)
+            var8, var32 = z[:, -8:].var(1), z.var(1)
+            raw = np.stack([z[:, -1], z[:, -1] - z[:, -2], mean8, mean32,
+                            np.log(var8 + 1e-4), np.log(var32 + 1e-4)], -1)
+            sums += np.where(seen[..., None], raw, 0).sum(0)
+            squares += np.where(seen[..., None], raw * raw, 0).sum(0)
+            counts += seen.sum(0)
+        mean = sums / counts.clip(min=1)[:, None]
+        scale = np.sqrt(np.maximum(0, squares / counts.clip(min=1)[:, None] - mean * mean)).clip(min=1e-3)
+        scale[counts == 0] = 1
+        metadata = dict(supports=[None if s is None else s.tolist() for s in policy.supports],
+                        amp_mean=mean.tolist(), amp_scale=scale.tolist(), channels=channel_names)
+        return cls(metadata)
 
-
-@torch.no_grad()
-def batch_feature_blocks(sequences, start, stop, model):
-    """Assemble a padded CPU block and transfer each feature array once."""
-    batch, length, channels = len(sequences), stop - start, sequences[0].z.shape[1]
-    context = np.zeros((batch, length + 31, channels), np.float32)
-    observed = np.zeros((batch, length, channels), bool)
-    ready = np.zeros_like(observed)
-    present = np.zeros((batch, length), bool)
-    current = np.zeros((batch, length, channels), np.float32)
-    prediction = np.zeros((batch, length, channels, 2), np.float32)
-    mi = np.full((batch, length, channels), -1, np.int64)
-    ji = np.full((batch, length), -1, np.int64)
-    for i, sequence in enumerate(sequences):
-        indices = np.arange(start, min(stop, len(sequence)))
-        n = len(indices)
-        if not n:
-            continue
-        left, right = max(0, start - 31), min(stop, len(sequence))
-        offset = left - (start - 31)
-        context[i, offset:offset + right - left] = sequence.z[left:right]
-        current[i, :n], observed[i, :n] = sequence.z[indices], sequence.mask[indices]
-        prediction[i, :n] = sequence.prediction[indices]
-        mi[i, :n], ji[i, :n] = sequence.marginal_index[indices], sequence.joint_index[indices]
-        ready[i, :n] = (indices >= sequence.window)[:, None]
-        present[i, :n] = True
-    device = next(model.parameters()).device
-    # Transfer the context once; materialize overlapping descriptor windows on GPU.
-    segments = torch.as_tensor(context, device=device).unfold(1, 32, 1).transpose(-1, -2).contiguous()
-    chi = model.descriptor(segments.reshape(-1, 32, channels))
-    chi = chi.reshape(batch, length, channels, 37)
-    chi *= torch.as_tensor(present, device=device)[..., None, None]
-    rm, rj, mv, jv = model.memory.references(torch.as_tensor(mi.reshape(-1, channels), device=device),
-                                           torch.as_tensor(ji.reshape(-1), device=device))
-    pred = torch.as_tensor(prediction, device=device)
-    rm = rm.reshape(batch, length, channels, 37)
-    rj = rj.reshape(batch, length, channels, 37)
-    return {"chi": chi, "prediction": pred,
-            "energy": model.energy_components(chi, rm, rj),
-            "residual": torch.as_tensor(current, device=device)[..., None] - pred,
-            "marginal": rm, "joint": rj,
-            "m_valid": mv.reshape(batch, length, channels), "j_valid": jv.reshape(batch, length, channels),
-            "observed": torch.as_tensor(observed, device=device),
-            "prediction_ready": torch.as_tensor(ready, device=device)}
-
-
-@torch.no_grad()
-def extract_features(record: Record, model: NormalRepresentation, batch_size=64,
-                     log_interval_seconds=0, progress_label="feature extraction batches",
-                     reference=None, statistics=None) -> FeatureSequence:
-    model.eval()
-    device = next(model.parameters()).device
-    n, c = record.z.shape
-    w = model.cfg["window"]
-    predictions = np.zeros((n, c, 2), np.float32)
-    mi, ji = np.full((n, c), -1, np.int32), np.full(n, -1, np.int32)
-    changed = None
-    if reference is not None:
-        if reference.z.shape != record.z.shape or reference.window != w:
-            raise ValueError("Feature reuse needs the same time/channel shape and window.")
-        same = np.all(reference.z == record.z, axis=1) & np.all(reference.mask == record.mask, axis=1)
-        changed = np.r_[0, np.cumsum(~same, dtype=np.int64)]
-        predictions[:] = reference.prediction
-        mi[:], ji[:] = reference.marginal_index, reference.joint_index
-    counts = dict(predicted_targets=0, queried_targets=0, reused_predictions=0, reused_queries=0)
-    for left in periodic_progress(range(w, n, batch_size), progress_label, log_interval_seconds):
-        indices = np.arange(left, min(left + batch_size, n))
-        prediction_indices = indices if changed is None else indices[(changed[indices] - changed[indices - w]) > 0]
-        query_indices = indices if changed is None else indices[(changed[indices + 1] - changed[indices - 31]) > 0]
-        if len(prediction_indices):
-            hidx = prediction_indices[:, None] + np.arange(-w, 0)
-            pred = model.predict(torch.as_tensor(record.z[hidx], device=device),
-                                 torch.as_tensor(record.mask[hidx], device=device))
-            predictions[prediction_indices] = pred.cpu().numpy()
-        if len(query_indices):
-            segment, smask = segment_arrays(record, query_indices)
-            chi = model.descriptor(torch.as_tensor(segment, device=device))
-            im, ij = model.memory.query(chi, torch.as_tensor(smask.all(1), device=device), model.history.identity.weight)
-            mi[query_indices], ji[query_indices] = im.cpu().numpy(), ij.cpu().numpy()
-        counts["predicted_targets"] += len(prediction_indices)
-        counts["queried_targets"] += len(query_indices)
-        counts["reused_predictions"] += len(indices) - len(prediction_indices)
-        counts["reused_queries"] += len(indices) - len(query_indices)
-    if statistics is not None:
-        statistics.update(counts)
-    return FeatureSequence(record.z, record.mask, predictions, mi, ji, w)
-
-
-def slice_normal_features(sequence, start, stop):
-    """Reuse frozen, window-local features with the task's own zero-state warmup."""
-    if not 0 <= start < stop <= len(sequence):
-        raise ValueError("Invalid source interval for normal feature reuse.")
-    prediction = sequence.prediction[start:stop].copy()
-    marginal, joint = sequence.marginal_index[start:stop].copy(), sequence.joint_index[start:stop].copy()
-    prediction[:sequence.window] = 0
-    marginal[:sequence.window], joint[:sequence.window] = -1, -1
-    return FeatureSequence(sequence.z[start:stop], sequence.mask[start:stop], prediction, marginal, joint, sequence.window)
-
-
-def feature_summary(sequence):
-    """Reference availability over targets, excluding the fixed history warmup."""
-    joint = sequence.joint_index[sequence.window:]
-    available = joint >= 0
-    edges = np.diff(np.r_[0, (~available).astype(np.int8), 0])
-    gaps = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
-    marginal = sequence.marginal_index[sequence.window:]
-    return {"target_points": len(joint), "joint_coverage": float(available.mean()) if len(joint) else None,
-            "longest_joint_unavailable": int(gaps.max()) if len(gaps) else 0,
-            "used_joint_codes": len(np.unique(joint[available])),
-            "marginal_coverage_by_channel": (marginal >= 0).mean(0).tolist() if len(joint) else [],
-            "used_marginal_codes_by_channel": [len(np.unique(column[column >= 0])) for column in marginal.T]}
-
-
-def attribution_summary(attribution, valid, channels):
-    attribution, valid = np.asarray(attribution), np.asarray(valid, bool)
-    selected = attribution[valid & (attribution >= 0)]
-    counts = np.bincount(selected, minlength=channels)
-    return {"scored_points": int(valid.sum()), "max_channel_counts": counts.tolist(),
-            "max_channel_fractions": (counts / max(1, len(selected))).tolist()}
-
-
-@torch.no_grad()
-def score_features(sequence: FeatureSequence, representation, detector, block_length=256, diagnostics=False,
-                   log_interval_seconds=0, progress_label="scoring blocks", execution="block"):
-    if execution not in {"block", "step"}:
-        raise ValueError("Detector execution must be block or step.")
-    detector.eval()
-    n, c = sequence.z.shape
-    scores, valid = np.full(n, np.nan, np.float32), np.zeros(n, bool)
-    attribution = np.full(n, -1, np.int32)
-    extra = {k: np.zeros((n, c), np.float32) for k in
-             ("retention", "state_difference", "marginal_difference", "joint_difference")} if diagnostics else {}
-    if diagnostics and hasattr(detector, "energy_weight"):
-        extra["prototype_energy"] = np.zeros((n, c), np.float32)
-    state = None
-    for start in periodic_progress(range(0, n, block_length), progress_label, log_interval_seconds):
-        block = sequence.block(start, min(n, start + block_length), representation)
-        if execution == "block":
-            out, state = detector.forward_block({k: v[None] for k, v in block.items()}, state, diagnostics)
-            if not torch.isfinite(out["score"][out["valid"]]).all():
-                raise FloatingPointError("Non-finite detector score at a scorable point.")
-            stop = start + len(block["chi"])
-            ready = out["valid"][0].cpu().numpy()
-            scores[start:stop] = np.where(ready, out["score"][0].cpu().numpy(), np.nan)
-            valid[start:stop] = ready
-            attribution[start:stop] = np.where(ready, out["attribution"][0].cpu().numpy(), -1)
-            for key in extra:
-                extra[key][start:stop] = out[key][0].cpu().numpy()
-        else:
-            for t in range(len(block["chi"])):
-                out, state = detector.step({k: v[t:t + 1] for k, v in block.items()}, state, diagnostics)
-                if not torch.isfinite(out["score"][out["valid"]]).all():
-                    raise FloatingPointError("Non-finite detector score at a scorable point.")
-                i = start + t
-                if out["valid"].item():
-                    scores[i] = out["score"].item()
-                    valid[i] = True
-                    attribution[i] = out["attribution"].item()
-                for key in extra:
-                    extra[key][i] = out[key][0].cpu().numpy()
-    return {"scores": scores, "valid": valid, "attribution": attribution, **extra}
-
-
-class StreamingDetector:
-    """One arriving raw sample -> one output; history and states persist across calls."""
-
-    def __init__(self, representation, detector, scaler: Standardizer, threshold: float):
-        self.representation, self.detector = representation.eval(), detector.eval()
-        self.scaler, self.threshold = scaler, float(threshold)
-        self.device = next(representation.parameters()).device
-        self.reset()
-
-    def reset(self):
-        self.previous = self.scaler.mean.copy()
-        self.history, self.masks = [], []
-        self.state = None
-        self.index = 0
-
-    @torch.no_grad()
-    def push(self, raw_sample, diagnostics=False):
-        sample = np.asarray(raw_sample, dtype=np.float64)
-        if sample.shape != self.scaler.mean.shape:
-            raise ValueError("Incoming sample has an incorrect channel shape/order.")
-        mask = np.isfinite(sample)
-        self.previous = np.where(mask, sample, self.previous)
-        z = ((self.previous - self.scaler.mean) / self.scaler.scale).astype(np.float32)
-        w = self.representation.cfg["window"]
-        result = {"index": self.index, "score": float("nan"), "valid": False, "alarm": False,
-                  "attribution": -1}
-        if len(self.history) == w:
-            history = torch.as_tensor(np.array(self.history)[None], device=self.device)
-            hmask = torch.as_tensor(np.array(self.masks)[None], device=self.device)
-            pred = self.representation.predict(history, hmask)
-            segment = np.concatenate([np.array(self.history)[-31:], z[None]])
-            smask = np.concatenate([np.array(self.masks)[-31:], mask[None]])
-            chi = self.representation.descriptor(torch.as_tensor(segment[None], device=self.device))
-            mi, ji = self.representation.memory.query(chi, torch.as_tensor(smask.all(0)[None], device=self.device),
-                                                       self.representation.history.identity.weight)
-            rm, rj, mv, jv = self.representation.memory.references(mi, ji)
-            observed = torch.as_tensor(mask[None], device=self.device)
-            f = {"chi": chi, "prediction": pred, "residual": torch.as_tensor(z[None, :, None], device=self.device) - pred,
-                 "energy": self.representation.energy_components(chi, rm, rj),
-                 "marginal": rm, "joint": rj, "m_valid": mv, "j_valid": jv,
-                 "observed": observed, "prediction_ready": torch.ones_like(observed)}
-            out, self.state = self.detector.step(f, self.state, diagnostics)
-            if not torch.isfinite(out["score"][out["valid"]]).all():
-                raise FloatingPointError("Non-finite detector score at a scorable point.")
-            if out["valid"].item():
-                result.update(score=out["score"].item(), valid=True,
-                              alarm=out["score"].item() > self.threshold,
-                              attribution=out["attribution"].item())
-            if diagnostics:
-                result.update({k: v[0].cpu().numpy() for k, v in out.items()
-                               if k not in {"score", "valid", "attribution"}})
-        self.history.append(z)
-        self.masks.append(mask)
-        if len(self.history) > w:
-            self.history.pop(0)
-            self.masks.pop(0)
-        self.index += 1
+    def ids(self, values):
+        shape = values.shape
+        result = torch.zeros(shape, dtype=torch.long, device=values.device)
+        # Per-channel bucketize avoids B*W*C*Q broadcast allocations.
+        for i in self.cat_indices:
+            support = self.vocabulary[i, self.known[i]]
+            index = torch.searchsorted(support, values[..., i].contiguous())
+            clipped = index.clamp(max=len(support) - 1)
+            matches = (index < len(support)) & (values[..., i] == support[clipped])
+            result[..., i] = torch.where(matches, index + 1, torch.zeros_like(index))
         return result
 
-    def process(self, samples):
-        return [self.push(sample) for sample in samples]
+    def block(self, records, starts, length, errors=None, ready=None, device=None):
+        """Build [B,T,C,...] features; negative indices are padding, never wraparound."""
+        device = self.amp_mean.device if device is None else device
+        values, masks, error_arrays, ready_arrays, target_masks = [], [], [], [], []
+        for k, (record, start) in enumerate(zip(records, starts)):
+            index = np.arange(start - 31, start + length)
+            inside = (index >= 0) & (index < len(record.z))
+            clipped = index.clip(0, max(0, len(record.z) - 1))
+            values.append(np.where(inside[:, None], record.z[clipped], 0))
+            masks.append(record.mask[clipped] & inside[:, None])
+            target_index = np.arange(start, start + length)
+            target_masks.append((target_index >= record.target_start) & (target_index < len(record.z)))
+            clipped_target = target_index.clip(0, len(record.z) - 1)
+            error_arrays.append(np.zeros((length, self.channels, 2), np.float32) if errors is None else errors[k][clipped_target])
+            ready_arrays.append(np.zeros((length, self.channels, 2), bool) if ready is None else ready[k][clipped_target] & inside[31:, None, None])
+        z = torch.as_tensor(np.stack(values), device=device, dtype=torch.float32)
+        observed = torch.as_tensor(np.stack(masks), device=device)
+        segments = z.unfold(1, 32, 1)  # [B,T,C,32] is a view.
+        complete = observed.unfold(1, 32, 1).all(-1)
+        mean8, mean32 = segments[..., -8:].mean(-1), segments.mean(-1)
+        var8, var32 = segments[..., -8:].var(-1, unbiased=False), segments.var(-1, unbiased=False)
+        raw = torch.stack([segments[..., -1], segments[..., -1] - segments[..., -2], mean8, mean32,
+                           (var8 + 1e-4).log(), (var32 + 1e-4).log()], -1)
+        amp = (raw - self.amp_mean) / self.amp_scale
+        shape = (segments - mean32[..., None]) / (var32[..., None] + 1e-4).sqrt()
+        chi = torch.cat([amp, shape], -1)
+        chi = torch.where(self.categorical[None, None, :, None], torch.zeros_like(chi), chi)
+        symbols = self.ids(z).unfold(1, 32, 1)
+        short_valid = observed[:, 31:] & observed[:, 30:-1]
+        target = torch.as_tensor(np.stack(target_masks), device=device)[..., None]
+        result = dict(chi=chi, v=amp[..., :2].masked_fill(self.categorical[None, None, :, None], 0),
+                    tokens=symbols, pair=symbols[..., -2:], sv=short_valid, lv=complete,
+                    target=target, observed=observed[:, 31:],
+                    forecast=torch.as_tensor(np.stack(error_arrays), device=device),
+                    forecast_ready=torch.as_tensor(np.stack(ready_arrays), device=device))
+        if all(record.routing is not None for record in records):
+            for name in ("reference_index", "m_index", "j_index", "short_marginal"):
+                rows = []
+                for record, start in zip(records, starts):
+                    index = np.arange(start, start + length).clip(0, len(record.z) - 1)
+                    rows.append(record.routing[name][index])
+                dtype = torch.float32 if name == "short_marginal" else torch.long
+                result[name] = torch.as_tensor(np.stack(rows), device=device, dtype=dtype)
+        return result
+
+    def cluster_features(self, f, channel=None):
+        """No ordinal distances for state symbols, including dictionary construction."""
+        parts = []
+        indices = range(self.channels) if channel is None else [channel]
+        for i in indices:
+            if i in self.cat_indices:
+                sequence = f["tokens"][..., i, :]
+                hot = F.one_hot(sequence, self.q).float()
+                # Squared Euclidean distance equals 32-step Hamming distance:
+                # each unequal symbol contributes two one-hot coordinates / 64.
+                parts.append(hot.flatten(-2) / 8.)
+            else:
+                weight = f["chi"].new_tensor([(.5 / 6) ** .5] * 6 + [(.5 / 32) ** .5] * 32)
+                parts.append(f["chi"][..., i, :] * weight)
+        return torch.cat(parts, -1)
+
+
+@torch.no_grad()
+def forecast_errors(record, normal, batch_size=64, clean=None, clean_errors=None, clean_ready=None, output=None,
+                    log_interval_seconds=0, progress_label="forecast batches"):
+    """Cache only two errors per channel; affected histories are recomputed exactly."""
+    n, c = record.z.shape
+    w = normal.predictor.window
+    if output is None:
+        errors, ready = np.zeros((n, c, 2), np.float32), np.zeros((n, c, 2), bool)
+    else:
+        errors, ready = output
+        if errors.shape != (n, c, 2) or ready.shape != errors.shape:
+            raise ValueError("Forecast output cache shape differs from the source.")
+        errors[:] = 0
+        ready[:] = False
+    times = np.arange(w, n)
+    reused = 0
+    if clean is not None:
+        if clean.z.shape != record.z.shape:
+            raise ValueError("Paired prediction reuse requires identical time axes.")
+        changed = np.any((clean.mask != record.mask) | (clean.z != record.z), axis=1)
+        prefix = np.r_[0, np.cumsum(changed, dtype=np.int64)]
+        reuse = (prefix[times + 1] - prefix[times - w]) == 0
+        index = times[reuse]
+        errors[index], ready[index] = clean_errors[index], clean_ready[index]
+        times = times[~reuse]
+        reused = len(index)
+    device = normal.schema.amp_mean.device
+    normal.predictor.eval()
+    offsets = np.arange(-w, 0)
+    for left in periodic_progress(range(0, len(times), batch_size), progress_label, log_interval_seconds):
+        ix = times[left:left + batch_size]
+        history = torch.as_tensor(record.z[ix[:, None] + offsets], device=device)
+        masks = torch.as_tensor(record.mask[ix[:, None] + offsets], device=device)
+        target = torch.as_tensor(record.z[ix], device=device)
+        prediction, logits, usable = normal.predictor(history, masks)
+        residual = target[..., None] - prediction
+        symbols = normal.schema.ids(target)
+        if normal.schema.cat_indices:
+            nll = -F.log_softmax(logits, -1).gather(-1, symbols[..., None, None].expand(-1, -1, 2, 1)).squeeze(-1)
+            residual = torch.where(normal.schema.categorical[None, :, None], nll, residual)
+        usable &= torch.as_tensor(record.mask[ix], device=device)[..., None]
+        errors[ix] = residual.masked_fill(~usable, 0).cpu().numpy()
+        ready[ix] = usable.cpu().numpy()
+    return errors, ready, reused

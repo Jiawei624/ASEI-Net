@@ -38,10 +38,7 @@ def _runs_root(cfg):
 
 def start_run(cfg, resume=None):
     runtime = cfg["runtime"]
-    if resume == "legacy":
-        directory = project_path(runtime["output"])
-        record = {"run_id": "legacy", "created_ns": 0}
-    elif resume is not None:
+    if resume is not None:
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", resume):
             raise ValueError("--resume must be a run ID printed by a previous training command.")
         directory = _runs_root(cfg) / resume
@@ -65,7 +62,7 @@ def start_run(cfg, resume=None):
 def training_root(cfg, stage):
     run_id = cfg["runtime"].get("run_id")
     if run_id is None and stage not in {"all", "representation"}:
-        raise ValueError("Continuing a stage requires --resume <run_id>; use --resume legacy for older output directories.")
+        raise ValueError("Continuing a stage requires --resume <run_id>.")
     return start_run(cfg, resume=run_id)
 
 

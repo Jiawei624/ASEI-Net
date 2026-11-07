@@ -7,6 +7,8 @@ from pathlib import Path
 import sys
 import time
 
+from threadpoolctl import threadpool_limits
+
 
 def validate_cpu_config(runtime):
     for key, default in (("cpu_cores", 8), ("threads", 4), ("interop_threads", 1)):
@@ -68,21 +70,20 @@ class CpuGovernor:
     def cooperate(self):
         if self.previous is None or time.monotonic() - self.last_check < self.interval:
             return
-        while True:
-            current = _cpu_counters()
-            now = time.monotonic()
-            previous, self.previous = self.previous, current
-            self.last_check = now
-            if current is None:
-                return
-            total, idle = current[0] - previous[0], current[1] - previous[1]
-            busy = 100 * (1 - min(total, max(0, idle)) / total) if total > 0 else 0
-            if busy <= self.maximum:
-                return
+        current = _cpu_counters()
+        now = time.monotonic()
+        previous, self.previous = self.previous, current
+        self.last_check = now
+        if current is None:
+            return
+        total, idle = current[0] - previous[0], current[1] - previous[1]
+        busy = 100 * (1 - min(total, max(0, idle)) / total) if total > 0 else 0
+        if busy > self.maximum:
             if now - self.last_notice >= 300:
-                print(f"CPU busy={busy:.1f}% exceeds {self.maximum:g}%; yielding to other jobs.", flush=True)
+                print(f"CPU busy={busy:.1f}% exceeds {self.maximum:g}%; yielding briefly.", flush=True)
                 self.last_notice = now
-            time.sleep(self.interval)
+            # Other users' sustained load must never stop this process indefinitely.
+            time.sleep(min(self.interval, .25))
 
 
 _governor = None
@@ -90,11 +91,12 @@ _governor_settings = None
 _last_report = None
 _affinity_source = None
 _applied_affinity = None
+_native_limits = None
 
 
 def configure_cpu(cfg):
     """Call before NumPy/PyTorch imports; safe to repeat for sequential seeds."""
-    global _governor, _governor_settings, _last_report, _affinity_source, _applied_affinity
+    global _governor, _governor_settings, _last_report, _affinity_source, _applied_affinity, _native_limits
     runtime = cfg["runtime"]
     validate_cpu_config(runtime)
     current_cpus = _allowed_cpus()
@@ -115,6 +117,12 @@ def configure_cpu(cfg):
         os.environ[key] = str(threads)
     os.environ["OMP_DYNAMIC"] = "FALSE"
     os.environ["MKL_DYNAMIC"] = "FALSE"
+    # NumPy may already be imported by embedded callers or configuration loading.
+    # Environment variables alone do not resize existing BLAS/OpenMP pools.
+    _native_limits = threadpool_limits(limits=threads)
+    numexpr = sys.modules.get("numexpr")
+    if numexpr is not None:
+        numexpr.set_num_threads(threads)
     torch = sys.modules.get("torch")
     if torch is not None:
         if torch.get_num_threads() != threads:

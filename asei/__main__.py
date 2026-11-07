@@ -22,18 +22,17 @@ def main():
         p.add_argument("--entities", "--data-name-list", nargs="+")
         if name == "run":
             p.add_argument("--output", help="Override runtime.output")
-            p.add_argument("--resume", help="Reuse a previous run ID; legacy reuses output directories created before timestamps")
+            p.add_argument("--resume", help="Continue a previous run using its printed run ID")
             p.add_argument("--seeds", "--seed", nargs="+", type=int, help="Override runtime.seeds (one or more seeds)")
             device = p.add_mutually_exclusive_group()
             device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1; uses logical cuda:0")
             device.add_argument("--device", help="Override logical runtime.device; use cpu for CPU execution")
             p.add_argument("--stage", choices=["all", "representation", "teacher", "cache", "detector", "calibrate", "evaluate"], default="all")
-            p.add_argument("--variant", choices=["full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru",
-                                                "no_teacher", "no_separation", "no_tail", "no_energy", "no_state", "no_external", "energy_only"])
-            p.add_argument("--sources", nargs="*", choices=["relation", "marginal", "joint"])
-            p.add_argument("--skip-vus", action="store_true")
+            from .settings import VARIANTS
+            p.add_argument("--variant", choices=sorted(VARIANTS))
+            p.add_argument("--skip-vus", action="store_true", default=None)
             p.add_argument("--anomaly-ratios", nargs="+", type=float, help="Preset anomaly percentages for TAB label evaluation")
-            p.add_argument("--threshold-method", choices=["tab_anomaly_ratio", "normal_validation", "parallel_normal"])
+            p.add_argument("--threshold-method", choices=["parallel_normal"])
             p.add_argument("--keep-intermediates", action="store_true", help="Keep task caches, predictions and diagnostic files after success")
             p.add_argument("--all-label-metrics", "--all-tab-label-metrics", action="store_true")
             p.add_argument("--all-metrics", action="store_true", help="Compute all 16 label and 6 score detection metrics (the default)")
@@ -64,14 +63,13 @@ def main():
     p.add_argument("--bundle", required=True)
     p.add_argument("--input-csv", required=True)
     p.add_argument("--output", help="Default: reports.predictions/<input stem>_alarms.csv")
-    p.add_argument("--anomaly-ratio", type=float, help="Use a ratio threshold stored in the bundle; default is prediction_ratio")
-    p.add_argument("--alpha", type=float, help="Override the normal pointwise budget in an in_1_2_4 bundle")
+    p.add_argument("--alpha", type=float, help="Override the normal pointwise budget stored in the bundle")
     device = p.add_mutually_exclusive_group()
     device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1")
     device.add_argument("--device", help="Override logical runtime.device")
     args = parser.parse_args()
     cfg = load_config(args.config or DEFAULT_CONFIG)
-    if args.command == "run" and args.resume and args.resume != "legacy" and args.config is None:
+    if args.command == "run" and args.resume and args.config is None:
         from pathlib import Path
         root = project_path(args.output or cfg["runtime"]["output"])
         # start_run performs the authoritative run-ID/path validation.
@@ -114,7 +112,7 @@ def execute(args, cfg):
         configure_cpu(cfg)  # Apply thread limits after importing PyTorch, too.
         source = project_path(args.input_csv)
         target = project_path(args.output) if args.output else report_path(cfg, "predictions") / (source.stem + "_alarms.csv")
-        stream, names = load_bundle(project_path(args.bundle), cfg["runtime"]["device"], anomaly_ratio=args.anomaly_ratio, alpha=args.alpha)
+        stream, names = load_bundle(project_path(args.bundle), cfg["runtime"]["device"], alpha=args.alpha)
         frame = pd.read_csv(source, usecols=names)
         values = frame[names].to_numpy(np.float64)
         output = stream.push_many(values) if hasattr(stream, "push_many") else [stream.push(row) for row in values]
@@ -134,11 +132,7 @@ def execute(args, cfg):
         if args.threshold_method:
             cfg["calibration"]["method"] = args.threshold_method
         if args.anomaly_ratios is not None:
-            if cfg["stage2"].get("method") == "in_1_2_4":
-                cfg["calibration"]["offline_anomaly_ratios"] = args.anomaly_ratios
-            else:
-                cfg["calibration"].update(method="tab_anomaly_ratio", anomaly_ratios=args.anomaly_ratios,
-                                         prediction_ratio=1. if 1. in args.anomaly_ratios else args.anomaly_ratios[0])
+            cfg["calibration"]["offline_anomaly_ratios"] = args.anomaly_ratios
     cfg = resolve_paths(cfg)
     datasets = set(ds.upper() for ds in (args.datasets or cfg["data"]["datasets"]))
     unsupported = datasets - set(DATASETS)
@@ -165,14 +159,15 @@ def execute(args, cfg):
         return
     if args.variant:
         cfg["stage2"]["variant"] = args.variant
-    if args.sources is not None:
-        cfg["stage2"]["sources"] = args.sources
-    cfg["evaluation"]["skip_vus"] = args.skip_vus
+    if args.skip_vus is not None:
+        cfg["evaluation"]["skip_vus"] = args.skip_vus
+    if args.all_metrics:
+        cfg["evaluation"]["skip_vus"] = False
     if args.keep_intermediates or args.diagnostics:
         cfg["runtime"]["keep_intermediates"] = True
     seeds = args.seeds if args.seeds is not None else cfg["runtime"].get("seeds", [41, 42, 43, 44, 45])
     if args.stage not in {"all", "representation"} and not args.resume:
-        raise ValueError("--stage " + args.stage + " requires --resume <run_id>; use --resume legacy for older results.")
+        raise ValueError("--stage " + args.stage + " requires --resume <run_id>.")
     from .runs import start_run, run_log_path
     cfg["runtime"]["seeds"] = list(seeds)
     cfg["data"]["datasets"] = sorted(datasets)

@@ -3,6 +3,7 @@ numpy>=1.21.0
 pandas>=1.1
 torch>=1.11.0
 scikit-learn
+threadpoolctl>=3.1
 scipy
 statsmodels>=0.14.0
 tqdm>=4.64.0
@@ -12,3 +13,6 @@ PyYAML>=5.1
 
 # Dataset downloader (scripts/download_data.py).
 gdown
+
+# Regression tests and the server smoke-check workflow.
+pytest>=7.0

@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--output", help="Keep smoke artifacts in this directory; default uses a temporary directory")
     args = parser.parse_args()
     from asei.config import load_config, configure_cuda
-    cfg = load_config(ROOT / "configs" / "in1_2_4.yaml")
+    cfg = load_config(ROOT / "configs" / "default.yaml")
     configure_cuda(cfg, gpu=args.gpu, device=args.device or (None if args.gpu is not None else "cpu"))
     # Configure visibility before importing modules that import PyTorch.
     import numpy as np
@@ -41,9 +41,9 @@ def main():
         frame.to_csv(path, index=False)
         cfg["runtime"].update(output=str(directory / "outputs"), keep_intermediates=True, seeds=[42])
         cfg["model"].update(window=32, d_model=8, heads=2, layers=1, dropout=0., marginal_prototypes=4, joint_prototypes=5)
-        cfg["memory124"].update(pool_size=64, prototype_chunk=2)
+        cfg["memory"].update(pool_size=64, prototype_chunk=2)
         cfg["stage1"].update(epochs=1, patience=1, batch_size=8, max_train_points=16, max_validation_points=16)
-        cfg["teacher"].update(epochs=1, patience=1, train_sequences=1, validation_sequences=1,
+        cfg["teacher"].update(epochs=1, patience=1, train_sequences=1,
                                batch_sequences=1, sequence_length=16, block_length=16)
         cfg["stage2"].update(epochs=1, patience=1, train_pairs=4, validation_pairs=4, batch_pairs=2, block_length=32)
         cfg["evaluation"].update(skip_vus=True)
@@ -58,7 +58,7 @@ def main():
     if args.output:
         check(args.output)
     else:
-        with tempfile.TemporaryDirectory(prefix="asei_v124_") as directory:
+        with tempfile.TemporaryDirectory(prefix="asei_smoke_") as directory:
             check(directory)
 
 

@@ -6,15 +6,17 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..compat import transformer_encoder
-from ..state import ContractiveCell
-from .features import Schema124
+from .compat import transformer_encoder
+from .state import ContractiveCell
+from .progress import Progress
+from .resources import cooperate
+from .features import DescriptorSchema
 
 
 class TypedForecaster(nn.Module):
     def __init__(self, schema, config):
         super().__init__()
-        # Schema belongs to Normal124; avoid duplicate state_dict subtrees.
+        # Schema belongs to NormalModel; avoid duplicate state_dict subtrees.
         object.__setattr__(self, "schema", schema)
         self.window, self.channels = config["window"], schema.channels
         d, q = config["d_model"], schema.q
@@ -78,7 +80,7 @@ class TypedForecaster(nn.Module):
         return numeric, logits, torch.stack([available, peer_available], -1)
 
 
-class NormalTeacher124(nn.Module):
+class NormalTeacher(nn.Module):
     def __init__(self, schema, eta=.2, rho=.95):
         super().__init__()
         object.__setattr__(self, "schema", schema)
@@ -94,12 +96,18 @@ class NormalTeacher124(nn.Module):
 
     def adapt(self, v, pair):
         identity = self.identity.weight.expand(*v.shape[:-2], -1, -1)
+        if not self.schema.cat_indices:
+            return self.num_adapter(torch.cat([v, identity], -1))
+        if not self.schema.num_indices:
+            return self.cat_adapter(torch.cat([F.one_hot(pair, self.schema.q).float().flatten(-2), identity], -1))
         num = self.num_adapter(torch.cat([v, identity], -1))
         cat = self.cat_adapter(torch.cat([F.one_hot(pair, self.schema.q).float().flatten(-2), identity], -1))
         return torch.where(self.schema.categorical[..., None], cat, num)
 
     def prior(self, state):
         numeric = self.next_num(state)[..., :2]
+        if not self.schema.cat_indices:
+            return numeric, state.new_empty(0)
         pair = self.next_pair(state).reshape(*state.shape[:-1], self.schema.q, self.schema.q)
         allowed = self.schema.allowed[:, :, None] & self.schema.allowed[:, None, :]
         return numeric, F.log_softmax(pair.masked_fill(~allowed, -1e9).flatten(-2), -1).reshape_as(pair)
@@ -127,7 +135,7 @@ class NormalTeacher124(nn.Module):
         return now, future
 
 
-class NormalMemory124(nn.Module):
+class NormalMemory(nn.Module):
     def __init__(self, schema, km, kj, chunk=32):
         super().__init__()
         object.__setattr__(self, "schema", schema)
@@ -160,7 +168,7 @@ class NormalMemory124(nn.Module):
         return np.asarray(selected)
 
     @torch.no_grad()
-    def fit(self, record, seed=42, pool_size=8192, rare_fraction=.25):
+    def fit(self, record, seed=42, pool_size=8192, rare_fraction=.25, log_interval_seconds=30):
         from .tasks import normal_difficulty
         rng = np.random.default_rng(seed)
         candidates = np.arange(31, len(record.z))
@@ -172,9 +180,12 @@ class NormalMemory124(nn.Module):
         indices.sort()
         f = self.schema.block([record] * len(indices), indices.tolist(), 1)
         f = {k: v[:, 0] for k, v in f.items()}
+        progress = Progress("memory marginal channels", self.schema.channels, log_interval_seconds)
         for i in range(self.schema.channels):
+            cooperate()
             valid = torch.nonzero(f["lv"][:, i], as_tuple=False).flatten()
             if not len(valid):
+                progress.update(i + 1)
                 continue
             embedding = self.schema.cluster_features({k: v[valid] for k, v in f.items()}, i).cpu().numpy()
             local_priority = priority[indices[valid.cpu().numpy()]]
@@ -188,14 +199,17 @@ class NormalMemory124(nn.Module):
             self.m_num[i, :len(chosen)] = f["chi"][chosen, i]
             self.m_tokens[i, :len(chosen)] = f["tokens"][chosen, i]
             self.m_active[i, :len(chosen)] = True
+            progress.update(i + 1)
         valid = torch.nonzero(f["lv"].all(-1), as_tuple=False).flatten()
         if len(valid):
+            print(f"memory joint clustering start candidates={len(valid)}", flush=True)
             embedding = self.schema.cluster_features({k: v[valid] for k, v in f.items()}).cpu().numpy()
             chosen = valid[torch.as_tensor(self._representatives(embedding, self.j_num.shape[0], seed,
                                            priority[indices[valid.cpu().numpy()]], rare_fraction), device=valid.device)]
             self.j_num[:len(chosen)] = f["chi"][chosen]
             self.j_tokens[:len(chosen)] = f["tokens"][chosen]
             self.j_active[:len(chosen)] = True
+            print(f"memory joint clustering complete prototypes={len(chosen)}", flush=True)
         for i in range(self.schema.channels):
             seen = f["sv"][:, i]
             if not seen.any():
@@ -212,9 +226,15 @@ class NormalMemory124(nn.Module):
         # Output [...,C,K]; prototype chunks bound the largest temporary.
         x = f["v"] if short else f["chi"]
         p = p_num[..., :2] if short else p_num
-        weight = x.new_tensor([.5, .5] if short else [.5 / 6] * 6 + [.5 / 32] * 32)
-        distance = ((x.square() * weight).sum(-1)[..., None] + (p.square() * weight).sum(-1)
-                    - 2 * torch.einsum("...cd,ckd->...ck", x * weight, p)).clamp(min=0)
+        if short:
+            # Direct two-coordinate differences avoid cancellation near a large
+            # prototype and keep instant energies consistent across batch sizes.
+            distance = .5 * ((x[..., 0, None] - p[..., 0]).square()
+                             + (x[..., 1, None] - p[..., 1]).square())
+        else:
+            weight = x.new_tensor([.5 / 6] * 6 + [.5 / 32] * 32)
+            distance = ((x.square() * weight).sum(-1)[..., None] + (p.square() * weight).sum(-1)
+                        - 2 * torch.einsum("...cd,ckd->...ck", x * weight, p)).clamp(min=0)
         if self.schema.cat_indices:
             ids = self.schema.cat_indices
             tokens = f["pair"][..., ids, :] if short else f["tokens"][..., ids, :]
@@ -224,6 +244,8 @@ class NormalMemory124(nn.Module):
         return distance
 
     def long_evidence(self, f):
+        if "m_index" in f:
+            return self._long_from_indices(f, f["m_index"], f["j_index"][..., 0])
         shape = f["sv"].shape
         m_best = f["v"].new_full(shape, float("inf"))
         m_index = torch.zeros(shape, dtype=torch.long, device=m_best.device)
@@ -243,7 +265,10 @@ class NormalMemory124(nn.Module):
             improve = value < j_best
             j_index = torch.where(improve, index + start, j_index)
             j_best = torch.minimum(j_best, value)
-        channels = torch.arange(self.schema.channels, device=m_best.device)
+        return self._long_from_indices(f, m_index, j_index)
+
+    def _long_from_indices(self, f, m_index, j_index):
+        channels = torch.arange(self.schema.channels, device=f["v"].device)
         mn, mt = self.m_num[channels, m_index], self.m_tokens[channels, m_index]
         jn, jt = self.j_num[j_index], self.j_tokens[j_index]
         mv = f["lv"] & self.m_active.any(-1)
@@ -263,7 +288,8 @@ class NormalMemory124(nn.Module):
             dj[..., self.schema.cat_indices] *= 2
         return dict(md=md.masked_fill(~mv[..., None], 0), jd=jd.masked_fill(~jv[..., None], 0),
                     long_dist=torch.stack([dm.masked_fill(~mv, 0), dj.masked_fill(~jv, 0)], -1),
-                    mv=mv, jv=jv)
+                    mv=mv, jv=jv, m_index=m_index,
+                    j_index=j_index[..., None].expand_as(m_index))
 
     @staticmethod
     def excluded_trim(cost, valid, fraction):
@@ -279,7 +305,6 @@ class NormalMemory124(nn.Module):
         prefix = F.pad(ordered.cumsum(-1), (1, 0))
         base = prefix.gather(-1, count)
         # Removing a selected target uses sums on either side, not total-target.
-        q = count[..., :1]  # Valid targets have the same retained peer count.
         # q can differ for missing targets; they are reset and do not affect scoring.
         valid_q = torch.ceil((valid.sum(-1) - 1).clamp(min=0) * (1 - fraction)).long()[:, None, None]
         positions = torch.arange(cost.shape[-1], device=cost.device)[None, None, :]
@@ -292,11 +317,46 @@ class NormalMemory124(nn.Module):
         full = F.pad(finite.cumsum(-1), (1, 0))[..., :-1] + F.pad(finite.flip(-1).cumsum(-1).flip(-1), (0, 1))[..., 1:]
         return trimmed, full / peer_count[:, None].clamp(min=1), peer_count
 
-    def reference(self, f, prior_num, prior_pair, trim=.1, prior_weight=.25, external=True):
-        # f is one time point: [B,C,...]. All routing excludes actual target input.
+    def short_marginal(self, f):
+        if "short_marginal" in f:
+            return f["short_marginal"]
+        best = f["v"].new_full(f["sv"].shape, float("inf"))
+        for start in range(0, self.m_num.shape[1], self.chunk):
+            end = start + self.chunk
+            d = self._distances(f, self.m_num[:, start:end], self.m_tokens[:, start:end], short=True)
+            best = torch.minimum(best, d.masked_fill(~self.m_active[:, start:end], float("inf")).min(-1).values)
+        return best.masked_fill(~self.m_active.any(-1), 0)
+
+    def prepare_peers(self, f, trim=.1):
+        """Batch time-independent retrieval; state-dependent priors stay causal."""
+        shape = f["sv"].shape
         pn, pt = self.j_num.transpose(0, 1), self.j_tokens.transpose(0, 1)
         d = self._distances(f, pn, pt, short=True) / self.peer_scale[:, None]
-        peer, secondary, counts = self.excluded_trim(d.transpose(1, 2), f["sv"], trim)
+        peer, secondary, counts = self.excluded_trim(
+            d.reshape(-1, self.schema.channels, self.j_num.shape[0]).transpose(1, 2),
+            f["sv"].reshape(-1, self.schema.channels), trim)
+        return dict(peer=peer.reshape(*shape[:-1], self.j_num.shape[0], shape[-1]),
+                    secondary=secondary.reshape(*shape[:-1], self.j_num.shape[0], shape[-1]),
+                    counts=counts.reshape(shape))
+
+    def lookup_reference(self, index):
+        channels = torch.arange(self.schema.channels, device=index.device)
+        joint = index >= 0
+        ji = index.clamp(min=0)
+        mi = (-index - 1).clamp(min=0)
+        # Both arms are gathered, so clamp their unused indices to their own table.
+        ji = ji.clamp(max=self.j_num.shape[0] - 1)
+        mi = mi.clamp(max=self.m_num.shape[1] - 1)
+        num = torch.where(joint[..., None], self.j_num[ji, channels, :2], self.m_num[channels, mi, :2])
+        pair = torch.where(joint[..., None], self.j_tokens[ji, channels, -2:], self.m_tokens[channels, mi, -2:])
+        available = joint | self.m_active.any(-1)
+        return num, pair, available, joint
+
+    def reference(self, f, prior_num, prior_pair, trim=.1, prior_weight=.25, external=True,
+                  prepared=None, return_index=False):
+        # f is one time point: [B,C,...]. All routing excludes actual target input.
+        prepared = self.prepare_peers(f, trim) if prepared is None else prepared
+        peer, secondary, counts = prepared["peer"], prepared["secondary"], prepared["counts"]
         nprior = .5 * (prior_num[:, None] - self.j_num[None, :, :, :2]).square().sum(-1) / self.peer_scale
         if self.schema.cat_indices:
             pairs = self.j_tokens[..., -2:]
@@ -323,11 +383,13 @@ class NormalMemory124(nn.Module):
         ref_num = torch.where(joint_valid[..., None], joint_num, marginal_num)
         ref_pair = torch.where(joint_valid[..., None], joint_pair, marginal_pair)
         available = joint_valid | self.m_active.any(-1)
-        return ref_num, ref_pair, available, joint_valid
+        result = (ref_num, ref_pair, available, joint_valid)
+        if return_index:
+            return (*result, torch.where(joint_valid, index, -mi - 1))
+        return result
 
     def short_evidence(self, f, ref_num, ref_pair, reference_valid, joint_valid):
-        d = self._distances(f, self.m_num, self.m_tokens, short=True)
-        marginal = d.masked_fill(~self.m_active, float("inf")).min(-1).values
+        marginal = self.short_marginal(f)
         relative = .5 * (f["v"] - ref_num).square().sum(-1)
         if self.schema.cat_indices:
             relative[..., self.schema.cat_indices] = (f["pair"][..., self.schema.cat_indices, :] != ref_pair[..., self.schema.cat_indices, :]).float().mean(-1)
@@ -338,15 +400,15 @@ class NormalMemory124(nn.Module):
         return distance, available
 
 
-class Normal124(nn.Module):
+class NormalModel(nn.Module):
     def __init__(self, metadata, config):
         super().__init__()
         self.metadata, self.config = metadata, config
-        self.schema = Schema124(metadata)
+        self.schema = DescriptorSchema(metadata)
         self.predictor = TypedForecaster(self.schema, config["model"])
-        self.memory = NormalMemory124(self.schema, config["model"]["marginal_prototypes"], config["model"]["joint_prototypes"],
-                                      config.get("memory124", {}).get("prototype_chunk", 32))
-        self.teacher = NormalTeacher124(self.schema, config["stage2"].get("eta", .2), config["stage2"].get("rho", .95))
+        self.memory = NormalMemory(self.schema, config["model"]["marginal_prototypes"], config["model"]["joint_prototypes"],
+                                      config.get("memory", {}).get("prototype_chunk", 32))
+        self.teacher = NormalTeacher(self.schema, config["stage2"].get("eta", .2), config["stage2"].get("rho", .95))
 
     def freeze(self):
         self.eval()

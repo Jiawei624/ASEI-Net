@@ -1,12 +1,17 @@
+# Normal-only fitting / selection / calibration = 60 / 20 / 20 of official normal prefix.
 data:
-  # Relative to the ASEI-Net project root: /ASEI-Net/dataset on the server.
   root: dataset
   manifest: null
   multivariate_only: true
   use_prepared_manifest: true
   archive: TAB_dataset.zip
-  train_fraction: 0.8
+  train_fraction: 0.6
+  selection_fraction: 0.5
   datasets: [PSM, SMD, SWAT, PUMP]
+  # Override automatic <=16-value typing, using actual channel names:
+  # channel_types: {sensor_1: continuous, actuator_1: discrete}
+  channel_types: null
+
 model:
   window: auto
   d_model: auto
@@ -15,92 +20,94 @@ model:
   dropout: 0.1
   marginal_prototypes: auto
   joint_prototypes: auto
+
+memory:
+  pool_size: 8192
+  prototype_chunk: 32
+  reference_block_length: 16
+  rare_fraction: 0.25
+
 stage1:
   epochs: 80
   batch_size: 64
   lr: 0.0003
   weight_decay: 0.0001
-  warmup_epochs: 5
   patience: 10
   stride: 1
-  workers: 0
-stage2:
-  optimizer_update: task_batch
-  method: in_1_2_3
-  epochs: 50
-  batch_pairs: 8
-  lr: 0.0003
-  patience: 8
-  block_length: 256
-  train_pairs: auto
-  validation_pairs: 128
-  validation_seeds: [1001, 1002]
-  families: [level, variance, temporal, relation]
-  variant: full
-  sources: [relation, marginal, joint]
-  fixed_retention: 0.9
-  cell: contractive
-  eta: 0.2
-  rho: 0.95
-  energy_weight: 1.0
-  beta_init: 2.0
-  lambda_ref: 0.1
-  lambda_sep: 0.1
-  lambda_tail: 0.1
-  gamma_max: 0.25
-  tail_margin: 0.5
-  tail_fraction: 0.01
-  hard_negative_fraction: 0.25
-  discrete_max_values: 16
-  donor_candidates: 16
-  boundary_blend: 4
+  # Zero uses all fitting targets. Validation is a fixed evenly spaced subset.
+  max_train_points: 0
+  max_validation_points: 4096
+
 teacher:
   optimizer_update: task_batch
   epochs: 10
   patience: 3
   lr: 0.0003
-  batch_sequences: 16
-  sequence_length: 512
-  train_sequences: 512
-  validation_sequences: 64
+  batch_sequences: 8
+  sequence_length: 256
+  train_sequences: 256
+  block_length: 64
+
+stage2:
+  method: asei_net
+  optimizer_update: task_batch
+  variant: full
+  epochs: 50
+  patience: 8
+  batch_pairs: 8
+  lr: 0.0003
+  block_length: 128
+  train_pairs: auto
+  validation_pairs: 128
+  families: [level, variance, temporal, relation]
+  relation_generator: residual_var
+  relation_l1: 0.001
+  fixed_retention: 0.9
+  eta: 0.2
+  rho: 0.95
+  reference_trim: 0.1
+  reference_prior: 0.25
+  lambda_state: 0.1
+  lambda_tail: 0.1
+  tail_fraction: 0.01
+  tail_margin: 0.5
+  hard_negative_fraction: 0.25
+  discrete_max_values: 16
+  donor_candidates: 16
+  boundary_blend: 4
+
 calibration:
-  method: tab_anomaly_ratio
-  anomaly_ratios: [0.1, 0.5, 1.0, 2, 3, 5, 10, 15, 20, 25]
-  prediction_ratio: 1.0
+  method: parallel_normal
+  weights: [0.5, 0.5]
+  alphas: [0.001, 0.005, 0.01]
+  alpha: 0.01
+  # Optional separate offline table; never changes deployment calibration.
+  # offline_anomaly_ratios: [0.1, 0.5, 1, 2, 5]
+
 evaluation:
-  label_metrics: [accuracy, precision, recall, f_score, adjust_accuracy, adjust_precision, adjust_recall, adjust_f_score, rprecision, rrecall, rf, precision_at_k, affiliation_precision, affiliation_recall, affiliation_f, add]
-  score_metrics: [auc_roc, auc_pr, R_AUC_ROC, R_AUC_PR, VUS_ROC, VUS_PR]
-  regression_metrics: []
-  supplementary_label_metrics: []
+  skip_vus: false
   recovery_confirmation: 8
-  latency_points: 0
+
 runtime:
-  # Physical GPU 1 is the only visible GPU and is cuda:0 inside this process.
-  cuda_visible_devices: "1"
   cuda_device_order: PCI_BUS_ID
-  device: cuda:0
+  cuda_visible_devices: "0"
+  device: auto
   feature_batch_size: 64
   threads: 4
   interop_threads: 1
   cpu_cores: 8
   cpu_max_percent: 80
-  cpu_check_interval_seconds: 5
   output: outputs
   keep_intermediates: false
   run_subdir: runs
   timestamp_utc_offset_hours: 8
   log_dir: logs
   log_file: main.log
-  # Epoch summaries are always printed; 0 disables timed progress messages.
-  log_interval_seconds: 300
-  detector_execution: block
-  task_cache_format: packed
-  task_cache_checkpoint_pairs: 16
-  task_cache_memory_mb: 2048
-  task_cache_compression: false
+  log_interval_seconds: 30
   seeds: [41, 42, 43, 44, 45]
+  task_cache_memory_mb: 256
+
 reports:
-  # Relative paths in this section are resolved under runtime.output.
   inventory: data_inventory.csv
   eligible_manifest: eligible_manifest.csv
   summary: summary

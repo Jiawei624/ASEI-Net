@@ -1,178 +1,133 @@
-"""Sequential task-feature storage and bounded reuse of legacy cache files."""
+"""Packed raw tasks and frozen forecast errors, bounded RAM and resumable writes."""
 from __future__ import annotations
 
-from collections import OrderedDict
 import json
+import shutil
 from pathlib import Path
+from collections import OrderedDict
 
 import numpy as np
 
-from .features import FeatureSequence
+from .data import Record
+from .config import write_json
+from .tasks import event_ranges
 
 
-_DTYPES = {"z": np.float32, "mask": np.bool_, "prediction": np.float32,
-           "marginal_index": np.int32, "joint_index": np.int32,
-           "labels": np.int8, "weights": np.float32}
+class PairCache:
+    FIELDS = {"z": (np.float32, 1), "mask": (np.uint8, 1), "error": (np.float32, 2), "ready": (np.uint8, 2),
+              "reference_index": (np.int32, 1), "m_index": (np.int32, 1),
+              "j_index": (np.int32, 1), "short_marginal": (np.float32, 1)}
 
-
-def _shape(name, channels):
-    if name == "prediction":
-        return (channels, 2)
-    return (channels,) if name in {"z", "mask", "marginal_index"} else ()
-
-
-def _atomic_json(path, record):
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    temporary.replace(path)
-
-
-class PackedTaskWriter:
-    """Append pairs sequentially; commit an index only after both records are written."""
-
-    def __init__(self, directory, key, channels, checkpoint_pairs=16):
-        self.directory = Path(directory)
+    def __init__(self, directory, key, channels, memory_mb=256):
+        self.directory, self.key, self.channels = Path(directory), key, channels
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / "index.json"
-        self.checkpoint_pairs = max(1, int(checkpoint_pairs))
-        self.record = {"format": 1, "key": key, "channels": channels, "items": [], "recipes": []}
+        self.index = {"format": "asei-net/raw-pairs/2", "key": key, "channels": channels, "entries": []}
         if self.path.exists():
-            self.record = json.loads(self.path.read_text(encoding="utf-8"))
-            if self.record.get("format") != 1 or self.record.get("key") != key or self.record.get("channels") != channels:
-                raise ValueError("Packed task cache does not match the frozen representation.")
-        self.total = sum(item["length"] for item in self.record["items"])
-        self.handles = {}
-        try:
-            for name, dtype in _DTYPES.items():
-                path = self.directory / (name + ".bin")
-                expected = self.total * int(np.prod(_shape(name, channels))) * np.dtype(dtype).itemsize
-                actual = path.stat().st_size if path.exists() else 0
-                if actual < expected:
-                    raise ValueError("A committed packed-cache field is truncated: " + str(path))
-                handle = open(path, "r+b" if path.exists() else "w+b", buffering=0)
-                self.handles[name] = handle
-                # A process interrupted before index commit may leave an uncommitted tail.
-                handle.truncate(expected)
-                handle.seek(expected)
-        except Exception:
-            self.close(commit=False)
-            raise
+            self.index = json.loads(self.path.read_text(encoding="utf-8"))
+            if self.index.get("format") != "asei-net/raw-pairs/2" or self.index["key"] != key or self.index["channels"] != channels:
+                raise ValueError("Task cache identity differs; use a new run.")
+        self.maps, self.lru, self.bytes = {}, OrderedDict(), 0
+        self.limit = max(0, int(memory_mb * 1024 ** 2))
+        self.offsets = np.r_[0, np.cumsum([e["length"] for e in self.index["entries"]], dtype=np.int64)].tolist()
+        self._recover_uncommitted_suffix()
 
-    def has_pair(self, index):
-        return index < len(self.record["recipes"])
+    def _file(self, role, field):
+        return self.directory / (role + "_" + field + ".bin")
 
-    def recipe(self, index):
-        return self.record["recipes"][index]
+    def _recover_uncommitted_suffix(self):
+        rows = sum(e["length"] for e in self.index["entries"])
+        for role in ("clean", "corrupt"):
+            for field, (dtype, width) in self.FIELDS.items():
+                path = self._file(role, field)
+                expected = rows * self.channels * width * np.dtype(dtype).itemsize
+                if path.exists() and path.stat().st_size < expected:
+                    raise ValueError("Truncated committed task cache: " + str(path))
+                if path.exists() and path.stat().st_size > expected:
+                    with path.open("r+b") as stream:
+                        stream.truncate(expected)
+                if expected and not path.exists():
+                    raise ValueError("Missing committed task cache: " + str(path))
 
-    def append(self, index, clean, corrupt, recipe):
-        if index != len(self.record["recipes"]):
-            raise ValueError("Packed task pairs must be appended in order.")
-        items, offset = [], self.total
-        for role, sequence in (("clean", clean), ("corrupt", corrupt)):
-            for name, dtype in _DTYPES.items():
-                value = getattr(sequence, name)
-                expected = (len(sequence), *_shape(name, self.record["channels"]))
-                if value is None or value.shape != expected:
-                    raise ValueError("Invalid task-cache field: " + name)
-                np.ascontiguousarray(value, dtype=dtype).tofile(self.handles[name])
-            items.append({"offset": offset, "length": len(sequence), "window": sequence.window,
-                          "index": index, "role": role})
-            offset += len(sequence)
-        for handle in self.handles.values():
-            handle.flush()
-        record = dict(self.record, items=self.record["items"] + items,
-                      recipes=self.record["recipes"] + [recipe])
-        self.record, self.total = record, offset
-        if len(record["recipes"]) % self.checkpoint_pairs == 0:
-            _atomic_json(self.path, record)
+    def append(self, pair, errors, ready):
+        if self.maps:
+            raise RuntimeError("Close read maps before appending task records.")
+        if pair.clean.z.shape != pair.corrupt.z.shape:
+            raise ValueError("Paired task shapes differ.")
+        for role, record, error, mask in zip(("clean", "corrupt"), (pair.clean, pair.corrupt), errors, ready):
+            if record.routing is None:
+                raise ValueError("Prepare frozen retrieval before committing a task.")
+            values = dict(z=record.z, mask=record.mask, error=error, ready=mask, **record.routing)
+            for field, (dtype, _) in self.FIELDS.items():
+                shape = (*record.z.shape, 2) if field in {"error", "ready"} else record.z.shape
+                if np.asarray(values[field]).shape != shape:
+                    raise ValueError("Task cache field has an invalid shape: " + field)
+                with self._file(role, field).open("ab") as stream:
+                    np.asarray(values[field], dtype=dtype).tofile(stream)
+        entry = dict(length=len(pair.clean.z), target_start=pair.clean.target_start, recipe=pair.recipe,
+                     label_ranges=event_ranges(pair.labels))
+        self.index["entries"].append(entry)
+        self.offsets.append(self.offsets[-1] + entry["length"])
+        temporary = self.path.with_suffix(".tmp")
+        write_json(temporary, self.index)
+        temporary.replace(self.path)
 
-    def close(self, commit=True):
-        if commit and self.handles:
-            _atomic_json(self.path, self.record)
-        for handle in self.handles.values():
-            handle.close()
-        self.handles.clear()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close(commit=exc[0] is None)
-
-
-class PackedTaskReader:
-    def __init__(self, directory, key):
-        directory = Path(directory)
-        self.record = json.loads((directory / "index.json").read_text(encoding="utf-8"))
-        if self.record.get("format") != 1 or self.record.get("key") != key:
-            raise ValueError("Stale packed task cache.")
-        total = sum(item["length"] for item in self.record["items"])
-        if not total:
-            raise ValueError("Packed task cache is empty.")
-        self.fields = {}
-        for name, dtype in _DTYPES.items():
-            shape = (total, *_shape(name, self.record["channels"]))
-            path = directory / (name + ".bin")
-            if path.stat().st_size != int(np.prod(shape)) * np.dtype(dtype).itemsize:
-                raise ValueError("Packed task-cache field has an unexpected size: " + str(path))
-            self.fields[name] = np.memmap(path, mode="r", dtype=dtype, shape=shape)
-
-    def get(self, index, role):
-        item = self.record["items"][2 * index + (1 if role == "corrupt" else 0)]
-        if item["index"] != index or item["role"] != role:
-            raise ValueError("Packed task-cache index is inconsistent.")
-        start, stop = item["offset"], item["offset"] + item["length"]
-        fields = {name: array[start:stop] for name, array in self.fields.items()}
-        return FeatureSequence(window=item["window"], **fields)
-
-    def close(self):
-        # Outstanding sequence views keep their mappings alive until released.
-        self.fields.clear()
-
-
-class TaskFeatureStore:
-    """Memory-map packed arrays, or cache legacy NPZ records within a RAM limit."""
-
-    def __init__(self, directory, key, memory_mb=2048):
-        self.directory, self.key = Path(directory), key
-        manifest = self.directory / "manifest.json"
-        record = json.loads(manifest.read_text(encoding="utf-8")) if manifest.exists() else {}
-        self.storage = record.get("storage", "npz")
-        self.limit = int(float(memory_mb) * 1024 ** 2)
-        self.cache, self.readers = OrderedDict(), {}
-        self.bytes, self.hits, self.loads = 0, 0, 0
-
-    def get(self, split, index, role):
-        if self.storage == "packed":
-            if split not in self.readers:
-                self.readers[split] = PackedTaskReader(self.directory / split, self.key)
-            return self.readers[split].get(int(index), role)
-        token = (split, int(index), role)
-        if token in self.cache:
-            self.hits += 1
-            self.cache.move_to_end(token)
-            return self.cache[token][0]
-        sequence = FeatureSequence.load(self.directory / f"{split}_{index:04d}_{role}.npz", self.key)
-        self.loads += 1
-        size = sum(getattr(sequence, name).nbytes for name in _DTYPES if getattr(sequence, name) is not None)
+    def get(self, index):
+        if index in self.lru:
+            value, size = self.lru.pop(index)
+            self.lru[index] = (value, size)
+            return value
+        entry = self.index["entries"][index]
+        start = self.offsets[index]
+        length = entry["length"]
+        result = []
+        size = 0
+        for role in ("clean", "corrupt"):
+            fields = {}
+            for field, (dtype, width) in self.FIELDS.items():
+                identity = role, field
+                if identity not in self.maps:
+                    self.maps[identity] = np.memmap(self._file(role, field), dtype=dtype, mode="r")
+                begin, end = start * self.channels * width, (start + length) * self.channels * width
+                shape = (length, self.channels) if width == 1 else (length, self.channels, width)
+                fields[field] = np.array(self.maps[identity][begin:end].reshape(shape), copy=True)
+                size += fields[field].nbytes
+            routing = {name: fields[name] for name in ("reference_index", "m_index", "j_index", "short_marginal")}
+            result.append((Record(fields["z"], fields["mask"].astype(bool), entry["target_start"], routing),
+                           fields["error"], fields["ready"].astype(bool)))
+        labels = np.zeros(length, bool)
+        for start, stop in entry["label_ranges"]:
+            labels[start:stop] = True
+        value = (*result, labels, entry["recipe"])
         if size <= self.limit:
-            while self.bytes + size > self.limit and self.cache:
-                _, (_, removed) = self.cache.popitem(last=False)
-                self.bytes -= removed
-            self.cache[token] = (sequence, size)
+            while self.lru and self.bytes + size > self.limit:
+                _, (_, old_size) = self.lru.popitem(last=False)
+                self.bytes -= old_size
+            self.lru[index] = (value, size)
             self.bytes += size
-        return sequence
-
-    def recipe(self, split, index):
-        if self.storage == "packed":
-            if split not in self.readers:
-                self.readers[split] = PackedTaskReader(self.directory / split, self.key)
-            return self.readers[split].record["recipes"][int(index)]
-        return json.loads((self.directory / f"{split}_{index:04d}.json").read_text(encoding="utf-8"))
+        return value
 
     def close(self):
-        self.cache.clear()
+        self.lru.clear()
         self.bytes = 0
-        for reader in self.readers.values():
-            reader.close()
-        self.readers.clear()
+        for array in self.maps.values():
+            array._mmap.close()
+        self.maps.clear()
+
+    def __len__(self):
+        return len(self.index["entries"])
+
+
+def prune_task_cache(directory):
+    """Remove the generated tasks child, retaining every model and result file."""
+    base = Path(directory).resolve()
+    path = base / "tasks"
+    if not path.exists():
+        return
+    if path.is_symlink() or path.resolve().parent != base:
+        raise ValueError("Task-cache cleanup target must remain a direct child of this run.")
+    for child in path.rglob("*"):
+        if child.is_symlink():
+            raise ValueError("Refusing cleanup of a task cache containing symbolic links.")
+        child.resolve().relative_to(path.resolve())
+    shutil.rmtree(path)

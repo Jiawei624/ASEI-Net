@@ -5,7 +5,6 @@ import csv
 import json
 import math
 from pathlib import Path
-import shutil
 
 from .data import DATASETS
 from .metrics import (LABEL_METRIC_ORDER, SCORE_METRIC_ORDER, EVENT_METRIC_ORDER, METRICS_PROTOCOL,
@@ -21,7 +20,7 @@ CSV_COLUMNS = ("run_id", "run_created_ns", "dataset", "entity", "seed", "variant
 
 def result_row(record):
     row = {key: record.get(key, "") for key in CSV_COLUMNS[:7]}
-    row["method"] = record.get("method") or record.get("config", {}).get("stage2", {}).get("method") or "in_1_2_2"
+    row["method"] = record.get("method") or record.get("config", {}).get("stage2", {}).get("method") or "legacy"
     row["metrics_protocol"] = record.get("metrics_protocol", record["metrics"].get("protocol", "legacy_binary_topk_v1"))
     row["test_points"] = record.get("test_points", "")
     row["metrics_type"] = record.get("metrics_type", "both")
@@ -89,7 +88,7 @@ def result_rows(record):
 
 
 def _model_identity(row):
-    return tuple(str((row.get(k) or "in_1_2_2") if k == "method" else row.get(k, ""))
+    return tuple(str((row.get(k) or "legacy") if k == "method" else row.get(k, ""))
                  for k in ("run_id", "dataset", "entity", "seed", "variant", "method"))
 
 
@@ -112,7 +111,7 @@ def _write_rows(path, rows):
     with temporary.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=CSV_COLUMNS)
         writer.writeheader()
-        writer.writerows({k: ((row.get(k) or "in_1_2_2") if k == "method" else
+        writer.writerows({k: ((row.get(k) or "legacy") if k == "method" else
                              (row.get(k) or "both") if k == "metrics_type" else row.get(k, ""))
                           for k in CSV_COLUMNS} for row in rows)
     temporary.replace(path)
@@ -196,7 +195,7 @@ def collect_rows(root, recompute_labels=False):
                 continue
             for row in reader:
                 if row.get("dataset") in DATASETS:
-                    row["method"] = row.get("method") or "in_1_2_2"
+                    row["method"] = row.get("method") or "legacy"
                     row["metrics_type"] = row.get("metrics_type") or "both"
                     row["threshold_method"] = row.get("threshold_method") or "normal_validation"
                     row["metrics_protocol"] = row.get("metrics_protocol") or "legacy_binary_topk_v1"
@@ -233,27 +232,3 @@ def export_results(root, output, recompute_labels=False):
     if not rows:
         raise ValueError("No completed detection results found.")
     return _write_rows(output, rows)
-
-
-def prune_intermediates(directory, detector_directory):
-    """Delete only known training artifacts inside the selected entity directory."""
-    base, detector = Path(directory).resolve(), Path(detector_directory).resolve()
-    detector.relative_to(base)
-    names = [base / name for name in ("representation.pt", "stage1_best.pt", "stage1_history.json",
-             "resolved_config.json", "data_provenance.json", "normal_features.npz", "test_features.npz", "task_cache",
-             "teacher.pt", "teacher_history.json", "teacher_train_features.npz", "teacher_selection_features.npz",
-             "threshold_train_features.npz")]
-    names += [detector / name for name in ("detector.pt", "stage2_history.json", "resolved_config.json",
-              "calibration.json", "normal_validation_scores.npz", "predictions.npz", "result.json")]
-    for path in names:
-        resolved = path.resolve()
-        resolved.relative_to(base)
-        if resolved == base or path.is_symlink():
-            raise ValueError("Refusing cleanup outside the experiment's generated artifacts.")
-        if path.is_dir():
-            for item in path.rglob("*"):
-                if item.is_symlink():
-                    raise ValueError("Refusing cleanup of a task cache containing symbolic links.")
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()

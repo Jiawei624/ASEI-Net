@@ -33,7 +33,7 @@ def collect(root, seeds=None):
         if seeds is not None and int(data["seed"]) not in seeds:
             continue
         row = {k: data[k] for k in ("dataset", "entity", "seed", "variant")}
-        row["method"] = data.get("method", "in_1_2_2")
+        row["method"] = data.get("method", "legacy")
         row["alpha"] = float(data["alpha"]) if data.get("alpha") not in (None, "") else float("nan")
         row["anomaly_ratio"] = float(data["anomaly_ratio"]) if data.get("anomaly_ratio") not in (None, "") else float("nan")
         row["metrics_type"] = data.get("metrics_type") or "both"

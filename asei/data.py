@@ -29,6 +29,8 @@ class Record:
     z: np.ndarray
     mask: np.ndarray
     target_start: int = 0
+    # Compact, fixed-model routing only; never cache trainable detector outputs.
+    routing: dict | None = None
 
 
 def _bool(value) -> bool:

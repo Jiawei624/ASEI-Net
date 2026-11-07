@@ -1,4 +1,4 @@
-# Keep only the server runtime directories and the three root files.
+# Keep only the server runtime directories and the requested root files.
 /*
 !/.gitignore
 !/dataset.txt
