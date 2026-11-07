@@ -8,6 +8,7 @@ import sys
 import time
 
 from threadpoolctl import threadpool_limits
+from .progress import log
 
 
 def validate_cpu_config(runtime):
@@ -80,7 +81,7 @@ class CpuGovernor:
         busy = 100 * (1 - min(total, max(0, idle)) / total) if total > 0 else 0
         if busy > self.maximum:
             if now - self.last_notice >= 300:
-                print(f"CPU busy={busy:.1f}% exceeds {self.maximum:g}%; yielding briefly.", flush=True)
+                log(f"CPU busy={busy:.1f}% exceeds {self.maximum:g}%; yielding briefly.")
                 self.last_notice = now
             # Other users' sustained load must never stop this process indefinitely.
             time.sleep(min(self.interval, .25))
@@ -147,9 +148,9 @@ def configure_cpu(cfg):
         _governor_settings = settings
     report["system_load_guard"] = _governor.previous is not None
     if report != _last_report:
-        print(f"CPU budget={budget} threads={threads} workers={workers} "
-              f"affinity={report['cpu_affinity']} host_limit={settings[0]:g}% "
-              f"load_guard={report['system_load_guard']}", flush=True)
+        log(f"CPU budget={budget} threads={threads} workers={workers} "
+            f"affinity={report['cpu_affinity']} host_limit={settings[0]:g}% "
+            f"load_guard={report['system_load_guard']}", cfg)
         _last_report = report.copy()
     return report
 

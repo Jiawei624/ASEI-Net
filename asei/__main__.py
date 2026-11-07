@@ -8,6 +8,7 @@ import json
 from .config import (DEFAULT_CONFIG, configure_cuda, load_config, project_path,
                      report_path, resolve_paths, write_json)
 from .resources import configure_cpu
+from .progress import log
 
 
 def main():
@@ -68,7 +69,12 @@ def main():
     device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1")
     device.add_argument("--device", help="Override logical runtime.device")
     args = parser.parse_args()
-    cfg = load_config(args.config or DEFAULT_CONFIG)
+    selected = args.config
+    if selected is None and args.command in {"run", "inspect"} and args.datasets and len(args.datasets) == 1:
+        selected = DEFAULT_CONFIG.parent / (args.datasets[0].lower() + ".yaml")
+    cfg = load_config(selected or DEFAULT_CONFIG)
+    if args.command == "run" and args.datasets and len(args.datasets) > 1:
+        raise ValueError("Run each dataset separately with its own configs/<dataset>.yaml.")
     if args.command == "run" and args.resume and args.config is None:
         from pathlib import Path
         root = project_path(args.output or cfg["runtime"]["output"])
@@ -172,14 +178,13 @@ def execute(args, cfg):
     cfg["runtime"]["seeds"] = list(seeds)
     cfg["data"]["datasets"] = sorted(datasets)
     directory = start_run(cfg, resume=args.resume)
-    print("Run ID:", cfg["runtime"]["run_id"], flush=True)
-    print("Run directory:", directory, flush=True)
+    log(f"Run ID: {cfg['runtime']['run_id']} directory: {directory}", cfg)
 
     def train():
         # CUDA visibility was configured before importing PyTorch through the pipeline.
         from .pipeline import run_entity
         if args.log:
-            print("Run ID:", cfg["runtime"]["run_id"], "directory:", directory, flush=True)
+            log(f"Run ID: {cfg['runtime']['run_id']} directory: {directory}", cfg)
         for entity in entities:
             for seed in seeds:
                 run_entity(entity, cfg, seed, args.stage, args.diagnostics)
@@ -187,7 +192,7 @@ def execute(args, cfg):
     if args.log:
         target = run_log_path(cfg)
         target.parent.mkdir(parents=True, exist_ok=True)
-        print("Log:", target, flush=True)
+        log(f"Log: {target}", cfg)
         with open(target, "a", encoding="utf-8", buffering=1) as stream:
             with redirect_stdout(stream), redirect_stderr(stream):
                 try:

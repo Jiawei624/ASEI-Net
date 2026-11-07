@@ -120,7 +120,7 @@ def check_gpu(cfg, physical_gpu, seed=42):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", "--config-path", default=str(ROOT / "configs" / "default.yaml"))
+    parser.add_argument("--config", "--config-path", default=str(ROOT / "configs" / "psm.yaml"))
     parser.add_argument("--strict-numpy", "--strict-tab", action="store_true", help="Also require the exact numpy==1.21.0 runtime pin")
     parser.add_argument("--check-imports", action="store_true")
     parser.add_argument("--gpu", "--gpus", type=int, help="Check one physical GPU; also enables import checks")

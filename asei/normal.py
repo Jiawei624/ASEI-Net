@@ -93,6 +93,32 @@ class NormalTeacher(nn.Module):
         self.current_cat = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 32 * schema.q))
         self.next_cat = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 32 * schema.q))
         self.next_pair = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, schema.q ** 2))
+        self._prototype_cache = None
+
+    def prototype_inputs(self, memory):
+        """Encode each possible reference once, retaining adapter gradients in training."""
+        key = (self.identity.weight.device, self.identity.weight.dtype,
+               tuple(p._version for p in self.parameters()), memory.m_num._version,
+               memory.j_num._version, memory.m_tokens._version, memory.j_tokens._version)
+        reusable = not torch.is_grad_enabled()
+        if reusable and self._prototype_cache is not None and self._prototype_cache[0] == key:
+            return self._prototype_cache[1]
+        marginal = self.adapt(memory.m_num[..., :2].transpose(0, 1), memory.m_tokens[..., -2:].transpose(0, 1))
+        joint = self.adapt(memory.j_num[..., :2], memory.j_tokens[..., -2:])
+        values = (marginal, joint, self.cell.input(marginal), self.cell.input(joint))
+        if reusable:
+            self._prototype_cache = (key, values)
+        return values
+
+    def reference_input(self, index, tables):
+        marginal, joint, marginal_projected, joint_projected = tables
+        channels = torch.arange(self.schema.channels, device=index.device)
+        use_joint = index >= 0
+        ji = index.clamp(min=0, max=joint.shape[0] - 1)
+        mi = (-index - 1).clamp(min=0, max=marginal.shape[0] - 1)
+        adapted = torch.where(use_joint[..., None], joint[ji, channels], marginal[mi, channels])
+        projected = torch.where(use_joint[..., None], joint_projected[ji, channels], marginal_projected[mi, channels])
+        return adapted, projected
 
     def adapt(self, v, pair):
         identity = self.identity.weight.expand(*v.shape[:-2], -1, -1)
@@ -202,14 +228,12 @@ class NormalMemory(nn.Module):
             progress.update(i + 1)
         valid = torch.nonzero(f["lv"].all(-1), as_tuple=False).flatten()
         if len(valid):
-            print(f"memory joint clustering start candidates={len(valid)}", flush=True)
             embedding = self.schema.cluster_features({k: v[valid] for k, v in f.items()}).cpu().numpy()
             chosen = valid[torch.as_tensor(self._representatives(embedding, self.j_num.shape[0], seed,
                                            priority[indices[valid.cpu().numpy()]], rare_fraction), device=valid.device)]
             self.j_num[:len(chosen)] = f["chi"][chosen]
             self.j_tokens[:len(chosen)] = f["tokens"][chosen]
             self.j_active[:len(chosen)] = True
-            print(f"memory joint clustering complete prototypes={len(chosen)}", flush=True)
         for i in range(self.schema.channels):
             seen = f["sv"][:, i]
             if not seen.any():

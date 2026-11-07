@@ -16,6 +16,9 @@ CSV_COLUMNS = ("run_id", "run_created_ns", "dataset", "entity", "seed", "variant
                "normal_fpr", "scorable_normal_fpr", "scorable_fraction",
                "short_calibration_points", "dynamic_calibration_points", "short_tail_supported", "dynamic_tail_supported",
                "missing_metrics", "undefined_metrics", "model_file")
+BRANCH_COLUMNS = tuple(branch + "_" + measure for branch in ("short", "dynamic")
+                       for measure in ("normal_fpr", "anomaly_recall"))
+CSV_COLUMNS = tuple(dict.fromkeys(CSV_COLUMNS + BRANCH_COLUMNS))
 
 
 def result_row(record):
@@ -28,6 +31,7 @@ def result_row(record):
     row["threshold_method"] = calibration.get("method", "normal_validation")
     row.update({key: calibration.get(key, "") for key in ("anomaly_ratio", "alpha", "threshold")})
     row["model_file"] = record.get("model_file", "")
+    row.update({key: record.get(key, "") for key in BRANCH_COLUMNS})
     for key in ("normal_fpr", "scorable_normal_fpr", "scorable_fraction", "short_calibration_points",
                 "dynamic_calibration_points", "short_tail_supported", "dynamic_tail_supported"):
         row[key] = record.get(key, "")
@@ -67,6 +71,8 @@ def result_rows(record):
                 resolution = entry.get("resolution", {}).get(branch, {})
                 details[branch + "_calibration_points"] = resolution.get("samples", "")
                 details[branch + "_tail_supported"] = resolution.get("supported", "")
+                for measure in ("normal_fpr", "anomaly_recall"):
+                    details[branch + "_" + measure] = entry.get("branches", {}).get(branch, {}).get(measure, "")
             rows.append(result_row(dict(record, **details, metrics_type="label",
                 metrics={"label": entry["metrics"], "event": entry.get("event", {})},
                 calibration={"method": "parallel_normal", "alpha": entry["alpha"], "threshold": entry["threshold"]})))

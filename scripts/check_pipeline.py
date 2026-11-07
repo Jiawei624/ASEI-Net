@@ -18,7 +18,7 @@ def main():
     parser.add_argument("--output", help="Keep smoke artifacts in this directory; default uses a temporary directory")
     args = parser.parse_args()
     from asei.config import load_config, configure_cuda
-    cfg = load_config(ROOT / "configs" / "default.yaml")
+    cfg = load_config(ROOT / "configs" / "psm.yaml")
     configure_cuda(cfg, gpu=args.gpu, device=args.device or (None if args.gpu is not None else "cpu"))
     # Configure visibility before importing modules that import PyTorch.
     import numpy as np

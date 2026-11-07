@@ -27,7 +27,7 @@ from .tasks import ResidualLagTasks
 from .training import (_save, fit_forecaster, fit_teacher, fit_energy_scales,
                        build_pairs, seed_everything)
 from .detection_training import fit_detector
-from .progress import Progress
+from .progress import Progress, log
 
 
 def get_device(name):
@@ -197,9 +197,15 @@ def _evaluate(raw, labels, calibration, cfg):
         fpr = float(predicted[negatives].mean()) if negatives.any() else None
         covered = negatives & valid
         scored_fpr = float(predicted[covered].mean()) if covered.any() else None
+        branches = {}
+        positives = actual == 1
+        for branch, weight in zip(("short", "dynamic"), calibration.weights):
+            branch_alarm = valid & (weight > 0) & (output["p_" + branch] <= alpha * weight)
+            branches[branch] = dict(normal_fpr=float(branch_alarm[negatives].mean()) if negatives.any() else None,
+                anomaly_recall=float(branch_alarm[positives].mean()) if positives.any() else None)
         metrics["label_by_alpha"].append(dict(alpha=alpha, threshold=float(-np.log(alpha)), metrics=entries, event=events,
             normal_fpr=fpr, scorable_normal_fpr=scored_fpr, scorable_fraction=float(valid.mean()),
-            resolution=calibration.resolution(alpha)))
+            resolution=calibration.resolution(alpha), branches=branches))
         alarms.append(predicted)
     metrics["undefined_or_warnings"] = warnings
     return metrics, output, np.stack(alarms)
@@ -226,8 +232,8 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     directory = training_root(cfg, stage) / entity.dataset / entity.name / f"seed_{seed}"
     detector_dir = directory / "detectors" / cfg["stage2"]["variant"]
     detector_dir.mkdir(parents=True, exist_ok=True)
-    print(f"entity={entity.dataset}/{entity.name} seed={seed} device={device} "
-          f"fit={len(fit.z)} selection={cut} calibration={len(heldout.z) - cut} channels={fit.z.shape[1]}", flush=True)
+    log(f"entity={entity.dataset}/{entity.name} seed={seed} device={device} "
+        f"fit={len(fit.z)} selection={cut} calibration={len(heldout.z) - cut} channels={fit.z.shape[1]}", cfg)
     implementation = implementation_fingerprint()
     normal_key = fingerprint(dict(data=provenance, model=cfg["model"], stage1=cfg["stage1"],
         memory=cfg["memory"], types=cfg["data"].get("channel_types"), implementation=implementation, seed=seed,
@@ -341,8 +347,8 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
         state = TrajectoryState(bootstrap["normal"].to(device), bootstrap["observed"].to(device))
         raw, _ = score_raw(model, _join(context, test), cfg, len(context.z), state, diagnostics)
     experiment["timings"]["test_scoring_seconds"] = time.perf_counter() - start
-    print(f"evaluation label_metrics={len(cfg['evaluation']['label_metrics'])} "
-          f"score_metrics={len(cfg['evaluation']['score_metrics'])}", flush=True)
+    log(f"evaluation label_metrics={len(cfg['evaluation']['label_metrics'])} "
+        f"score_metrics={len(cfg['evaluation']['score_metrics'])}", cfg)
     metrics, output, alarms = _evaluate(raw, labels, calibration, cfg)
     result = dict(dataset=entity.dataset, entity=entity.name, seed=seed, method=METHOD, variant=model.variant,
         run_id=cfg["runtime"]["run_id"], run_created_ns=cfg["runtime"]["run_created_ns"],
@@ -369,12 +375,12 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     save_bundle(bundle, model, scaler, calibration, cfg, provenance, experiment, bootstrap)
     write_json(detector_dir / "result.json", result)
     csv_path = write_run_result(cfg["runtime"]["run_directory"], result)
-    if cfg["runtime"]["keep_intermediates"] or diagnostics:
+    if cfg["runtime"]["keep_intermediates"] or diagnostics or cfg["runtime"].get("save_predictions", False):
         np.savez_compressed(detector_dir / "predictions.npz", labels=labels, alarms_by_alpha=alarms,
             alphas=np.asarray(cfg["calibration"]["alphas"]),
             **{k: v for k, v in output.items() if k != "labels"},
             **{"raw_" + k: v for k, v in raw.items()})
-    else:
+    if not cfg["runtime"]["keep_intermediates"] and not diagnostics:
         prune_task_cache(directory)
-    print(f"saved metrics {csv_path}; best model {bundle}", flush=True)
+    log(f"saved metrics {csv_path}; best model {bundle}", cfg)
     return detector_dir

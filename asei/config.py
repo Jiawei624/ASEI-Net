@@ -13,7 +13,7 @@ import yaml
 from .resources import validate_cpu_config
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "psm.yaml"
 TAB_ANOMALY_RATIOS = (0.1, 0.5, 1., 2., 3., 5., 10., 15., 20., 25.)
 REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
                    "summary": "summary", "environment": "environment.json", "predictions": "predictions"}

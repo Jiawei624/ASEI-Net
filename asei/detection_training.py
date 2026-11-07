@@ -8,19 +8,21 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from .progress import Progress
+from .progress import Progress, log, epoch_log
 from .resources import cooperate
 from .tasks import observable_positive_mask, phase_weights
-from .training import StageCheckpoint, _recovery
+from .training import StageCheckpoint, _recovery, learning_rate_schedule
+from .batching import BatchFeatures
 
 
 def fit_detector(model, training, validation, cfg, directory, key, seed):
     settings = cfg["stage2"]
     device = model.normal.schema.amp_mean.device
     parameters = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.Adam(parameters, lr=settings["lr"])
+    optimizer = torch.optim.Adam(parameters, lr=settings["lr"], weight_decay=settings.get("weight_decay", 0.))
     rng = np.random.default_rng(seed)
-    checkpoint = StageCheckpoint(Path(directory) / "detector.pt", model, optimizer, key, rng)
+    scheduler = learning_rate_schedule(optimizer, settings)
+    checkpoint = StageCheckpoint(Path(directory) / "detector.pt", model, optimizer, key, rng, scheduler)
     if checkpoint.complete:
         return checkpoint.history
     active = model.normal.memory.m_active.any(-1).cpu().numpy()
@@ -49,6 +51,7 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
             ready = [v[2] for v in clean] + [v[2] for v in corrupt]
             size = len(clean)
             maximum = max(len(r.z) for r in records)
+            batch_features = BatchFeatures(model, records, errors, ready, maximum, cfg)
             whole_weight = np.zeros((2 * size, maximum), np.float32)
             whole_truth = np.zeros_like(whole_weight)
             whole_ramp = np.zeros((size, maximum, model.normal.schema.channels), np.float32)
@@ -76,14 +79,17 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
             tail_coefficient = weights.new_zeros(())
             tail_selected = torch.zeros_like(weights, dtype=torch.bool)
             tail_count, tail_active = 1, False
-            if tail_enabled:
+            if tail_enabled and learn:
                 snapshot, snapshot_valid, state = torch.zeros_like(weights), torch.zeros_like(tail_selected), None
+                target_state = None
                 with torch.no_grad():
                     for start in range(0, maximum, block):
                         cooperate()
                         length = min(block, maximum - start)
-                        f = model.normal.schema.block(records, [start] * len(records), length, errors, ready)
-                        out, state = model.forward_block(f, state)
+                        f = batch_features.block(start, length)
+                        prepared = model.frozen_block(f, None if state is None else state.normal)
+                        out, state = model.forward_block(f, state, prepared=prepared)
+                        target_state = batch_features.store(start, f, prepared, target_state, size)
                         snapshot[:, start:start + length] = out["dynamic"]
                         snapshot_valid[:, start:start + length] = out["dynamic_valid"]
                         completed += 1
@@ -99,17 +105,28 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                         tail = snapshot.flatten()[selected].mean()
                         tail_coefficient = 2 * (torch.sigmoid(settings["tail_margin"] + tail - snapshot)
                                                 * weights * positive).sum() / size
+            if tail_enabled and not learn:
+                snapshot = torch.zeros_like(weights)
+                snapshot_valid = torch.zeros_like(tail_selected)
             state, teacher_state = None, None
             if learn:
                 optimizer.zero_grad(set_to_none=True)
             for start in range(0, maximum, block):
                 cooperate()
                 length = min(block, maximum - start)
-                f = model.normal.schema.block(records, [start] * len(records), length, errors, ready)
+                f = batch_features.block(start, length)
+                cached = batch_features.cached.get(start)
                 with torch.no_grad():
-                    targets, teacher_state = model.teacher_block({k: v[:size] for k, v in f.items()}, teacher_state)
+                    if cached is None:
+                        targets, teacher_state = model.teacher_block({k: v[:size] for k, v in f.items()}, teacher_state)
+                    else:
+                        targets, teacher_state = cached["targets"], cached["teacher_state"]
                 with torch.set_grad_enabled(learn):
-                    out, state = model.forward_block(f, state, return_aux=True)
+                    out, state = model.forward_block(f, state, return_aux=True,
+                        prepared=None if cached is None else cached["prepared"])
+                    if tail_enabled and not learn:
+                        snapshot[:, start:start + length] = out["dynamic"]
+                        snapshot_valid[:, start:start + length] = out["dynamic_valid"]
                     weight = weights[:, start:start + length]
                     target = truth[:, start:start + length]
                     ramp = ramps[:, start:start + length]
@@ -142,6 +159,16 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                 state = state.detach()
                 completed += 1
                 progress.update(completed)
+            if tail_enabled and not learn:
+                negative = (truth == 0) & (weights > 0) & snapshot_valid
+                positive = (truth > 0) & (weights > 0) & snapshot_valid
+                if bool(negative.any() & positive.any()):
+                    values = snapshot[negative]
+                    count = max(1, int(np.ceil(settings["tail_fraction"] * len(values))))
+                    threshold = values.topk(count).values.mean()
+                    penalty = 2 * (F.softplus(settings["tail_margin"] + threshold - snapshot) * weights * positive).sum() / size
+                    totals[3] += penalty.double() * size
+                    totals[0] += settings["lambda_tail"] * penalty.double() * size
             if learn and model.variant != "energy_only":
                 torch.nn.utils.clip_grad_norm_(parameters, 1)
                 optimizer.step()
@@ -155,12 +182,15 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
         if checkpoint.stale >= settings["patience"]:
             break
         began = time.perf_counter()
-        print(f"stage2 epoch={number + 1} start train_pairs={len(training)} validation_pairs={len(validation)}", flush=True)
+        rate = optimizer.param_groups[0]["lr"]
         train, valid = epoch(training, True), epoch(validation, False)
-        checkpoint.record(dict(epoch=number + 1, train=train, selection=valid), valid["loss"])
-        print(f"stage2 epoch={number + 1} train={train['loss']:.6f} validation={valid['loss']:.6f} "
-              f"classification={train['classification']:.6f} state={train['state']:.6f} "
-              f"tail={train['tail']:.6f} seconds={time.perf_counter() - began:.1f}", flush=True)
+        if scheduler is not None:
+            scheduler.step(valid["loss"])
+        checkpoint.record(dict(epoch=number + 1, train=train, selection=valid,
+                               seconds=time.perf_counter() - began), valid["loss"])
+        epoch_log("stage2", number + 1, settings["epochs"], train["loss"], valid["loss"], began, cfg, checkpoint,
+                  lr=rate, classification=train["classification"],
+                  state=train["state"], tail=train["tail"])
     history = checkpoint.finish()
     model.eval()
     return history

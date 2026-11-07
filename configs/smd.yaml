@@ -1,10 +1,143 @@
-base: default.yaml
 data:
-  datasets: [SMD]
+  root: dataset
+  manifest: null
+  multivariate_only: true
+  use_prepared_manifest: true
+  archive: TAB_dataset.zip
+  train_fraction: 0.6
+  selection_fraction: 0.5
+  datasets:
+  - SMD
+  channel_types: null
 model:
   window: 128
   d_model: 64
+  heads: 4
+  layers: 2
+  dropout: 0.1
   marginal_prototypes: 128
   joint_prototypes: 256
+memory:
+  pool_size: 8192
+  prototype_chunk: 32
+  reference_block_length: 16
+  rare_fraction: 0.25
+stage1:
+  epochs: 80
+  batch_size: 64
+  lr: 0.0003
+  weight_decay: 0.0001
+  patience: 10
+  stride: 1
+  max_train_points: 0
+  max_validation_points: 4096
+teacher:
+  optimizer_update: task_batch
+  epochs: 10
+  patience: 3
+  lr: 0.0003
+  batch_sequences: 8
+  sequence_length: 256
+  train_sequences: 256
+  block_length: 64
+stage2:
+  method: asei_net
+  optimizer_update: task_batch
+  variant: full
+  epochs: 50
+  patience: 8
+  batch_pairs: 8
+  lr: 0.0003
+  block_length: 128
+  train_pairs: auto
+  validation_pairs: 128
+  families:
+  - level
+  - variance
+  - temporal
+  - relation
+  relation_generator: residual_var
+  relation_l1: 0.001
+  fixed_retention: 0.9
+  eta: 0.2
+  rho: 0.95
+  reference_trim: 0.1
+  reference_prior: 0.25
+  lambda_state: 0.1
+  lambda_tail: 0.1
+  tail_fraction: 0.01
+  tail_margin: 0.5
+  hard_negative_fraction: 0.25
+  discrete_max_values: 16
+  donor_candidates: 16
+  boundary_blend: 4
+calibration:
+  method: parallel_normal
+  weights:
+  - 0.5
+  - 0.5
+  alphas:
+  - 0.001
+  - 0.005
+  - 0.01
+  alpha: 0.01
+evaluation:
+  skip_vus: false
+  recovery_confirmation: 8
+  regression_metrics: []
+  supplementary_label_metrics: []
+  latency_points: 0
+  label_metrics:
+  - accuracy
+  - precision
+  - recall
+  - f_score
+  - adjust_accuracy
+  - adjust_precision
+  - adjust_recall
+  - adjust_f_score
+  - rprecision
+  - rrecall
+  - rf
+  - precision_at_k
+  - affiliation_precision
+  - affiliation_recall
+  - affiliation_f
+  - add
+  score_metrics:
+  - auc_roc
+  - auc_pr
+  - R_AUC_ROC
+  - R_AUC_PR
+  - VUS_ROC
+  - VUS_PR
 runtime:
+  cuda_device_order: PCI_BUS_ID
+  cuda_visible_devices: '0'
+  device: auto
+  feature_batch_size: 64
+  threads: 4
+  interop_threads: 1
+  cpu_cores: 8
+  cpu_max_percent: 80
+  output: outputs
+  keep_intermediates: false
+  run_subdir: runs
+  timestamp_utc_offset_hours: 8
+  log_dir: logs
   log_file: smd.log
+  log_interval_seconds: 30
+  seeds:
+  - 41
+  - 42
+  - 43
+  - 44
+  - 45
+  task_cache_memory_mb: 256
+  detector_execution: block
+reports:
+  inventory: data_inventory.csv
+  eligible_manifest: eligible_manifest.csv
+  summary: summary
+  environment: environment.json
+  predictions: predictions

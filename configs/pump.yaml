@@ -1,10 +1,157 @@
-base: default.yaml
 data:
-  datasets: [PUMP]
+  root: dataset
+  manifest: null
+  multivariate_only: true
+  use_prepared_manifest: true
+  archive: TAB_dataset.zip
+  train_fraction: 0.6
+  selection_fraction: 0.5
+  datasets:
+  - PUMP
+  channel_types: null
 model:
-  window: 256
-  d_model: 96
+  window: 128
+  d_model: 64
+  heads: 4
+  layers: 2
+  dropout: 0.2
   marginal_prototypes: 128
   joint_prototypes: 256
+memory:
+  pool_size: 8192
+  prototype_chunk: 32
+  reference_block_length: 16
+  rare_fraction: 0.25
+stage1:
+  epochs: 30
+  batch_size: 128
+  lr: 0.0002
+  weight_decay: 0.001
+  patience: 4
+  stride: 1
+  max_train_points: 0
+  max_validation_points: 4096
+  lr_patience: 2
+  lr_factor: 0.5
+  min_lr: 2.0e-05
+teacher:
+  optimizer_update: task_batch
+  epochs: 20
+  patience: 5
+  lr: 0.0003
+  batch_sequences: 16
+  sequence_length: 256
+  train_sequences: 512
+  block_length: 128
+  weight_decay: 1.0e-05
+  lr_patience: 3
+  lr_factor: 0.5
+  min_lr: 2.0e-05
+stage2:
+  method: asei_net
+  optimizer_update: task_batch
+  variant: full
+  epochs: 40
+  patience: 5
+  batch_pairs: 16
+  lr: 0.0002
+  block_length: 256
+  train_pairs: 1024
+  validation_pairs: 128
+  families:
+  - level
+  - variance
+  - temporal
+  - relation
+  relation_generator: residual_var
+  relation_l1: 0.001
+  fixed_retention: 0.9
+  eta: 0.2
+  rho: 0.95
+  reference_trim: 0.1
+  reference_prior: 0.25
+  lambda_state: 0.1
+  lambda_tail: 0.1
+  tail_fraction: 0.01
+  tail_margin: 0.5
+  hard_negative_fraction: 0.5
+  discrete_max_values: 16
+  donor_candidates: 16
+  boundary_blend: 4
+  weight_decay: 0.0001
+  lr_patience: 2
+  lr_factor: 0.5
+  min_lr: 2.0e-05
+calibration:
+  method: parallel_normal
+  weights:
+  - 0.5
+  - 0.5
+  alphas:
+  - 0.001
+  - 0.005
+  - 0.01
+  alpha: 0.01
+evaluation:
+  skip_vus: false
+  recovery_confirmation: 8
+  regression_metrics: []
+  supplementary_label_metrics: []
+  latency_points: 0
+  label_metrics:
+  - accuracy
+  - precision
+  - recall
+  - f_score
+  - adjust_accuracy
+  - adjust_precision
+  - adjust_recall
+  - adjust_f_score
+  - rprecision
+  - rrecall
+  - rf
+  - precision_at_k
+  - affiliation_precision
+  - affiliation_recall
+  - affiliation_f
+  - add
+  score_metrics:
+  - auc_roc
+  - auc_pr
+  - R_AUC_ROC
+  - R_AUC_PR
+  - VUS_ROC
+  - VUS_PR
 runtime:
+  cuda_device_order: PCI_BUS_ID
+  cuda_visible_devices: '0'
+  device: auto
+  feature_batch_size: 256
+  threads: 4
+  interop_threads: 1
+  cpu_cores: 8
+  cpu_max_percent: 80
+  output: outputs
+  keep_intermediates: false
+  run_subdir: runs
+  timestamp_utc_offset_hours: 8
+  log_dir: logs
   log_file: pump.log
+  log_interval_seconds: 0
+  seeds:
+  - 41
+  - 42
+  - 43
+  - 44
+  - 45
+  task_cache_memory_mb: 256
+  detector_execution: block
+  preparation_batch_pairs: 8
+  batch_working_memory_mb: 2048
+  save_predictions: true
+reports:
+  inventory: data_inventory.csv
+  eligible_manifest: eligible_manifest.csv
+  summary: summary
+  environment: environment.json
+  predictions: predictions

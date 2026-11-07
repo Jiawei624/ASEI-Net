@@ -1,47 +1,41 @@
-"""Plain-text progress messages limited by elapsed time."""
+"""Timestamped epoch summaries; inner loops remain silent."""
 from __future__ import annotations
 
-import math
+from datetime import datetime, timedelta, timezone
 import time
 
-from .resources import cooperate
+
+def log(message, cfg=None):
+    offset = (cfg or {}).get("runtime", {}).get("timestamp_utc_offset_hours", 8)
+    stamp = datetime.now(timezone(timedelta(hours=float(offset)))).strftime("%Y-%m-%d %H:%M:%S%z")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def epoch_log(stage, number, total, train, validation, began, cfg, checkpoint, **details):
+    seconds = time.perf_counter() - began
+    elapsed = sum(entry.get("seconds", 0.) for entry in checkpoint.history)
+    best = min(checkpoint.history, key=lambda entry: entry.get("validation_loss", entry.get("selection", {}).get("loss", float("inf"))))
+    extra = " ".join(f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}" for key, value in details.items())
+    stop = checkpoint.stale >= cfg[stage]["patience"]
+    remaining = 0. if stop else elapsed / max(1, number) * (total - number)
+    log(f"{stage} epoch={number}/{total} progress={100 * number / total:.1f}% "
+        f"train={train:.6f} validation={validation:.6f} {extra} seconds={seconds:.1f} "
+        f"elapsed={elapsed:.1f}s eta={remaining:.1f}s "
+        f"best_epoch={best['epoch']} bad_epochs={checkpoint.stale} early_stop={stop}", cfg)
 
 
 class Progress:
-    """Timed block-level progress, with explicit phase transitions."""
+    """Compatibility counter for silent inner loops."""
     def __init__(self, description, total, interval_seconds=30):
-        self.description, self.total = description, total
-        self.interval = float(interval_seconds)
-        self.began = self.last = time.perf_counter()
-        print(f"{description} start total={total}", flush=True)
+        pass
 
     def update(self, completed, force=False):
-        now = time.perf_counter()
-        if force or completed == self.total or (self.interval and now - self.last >= self.interval):
-            elapsed = now - self.began
-            remaining = elapsed * (self.total - completed) / max(1, completed)
-            print(f"{self.description} progress={completed}/{self.total} "
-                  f"elapsed={elapsed:.1f}s remaining={remaining:.1f}s", flush=True)
-            self.last = now
+        pass
 
 
 def periodic_progress(iterable, description, interval_seconds=0):
-    """Yield items unchanged; callers report completion or an epoch summary."""
-    interval = float(interval_seconds)
-    if not math.isfinite(interval) or interval < 0:
-        raise ValueError("log_interval_seconds must be a finite nonnegative number.")
-    if interval == 0:
-        for item in iterable:
-            cooperate()
-            yield item
-        return
-    total = len(iterable)
-    began = last = time.perf_counter()
-    for completed, item in enumerate(iterable, 1):
+    """Preserve CPU cooperation without emitting batch or block messages."""
+    from .resources import cooperate
+    for item in iterable:
         cooperate()
         yield item
-        now = time.perf_counter()
-        if completed < total and now - last >= interval:
-            print(f"{description} progress={completed}/{total} ({100 * completed / total:.1f}%) "
-                  f"elapsed={now - began:.1f}s", flush=True)
-            last = now

@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--discrete-channels", type=int, default=0)
+    parser.add_argument("--prepare-tasks", type=int, default=0, help="Also compare separate and batched independent task preparation")
     device_args = parser.add_mutually_exclusive_group()
     device_args.add_argument("--gpu", type=int)
     device_args.add_argument("--device")
@@ -42,7 +43,7 @@ def main():
     device = get_device(cfg["runtime"]["device"])
     pairs = args.pairs if args.pairs is not None else cfg["stage2"]["batch_pairs"]
     length = args.length if args.length is not None else cfg["stage2"]["block_length"]
-    if min(args.channels, pairs, length, args.steps) < 1 or args.warmup < 0 or not 0 <= args.discrete_channels <= args.channels:
+    if min(args.channels, pairs, length, args.steps) < 1 or args.warmup < 0 or args.prepare_tasks < 0 or not 0 <= args.discrete_channels <= args.channels:
         raise ValueError("Invalid benchmark dimensions, steps or discrete-channel count.")
     window = cfg["model"]["window"]
     window = 128 if window == "auto" else window
@@ -104,6 +105,29 @@ def main():
                    length=length, max_score_difference=differences,
                    cached_speedup=results["step"]["seconds_per_batch"] / results["cached"]["seconds_per_batch"],
                    scope="Synthetic forward/backward. Step/block include frozen retrieval; cached reuses exact routing. Excludes forecasting and disk I/O.")
+    if args.prepare_tasks:
+        tasks = []
+        for i in range(args.prepare_tasks):
+            task = values.copy()
+            if args.discrete_channels < args.channels:
+                task[80:120, -1] += .1 * i
+            tasks.append(Record(task, record.mask.copy()))
+        synchronize()
+        began = time.perf_counter()
+        separate = [model.routing(task, cfg["stage2"]["block_length"]) for task in tasks]
+        synchronize()
+        separate_seconds = time.perf_counter() - began
+        began = time.perf_counter()
+        together = model.routing_many(tasks, cfg["stage2"]["block_length"])
+        synchronize()
+        together_seconds = time.perf_counter() - began
+        for first, second in zip(separate, together):
+            for key in first:
+                np.testing.assert_allclose(first[key], second[key], atol=3e-4, rtol=3e-4)
+        results["task_preparation"] = dict(tasks=len(tasks), separate_seconds=separate_seconds,
+            batched_seconds=together_seconds, speedup=separate_seconds / together_seconds,
+            scope="Frozen routing only; excludes task synthesis, forecasting and disk writes.")
+        print(f"task_preparation separate={separate_seconds:.6f}s batched={together_seconds:.6f}s", flush=True)
     target = project_path(args.output) if args.output else Path(cfg["runtime"]["output"]) / "benchmarks" / "stage2.json"
     write_json(target, results)
     print("Benchmark report:", target)

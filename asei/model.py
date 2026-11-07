@@ -47,11 +47,12 @@ class DualTrajectoryDetector(nn.Module):
     def _reference_replay(self, f, state, training=False):
         """Only the previous normal state and available peers can select a reference."""
         teacher, memory = self.normal.teacher, self.normal.memory
+        tables = teacher.prototype_inputs(memory)
         if not training and "reference_index" in f:
             reference, pair, available, external = memory.lookup_reference(f["reference_index"])
-            adapted = teacher.adapt(reference, pair)
+            adapted, projected = teacher.reference_input(f["reference_index"], tables)
             valid = f["sv"] & available
-            states, state = normal_scan(teacher.cell.input(adapted), state, valid,
+            states, state = normal_scan(projected, state, valid,
                 teacher.cell.hidden.weight, teacher.cell.hidden.bias, teacher.cell.eta)
             return dict(reference=reference, pair=pair, available=available, external=external,
                         reference_index=f["reference_index"], adapted=adapted, states=states), state
@@ -71,9 +72,9 @@ class DualTrajectoryDetector(nn.Module):
                         self.settings.get("reference_trim", .1), self.settings.get("reference_prior", .25),
                         external=training or self.variant != "no_external",
                         prepared={k: v[:, t - begin] for k, v in prepared.items()}, return_index=True)
-                adapted = teacher.adapt(reference, pair)
+                adapted, projected = teacher.reference_input(index, tables)
                 valid = step["sv"] & available
-                state = teacher.cell(adapted.reshape(-1, 32), state.reshape(-1, 32)).reshape_as(state)
+                state = teacher.cell.forward_projected(projected.reshape(-1, 32), state.reshape(-1, 32)).reshape_as(state)
                 state = state.masked_fill(~valid[..., None], 0)
                 values = (reference, pair, available, external, index, adapted, state)
                 for name, value in zip(collected, values):
@@ -123,9 +124,9 @@ class DualTrajectoryDetector(nn.Module):
             reference_index=references["reference_index"], m_index=long["m_index"],
             j_index=long["j_index"], short_marginal=marginal)
 
-    def forward_block(self, f, state=None, return_aux=False):
+    def forward_block(self, f, state=None, return_aux=False, prepared=None):
         state = self.initial_state(f["v"].shape[0]) if state is None else state
-        prepared = self.frozen_block(f, state.normal)
+        prepared = self.frozen_block(f, state.normal) if prepared is None else prepared
         b = self.evidence(prepared["feature"])
         normals, valid = prepared["normal"], prepared["reference_valid"]
         if self.variant in {"mlp", "energy_only"}:
@@ -173,16 +174,26 @@ class DualTrajectoryDetector(nn.Module):
     @torch.no_grad()
     def routing(self, record, block_length=128, progress=None):
         """Compact normal-only retrieval identity; no trainable outputs are cached."""
+        return self.routing_many([record], block_length, progress)[0]
+
+    @torch.no_grad()
+    def routing_many(self, records, block_length=128, progress=None):
+        """Replay independent tasks together, preserving each task's own state boundary."""
         import numpy as np
-        result, state = {}, None
-        for start in range(0, len(record.z), block_length):
+        results, state = [{} for _ in records], None
+        maximum = max(len(record.z) for record in records)
+        for start in range(0, maximum, block_length):
             cooperate()
-            f = self.normal.schema.block([record], [start], min(block_length, len(record.z) - start))
+            f = self.normal.schema.block(records, [start] * len(records), min(block_length, maximum - start))
             values = self.frozen_block(f, state)
             state = values["final_normal"]
             for name in ("reference_index", "m_index", "j_index", "short_marginal"):
                 dtype = np.float32 if name == "short_marginal" else np.int32
-                result.setdefault(name, []).append(values[name][0].cpu().numpy().astype(dtype))
+                array = values[name].cpu().numpy().astype(dtype)
+                for i, record in enumerate(records):
+                    count = min(block_length, len(record.z) - start)
+                    if count > 0:
+                        results[i].setdefault(name, []).append(array[i, :count].copy())
             if progress is not None:
-                progress(min(start + block_length, len(record.z)))
-        return {k: np.concatenate(v) for k, v in result.items()}
+                progress(min(start + block_length, maximum))
+        return [{k: np.concatenate(v) for k, v in result.items()} for result in results]

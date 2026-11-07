@@ -46,7 +46,7 @@ def defaults(cfg):
     cfg["evaluation"]["score_metrics"] = [name for name in SCORE_METRIC_ORDER
         if not (cfg["evaluation"]["skip_vus"] and name.startswith("VUS_"))]
     if cfg["stage2"]["method"] != METHOD:
-        raise ValueError("Unsupported model configuration; use configs/default.yaml.")
+        raise ValueError("Unsupported model configuration; use a dataset configuration under configs/.")
     return cfg
 
 
@@ -97,6 +97,20 @@ def resolve(cfg, n_train, channels):
     for section in ("stage1", "teacher", "stage2"):
         if not math.isfinite(cfg[section]["lr"]) or cfg[section]["lr"] <= 0:
             raise ValueError(section + ".lr must be finite and positive.")
+        options = cfg[section]
+        decay = options.get("weight_decay", 0.)
+        patience = options.get("lr_patience", 0)
+        if not math.isfinite(decay) or decay < 0 or isinstance(patience, bool) or not isinstance(patience, int) or patience < 0:
+            raise ValueError("Invalid weight decay or learning-rate patience in " + section)
+        if patience and (not 0 < options.get("lr_factor", .5) < 1 or not 0 < options.get("min_lr", 1e-5) <= options["lr"]):
+            raise ValueError("Invalid learning-rate scheduler settings in " + section)
+    runtime = cfg["runtime"]
+    for key, default in (("preparation_batch_pairs", 8), ("batch_working_memory_mb", 2048)):
+        value = runtime.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < (1 if key == "preparation_batch_pairs" else 0):
+            raise ValueError("Invalid runtime." + key)
+    if not isinstance(runtime.get("save_predictions", False), bool):
+        raise ValueError("runtime.save_predictions must be boolean.")
     for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1"):
         if not math.isfinite(s[key]) or s[key] < 0:
             raise ValueError("stage2." + key + " must be finite and nonnegative.")

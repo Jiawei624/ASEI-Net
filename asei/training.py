@@ -13,9 +13,10 @@ from .compat import load_torch_checkpoint
 from .config import fingerprint, write_json
 from .tasks import NormalTaskPolicy, generate_reference_pair
 from .resources import cooperate
-from .progress import Progress
+from .progress import Progress, log, epoch_log
 from .features import forecast_errors
 from .cache import PairCache
+from .batching import BatchFeatures
 from .tasks import normal_difficulty, typed_donor_matcher
 
 
@@ -49,12 +50,21 @@ def _save(path, value):
     temporary.replace(path)
 
 
+def learning_rate_schedule(optimizer, settings):
+    if not settings.get("lr_patience", 0):
+        return None
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min",
+        factor=settings.get("lr_factor", .5), patience=settings["lr_patience"],
+        min_lr=settings.get("min_lr", 1e-5))
+
+
 class StageCheckpoint:
     """Best weights plus resumable last-epoch state; an early best is not completion."""
-    def __init__(self, path, module, optimizer, key, rng=None):
+    def __init__(self, path, module, optimizer, key, rng=None, scheduler=None):
         self.path, self.module, self.optimizer = Path(path), module, optimizer
         self.last = self.path.with_name(self.path.stem + "_last.pt")
         self.key, self.rng = key, rng
+        self.scheduler = scheduler
         self.history, self.best, self.stale, self.complete = [], float("inf"), 0, False
         source = self.last if self.last.exists() else self.path
         if source.exists():
@@ -67,12 +77,14 @@ class StageCheckpoint:
             self.complete = saved.get("complete", False)
             if not self.complete:
                 optimizer.load_state_dict(saved["optimizer"])
+                if scheduler is not None and "lr_scheduler" in saved:
+                    scheduler.load_state_dict(saved["lr_scheduler"])
                 torch.set_rng_state(saved["torch_rng"].cpu())
                 if torch.cuda.is_available() and "cuda_rng" in saved:
                     torch.cuda.set_rng_state_all([v.cpu() for v in saved["cuda_rng"]])
                 if rng is not None:
                     rng.bit_generator.state = saved["numpy_rng"]
-                print(f"resume {self.path.stem} epoch={len(self.history) + 1}", flush=True)
+                log(f"resume {self.path.stem} epoch={len(self.history) + 1}")
 
     def record(self, entry, validation):
         self.history.append(entry)
@@ -83,6 +95,8 @@ class StageCheckpoint:
                      torch_rng=torch.get_rng_state())
         if self.rng is not None:
             saved["numpy_rng"] = self.rng.bit_generator.state
+        if self.scheduler is not None:
+            saved["lr_scheduler"] = self.scheduler.state_dict()
         if torch.cuda.is_available():
             saved["cuda_rng"] = torch.cuda.get_rng_state_all()
         if improved:
@@ -94,7 +108,7 @@ class StageCheckpoint:
         self.module.load_state_dict(saved["model"])
         saved.update(complete=True, history=self.history)
         # Optimizer and random state are only needed while training is incomplete.
-        for name in ("optimizer", "torch_rng", "cuda_rng", "numpy_rng"):
+        for name in ("optimizer", "torch_rng", "cuda_rng", "numpy_rng", "lr_scheduler"):
             saved.pop(name, None)
         _save(self.path, saved)
         self.last.unlink(missing_ok=True)
@@ -113,7 +127,8 @@ def fit_forecaster(normal, fit, selection, cfg, directory, key, seed):
     limit = int(settings.get("max_train_points", 0))
     selection_limit = int(settings.get("max_validation_points", 4096))
     rng = np.random.default_rng(seed)
-    checkpoint = StageCheckpoint(path, normal, optimizer, key, rng)
+    scheduler = learning_rate_schedule(optimizer, settings)
+    checkpoint = StageCheckpoint(path, normal, optimizer, key, rng, scheduler)
     interval = cfg["runtime"].get("log_interval_seconds", 30)
     def epoch(record, training):
         predictor.train(training)
@@ -166,20 +181,23 @@ def fit_forecaster(normal, fit, selection, cfg, directory, key, seed):
         if checkpoint.stale >= settings["patience"]:
             break
         began = time.perf_counter()
+        rate = optimizer.param_groups[0]["lr"]
         training_loss, validation_loss = epoch(fit, True), epoch(selection, False)
-        checkpoint.record(dict(epoch=number + 1, train_loss=training_loss, validation_loss=validation_loss), validation_loss)
-        print(f"stage1 epoch={number + 1} train={training_loss:.6f} validation={validation_loss:.6f} "
-              f"seconds={time.perf_counter() - began:.1f}", flush=True)
+        if scheduler is not None:
+            scheduler.step(validation_loss)
+        checkpoint.record(dict(epoch=number + 1, train_loss=training_loss, validation_loss=validation_loss,
+                               seconds=time.perf_counter() - began), validation_loss)
+        epoch_log("stage1", number + 1, settings["epochs"], training_loss, validation_loss, began, cfg, checkpoint,
+                  lr=rate)
     history = checkpoint.history if checkpoint.complete else checkpoint.finish()
     normal.freeze()
     # Dictionaries contain real fitting windows and are fixed before teacher learning.
     saved = load_torch_checkpoint(path, map_location=normal.schema.amp_mean.device)
     if not saved.get("memory_complete", False):
-        print("memory construction start", flush=True)
         normal.memory.fit(fit, seed, cfg["memory"]["pool_size"], cfg["memory"]["rare_fraction"], interval)
         saved.update(model=normal.state_dict(), memory_complete=True)
         _save(path, saved)
-        print("memory construction complete", flush=True)
+        log("memory construction complete", cfg)
     return history
 
 
@@ -199,8 +217,9 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
     for p in teacher.parameters():
         p.requires_grad_(True)
     settings, w = cfg["teacher"], normal.predictor.window
-    optimizer = torch.optim.Adam(teacher.parameters(), lr=settings["lr"])
-    checkpoint = StageCheckpoint(path, normal, optimizer, key)
+    optimizer = torch.optim.Adam(teacher.parameters(), lr=settings["lr"], weight_decay=settings.get("weight_decay", 0.))
+    scheduler = learning_rate_schedule(optimizer, settings)
+    checkpoint = StageCheckpoint(path, normal, optimizer, key, scheduler=scheduler)
     if checkpoint.complete:
         normal.freeze()
         return checkpoint.history
@@ -216,6 +235,15 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
         for first in range(0, len(sequences), settings["batch_sequences"]):
             batch = sequences[first:first + settings["batch_sequences"]]
             starts, lengths = zip(*batch)
+            features = BatchFeatures(model, [record] * len(batch), None, None, max(lengths) + 1, cfg, starts=starts)
+            def current_and_next(offset, length):
+                full = features.block(offset, length + 1)
+                f = {key: value[:, :-1] for key, value in full.items()}
+                following = {key: value[:, 1:] for key, value in full.items()}
+                if offset == 0:
+                    f["sv"][:, 0] = False
+                f["target"] &= (torch.arange(offset, offset + length, device=f["v"].device)[None, :, None] >= w)
+                return f, following
             direct, closed = None, None
             if training:
                 optimizer.zero_grad(set_to_none=True)
@@ -224,21 +252,13 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
             denominator = torch.zeros(len(batch), normal.schema.channels, device=normal.schema.amp_mean.device)
             for offset in range(0, max(lengths), block_size):
                 length = min(block_size, max(lengths) - offset)
-                f = normal.schema.block([record] * len(batch), [s + offset for s in starts], length)
-                following = normal.schema.block([record] * len(batch), [s + offset + 1 for s in starts], length)
-                if offset == 0:
-                    f["sv"][:, 0] = False  # Same zero-state boundary as a standalone paired task.
-                f["target"] &= (torch.arange(offset, offset + length, device=f["v"].device)[None, :, None] >= w)
+                f, following = current_and_next(offset, length)
                 good = f["sv"] & f["lv"] & following["lv"] & f["target"]
                 denominator += good.sum(1)
             for offset in range(0, max(lengths), block_size):
                 cooperate()
                 length = min(block_size, max(lengths) - offset)
-                f = normal.schema.block([record] * len(batch), [s + offset for s in starts], length)
-                following = normal.schema.block([record] * len(batch), [s + offset + 1 for s in starts], length)
-                if offset == 0:
-                    f["sv"][:, 0] = False
-                f["target"] &= (torch.arange(offset, offset + length, device=f["v"].device)[None, :, None] >= w)
+                f, following = current_and_next(offset, length)
                 valid = f["sv"] & f["lv"] & following["lv"] & f["target"]
                 with torch.set_grad_enabled(training):
                     hidden, direct = model.teacher_block(f, direct, False)
@@ -274,8 +294,9 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
         for start in range(0, len(selection.z) - 1, block_size):
             cooperate()
             length = min(block_size, len(selection.z) - start - 1)
-            f = normal.schema.block([selection], [start], length)
-            following = normal.schema.block([selection], [start + 1], length)
+            full = normal.schema.block([selection], [start], length + 1)
+            f = {key: value[:, :-1] for key, value in full.items()}
+            following = {key: value[:, 1:] for key, value in full.items()}
             hidden, direct = model.teacher_block(f, direct)
             reference, closed = model.teacher_block(f, closed, True)
             now, future = teacher.losses(hidden, f, following)
@@ -294,11 +315,15 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
         if checkpoint.stale >= settings["patience"]:
             break
         began = time.perf_counter()
+        rate = optimizer.param_groups[0]["lr"]
         sequences = _sequence_starts(fit, w, settings["sequence_length"], settings["train_sequences"], seed + 7200 + number)
         training_loss, validation_loss = epoch(fit, sequences, True), validate()
-        checkpoint.record(dict(epoch=number + 1, train_loss=training_loss, validation_loss=validation_loss), validation_loss)
-        print(f"teacher epoch={number + 1} train={training_loss:.6f} validation={validation_loss:.6f} "
-              f"seconds={time.perf_counter() - began:.1f}", flush=True)
+        if scheduler is not None:
+            scheduler.step(validation_loss)
+        checkpoint.record(dict(epoch=number + 1, train_loss=training_loss, validation_loss=validation_loss,
+                               seconds=time.perf_counter() - began), validation_loss)
+        epoch_log("teacher", number + 1, settings["epochs"], training_loss, validation_loss, began, cfg, checkpoint,
+                  lr=rate)
     history = checkpoint.finish()
     normal.freeze()
     return history
@@ -337,8 +362,9 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
     cache = PairCache(Path(directory) / "tasks" / key / split, key, normal.schema.channels,
                          cfg["runtime"].get("task_cache_memory_mb", 256))
     if len(cache) >= count:
-        print(f"cache {split} complete pairs={count} reused=True", flush=True)
+        log(f"cache {split} complete pairs={count} reused=True", cfg)
         return cache
+    began = time.perf_counter()
     progress = Progress(f"cache {split} pairs", count, cfg["runtime"].get("log_interval_seconds", 30))
     policy = NormalTaskPolicy(source, settings["discrete_max_values"], cfg["data"].get("channel_types"), names)
     policy.supports = [None if s is None else np.asarray(s, np.float32) for s in normal.metadata["supports"]]
@@ -367,30 +393,34 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
         write_json(marker, dict(key=key, shape=shape))
     source_error, source_ready = np.load(error_path, mmap_mode="r"), np.load(ready_path, mmap_mode="r")
     try:
-        for index in range(len(cache), count):
-            pair = generate_reference_pair(source, donor, normal.predictor.window, index, seed,
-                settings["families"], policy, hard, settings["hard_negative_fraction"],
-                settings["donor_candidates"], settings["boundary_blend"], relation_matcher=matcher)
-            if relation_tasks is not None:
-                pair = relation_tasks.apply(pair, seed)
-            begin, end = pair.recipe["source_start"], pair.recipe["source_stop"]
-            clean_error, clean_ready = source_error[begin:end].copy(), source_ready[begin:end].copy()
-            clean_error[:normal.predictor.window] = 0
-            clean_ready[:normal.predictor.window] = False
-            corrupt_error, corrupt_ready, reused = forecast_errors(pair.corrupt, normal, cfg["runtime"]["feature_batch_size"],
-                pair.clean, clean_error, clean_ready, log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 30),
-                progress_label=f"cache {split} pair={index + 1} forecast")
-            pair.recipe["forecast_rows_reused"] = reused
-            pair.recipe["generator"] = settings["relation_generator"]
-            heartbeat = lambda _: progress.update(index)
-            pair.clean.routing = model.routing(pair.clean, settings["block_length"], heartbeat)
-            pair.corrupt.routing = model.routing(pair.corrupt, settings["block_length"], heartbeat)
-            cache.append(pair, (clean_error, corrupt_error), (clean_ready, corrupt_ready))
-            progress.update(index + 1, force=index == 0)
+        group_size = max(1, int(cfg["runtime"].get("preparation_batch_pairs", 8)))
+        for first in range(len(cache), count, group_size):
+            pending = []
+            for index in range(first, min(first + group_size, count)):
+                pair = generate_reference_pair(source, donor, normal.predictor.window, index, seed,
+                    settings["families"], policy, hard, settings["hard_negative_fraction"],
+                    settings["donor_candidates"], settings["boundary_blend"], relation_matcher=matcher)
+                if relation_tasks is not None:
+                    pair = relation_tasks.apply(pair, seed)
+                begin, end = pair.recipe["source_start"], pair.recipe["source_stop"]
+                clean_error, clean_ready = source_error[begin:end].copy(), source_ready[begin:end].copy()
+                clean_error[:normal.predictor.window] = 0
+                clean_ready[:normal.predictor.window] = False
+                corrupt_error, corrupt_ready, reused = forecast_errors(pair.corrupt, normal,
+                    cfg["runtime"]["feature_batch_size"], pair.clean, clean_error, clean_ready)
+                pair.recipe["forecast_rows_reused"] = reused
+                pair.recipe["generator"] = settings["relation_generator"]
+                pending.append((pair, (clean_error, corrupt_error), (clean_ready, corrupt_ready)))
+            records = [p[0].clean for p in pending] + [p[0].corrupt for p in pending]
+            routes = model.routing_many(records, settings["block_length"])
+            for record, routing in zip(records, routes):
+                record.routing = routing
+            for pair, error, valid in pending:
+                cache.append(pair, error, valid)
     finally:
         source_error._mmap.close()
         source_ready._mmap.close()
-    print(f"cache {split} complete pairs={count} storage=packed", flush=True)
+    log(f"cache {split} complete pairs={count} storage=packed seconds={time.perf_counter() - began:.1f}", cfg)
     return cache
 
 
