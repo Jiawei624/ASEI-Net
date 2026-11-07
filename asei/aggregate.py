@@ -46,6 +46,9 @@ def collect(root, seeds=None):
             prefix = "event." if name in EVENT_METRIC_ORDER else "label." if name in LABEL_METRIC_ORDER else "score."
             value = data.get(name)
             row[prefix + name] = float(value) if value not in (None, "") else float("nan")
+        for name in ("normal_fpr", "scorable_normal_fpr", "scorable_fraction", "short_calibration_points", "dynamic_calibration_points"):
+            value = data.get(name)
+            row["operating." + name] = float(value) if value not in (None, "") else float("nan")
         row["path"] = data.get("_source", "")
         rows.append(row)
     if not rows:
@@ -78,7 +81,7 @@ def aggregate(root, output, seeds=None):
     return output
 
 
-def paired_comparison(root, baseline_root, metric, variant, baseline_variant, samples=10000, seed=0, seeds=None, anomaly_ratio=None):
+def paired_comparison(root, baseline_root, metric, variant, baseline_variant, samples=10000, seed=0, seeds=None, anomaly_ratio=None, alpha=None):
     left, right = collect(root, seeds), collect(baseline_root, seeds)
     left, right = left[left.variant == variant], right[right.variant == baseline_variant]
     label = metric.startswith(("label.", "event."))
@@ -87,12 +90,14 @@ def paired_comparison(root, baseline_root, metric, variant, baseline_variant, sa
             frame = frame[frame.metrics_type.isin(["label", "both"] if label else ["score", "both"])]
         if label and anomaly_ratio is not None and "anomaly_ratio" in frame:
             frame = frame[np.isclose(frame.anomaly_ratio, anomaly_ratio)]
+        if label and alpha is not None and "alpha" in frame:
+            frame = frame[np.isclose(frame.alpha, alpha)]
         return frame
     left, right = select(left), select(right)
     if metric not in left or metric not in right:
         raise ValueError(f"Metric is absent: {metric}")
     if left.duplicated(["dataset", "entity", "seed"]).any() or right.duplicated(["dataset", "entity", "seed"]).any():
-        raise ValueError("Choose one anomaly ratio (--anomaly-ratio), method and metrics protocol per entity/seed on each side.")
+        raise ValueError("Choose one anomaly ratio (--anomaly-ratio) or normal alpha (--alpha), method and metrics protocol per entity/seed on each side.")
     joined = left.merge(right, on=["dataset", "entity", "seed"], suffixes=("_method", "_baseline"))
     if (joined.metrics_protocol_method != joined.metrics_protocol_baseline).any():
         raise ValueError("Paired comparisons require the same metrics protocol on both sides.")

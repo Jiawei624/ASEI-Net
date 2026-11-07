@@ -277,7 +277,8 @@ def observable_channel_mask(clean, corrupt, labels, events, tolerance=1e-6):
 
 
 def generate_reference_pair(source, donor, window, index, seed, families, policy,
-                            hard_anchors=None, hard_fraction=.25, donor_candidates=16, boundary_blend=4):
+                            hard_anchors=None, hard_fraction=.25, donor_candidates=16, boundary_blend=4,
+                            relation_matcher=None):
     rng = np.random.default_rng(np.random.SeedSequence([seed, index, 919]))
     family_count = len([f for f in families if source.z.shape[1] > 1 or f != "relation"])
     if not family_count:
@@ -299,6 +300,11 @@ def generate_reference_pair(source, donor, window, index, seed, families, policy
                 continue
             values = donor.z[left:left + length, channels].astype(np.float64)
             if not np.any(np.abs(values - reference) > 1e-6):
+                continue
+            if relation_matcher is not None:
+                cost = relation_matcher(clean, masks, start, stop, channels, donor, left)
+                if cost < best:
+                    best, selected, donor_start = float(cost), values.astype(clean.dtype), left
                 continue
             mean, std = values.mean(0), values.std(0)
             cost = np.square(mean - ref_mean).mean() + np.square(std - ref_std).mean()

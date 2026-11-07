@@ -14,6 +14,8 @@ from .metrics import (LABEL_METRIC_ORDER, SCORE_METRIC_ORDER, EVENT_METRIC_ORDER
 METRIC_COLUMNS = LABEL_METRIC_ORDER + SCORE_METRIC_ORDER
 CSV_COLUMNS = ("run_id", "run_created_ns", "dataset", "entity", "seed", "variant", "method", "metrics_protocol",
                "metrics_type", "test_points", "threshold_method", "anomaly_ratio", "alpha", "threshold") + METRIC_COLUMNS + EVENT_METRIC_ORDER + (
+               "normal_fpr", "scorable_normal_fpr", "scorable_fraction",
+               "short_calibration_points", "dynamic_calibration_points", "short_tail_supported", "dynamic_tail_supported",
                "missing_metrics", "undefined_metrics", "model_file")
 
 
@@ -27,6 +29,9 @@ def result_row(record):
     row["threshold_method"] = calibration.get("method", "normal_validation")
     row.update({key: calibration.get(key, "") for key in ("anomaly_ratio", "alpha", "threshold")})
     row["model_file"] = record.get("model_file", "")
+    for key in ("normal_fpr", "scorable_normal_fpr", "scorable_fraction", "short_calibration_points",
+                "dynamic_calibration_points", "short_tail_supported", "dynamic_tail_supported"):
+        row[key] = record.get(key, "")
     missing, undefined = [], []
     for name in METRIC_COLUMNS:
         relevant = (row["metrics_type"] == "both" or
@@ -55,6 +60,20 @@ def result_row(record):
 
 
 def result_rows(record):
+    if "label_by_alpha" in record["metrics"]:
+        rows = []
+        for entry in record["metrics"]["label_by_alpha"]:
+            details = {key: entry.get(key) for key in ("normal_fpr", "scorable_normal_fpr", "scorable_fraction")}
+            for branch in ("short", "dynamic"):
+                resolution = entry.get("resolution", {}).get(branch, {})
+                details[branch + "_calibration_points"] = resolution.get("samples", "")
+                details[branch + "_tail_supported"] = resolution.get("supported", "")
+            rows.append(result_row(dict(record, **details, metrics_type="label",
+                metrics={"label": entry["metrics"], "event": entry.get("event", {})},
+                calibration={"method": "parallel_normal", "alpha": entry["alpha"], "threshold": entry["threshold"]})))
+        rows.append(result_row(dict(record, metrics_type="score", metrics={"score": record["metrics"]["score"]},
+                                    calibration={"method": "parallel_normal"})))
+        return rows
     if "label_by_ratio" not in record["metrics"]:
         return [result_row(record)]
     common = dict(record, metrics_protocol=record.get("metrics_protocol", TAB_METRICS_PROTOCOL))
@@ -77,7 +96,9 @@ def _model_identity(row):
 def _identity(row):
     ratio = row.get("anomaly_ratio")
     ratio = float(ratio) if ratio not in (None, "") else ""
-    return _model_identity(row) + (row.get("metrics_protocol", ""), row.get("metrics_type") or "both", ratio)
+    alpha = row.get("alpha")
+    alpha = float(alpha) if alpha not in (None, "") else ""
+    return _model_identity(row) + (row.get("metrics_protocol", ""), row.get("metrics_type") or "both", ratio, alpha)
 
 
 def _write_rows(path, rows):
@@ -127,6 +148,19 @@ def _refresh_labels(record, path):
     if not predictions.is_file():
         raise FileNotFoundError("Recomputing label metrics needs the original predictions.npz beside " + str(path))
     with np.load(predictions, allow_pickle=False) as values:
+        if "label_by_alpha" in record["metrics"]:
+            from .metrics import _evaluation_scores, label_metrics, event_metrics
+            record = copy.deepcopy(record)
+            _, _, valid, full_scores = _evaluation_scores(values["labels"], values["scores"], values["valid"])
+            for i, entry in enumerate(record["metrics"]["label_by_alpha"]):
+                alarms = valid & (values["p_mix"] <= entry["alpha"])
+                if "alarms_by_alpha" in values and not np.array_equal(alarms, values["alarms_by_alpha"][i]):
+                    raise ValueError("Saved alpha alarms differ from tail ranks: " + str(predictions))
+                warnings = {}
+                entry["metrics"] = label_metrics(values["labels"], alarms, list(LABEL_METRIC_ORDER), warnings, full_scores)
+                entry["event"] = event_metrics(values["labels"], alarms, valid, record["config"]["evaluation"]["recovery_confirmation"])
+                entry["undefined_or_warnings"] = warnings
+            return record
         if "label_by_ratio" in record["metrics"]:
             record = copy.deepcopy(record)
             for i, entry in enumerate(record["metrics"]["label_by_ratio"]):

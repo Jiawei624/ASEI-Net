@@ -13,7 +13,7 @@ import yaml
 from .resources import validate_cpu_config
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = ROOT / "configs" / "default.yaml"
+DEFAULT_CONFIG = ROOT / "configs" / "in1_2_4.yaml"
 TAB_ANOMALY_RATIOS = (0.1, 0.5, 1., 2., 3., 5., 10., 15., 20., 25.)
 REPORT_DEFAULTS = {"inventory": "data_inventory.csv", "eligible_manifest": "eligible_manifest.csv",
                    "summary": "summary", "environment": "environment.json", "predictions": "predictions"}
@@ -26,6 +26,9 @@ def project_path(value: str | Path) -> Path:
 
 def resolve_paths(cfg: dict) -> dict:
     """Fixed paths are relative to the project, never to the launch directory."""
+    if cfg.get("stage2", {}).get("method") == "in_1_2_4":
+        from .v124.config import defaults
+        defaults(cfg)
     cfg["data"]["root"] = str(project_path(cfg["data"]["root"]))
     if cfg["data"].get("manifest"):
         cfg["data"]["manifest"] = str(project_path(cfg["data"]["manifest"]))
@@ -68,6 +71,9 @@ def resolve_paths(cfg: dict) -> dict:
         calibration.setdefault("prediction_ratio", default_ratio)
     elif calibration["method"] == "normal_validation":
         calibration.setdefault("alpha", .01)
+    elif calibration["method"] == "parallel_normal":
+        if cfg.get("stage2", {}).get("method") != "in_1_2_4":
+            raise ValueError("parallel_normal requires in_1_2_4.")
     else:
         raise ValueError("calibration.method must be tab_anomaly_ratio or normal_validation.")
     if cfg.get("stage2", {}).get("method") == "in_1_2_3":
@@ -132,6 +138,9 @@ def load_config(path: str | Path) -> dict:
 
 def resolve_config(cfg: dict, n_train: int, channels: int) -> dict:
     cfg = resolve_paths(copy.deepcopy(cfg))
+    if cfg.get("stage2", {}).get("method") == "in_1_2_4":
+        from .v124.config import resolve
+        return resolve(cfg, n_train, channels)
     if not isinstance(cfg["data"].get("separate_calibration", False), bool):
         raise ValueError("data.separate_calibration must be boolean.")
     if "selection_fraction" in cfg["data"] and not 0 < cfg["data"]["selection_fraction"] < 1:

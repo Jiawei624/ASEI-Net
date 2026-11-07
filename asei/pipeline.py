@@ -115,9 +115,17 @@ def save_bundle(path, representation, detector, scaler, calibration, cfg, proven
     temporary.replace(path)
 
 
-def load_bundle(path, device="cpu", anomaly_ratio=None):
+def load_bundle(path, device="cpu", anomaly_ratio=None, alpha=None):
     device = get_device(device)
     checkpoint = load_torch_checkpoint(path, map_location=device)
+    from .v124 import FORMAT
+    if checkpoint.get("format") == FORMAT:
+        if anomaly_ratio is not None:
+            raise ValueError("in_1_2_4 deployment uses --alpha; TAB ratios are offline evaluations.")
+        from .v124.pipeline import load_bundle124
+        return load_bundle124(checkpoint, device, alpha)
+    if alpha is not None:
+        raise ValueError("--alpha overrides require an in_1_2_4 bundle.")
     if checkpoint.get("format") != 1:
         raise ValueError("Unsupported deployment bundle format.")
     model = NormalRepresentation(checkpoint["model_config"]).to(device)
@@ -351,6 +359,9 @@ def _evaluate_and_save(entity, train, valid, raw_test, labels, scaler, provenanc
 
 
 def run_entity(entity: Entity, config: dict, seed: int, stage="all", diagnostics=False):
+    if config.get("stage2", {}).get("method") == "in_1_2_4":
+        from .v124.pipeline import run_entity124
+        return run_entity124(entity, config, seed, stage, diagnostics)
     config = resolve_paths(copy.deepcopy(config))
     if diagnostics:
         config["runtime"]["keep_intermediates"] = True

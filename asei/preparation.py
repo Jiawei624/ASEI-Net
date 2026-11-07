@@ -30,7 +30,7 @@ def inspect_entities(entities, cfg, read_data=False):
                     raise ValueError("Multivariate experiments require at least two observed training channels.")
                 row.update(status="eligible", fit=len(train.z), validation=len(val.z), test=len(test.z),
                            channels=train.z.shape[1], source_sha256=provenance["source_sha256"])
-                if cfg["stage2"].get("method") == "in_1_2_3":
+                if cfg["stage2"].get("method") in {"in_1_2_3", "in_1_2_4"}:
                     selection = (len(val.z) if cfg["calibration"].get("method") == "tab_anomaly_ratio" else
                                  int(len(val.z) * cfg["data"].get("selection_fraction", .5)))
                     row.update(selection=selection, calibration=len(val.z) - selection)

@@ -29,11 +29,11 @@ def main():
             device.add_argument("--device", help="Override logical runtime.device; use cpu for CPU execution")
             p.add_argument("--stage", choices=["all", "representation", "teacher", "cache", "detector", "calibrate", "evaluate"], default="all")
             p.add_argument("--variant", choices=["full", "mlp", "single_gru", "no_alignment", "zero_alignment", "fixed_gate", "independent_gru",
-                                                "no_teacher", "no_separation", "no_tail", "no_energy"])
+                                                "no_teacher", "no_separation", "no_tail", "no_energy", "no_state", "no_external", "energy_only"])
             p.add_argument("--sources", nargs="*", choices=["relation", "marginal", "joint"])
             p.add_argument("--skip-vus", action="store_true")
             p.add_argument("--anomaly-ratios", nargs="+", type=float, help="Preset anomaly percentages for TAB label evaluation")
-            p.add_argument("--threshold-method", choices=["tab_anomaly_ratio", "normal_validation"])
+            p.add_argument("--threshold-method", choices=["tab_anomaly_ratio", "normal_validation", "parallel_normal"])
             p.add_argument("--keep-intermediates", action="store_true", help="Keep task caches, predictions and diagnostic files after success")
             p.add_argument("--all-label-metrics", "--all-tab-label-metrics", action="store_true")
             p.add_argument("--all-metrics", action="store_true", help="Compute all 16 label and 6 score detection metrics (the default)")
@@ -52,6 +52,7 @@ def main():
     p.add_argument("--variant", default="full")
     p.add_argument("--baseline-variant", default="single_gru")
     p.add_argument("--anomaly-ratio", type=float, help="Preset percentage for paired label-metric comparisons")
+    p.add_argument("--alpha", type=float, help="Normal false-positive budget for paired label-metric comparisons")
     p.add_argument("--seeds", "--seed", nargs="+", type=int, help="Seeds to aggregate; otherwise use runtime.seeds")
     p = sub.add_parser("export")
     p.add_argument("--root", required=True, help="Result JSON/CSV file or experiment directory")
@@ -64,6 +65,7 @@ def main():
     p.add_argument("--input-csv", required=True)
     p.add_argument("--output", help="Default: reports.predictions/<input stem>_alarms.csv")
     p.add_argument("--anomaly-ratio", type=float, help="Use a ratio threshold stored in the bundle; default is prediction_ratio")
+    p.add_argument("--alpha", type=float, help="Override the normal pointwise budget in an in_1_2_4 bundle")
     device = p.add_mutually_exclusive_group()
     device.add_argument("--gpu", "--gpus", type=int, help="Physical GPU index, e.g. 0 or 1")
     device.add_argument("--device", help="Override logical runtime.device")
@@ -101,7 +103,7 @@ def execute(args, cfg):
         output = aggregate(root, output_path, seeds=selected_seeds)
         if args.baseline_root:
             result = paired_comparison(root, project_path(args.baseline_root), args.metric, args.variant, args.baseline_variant,
-                                       seeds=selected_seeds, anomaly_ratio=args.anomaly_ratio)
+                                       seeds=selected_seeds, anomaly_ratio=args.anomaly_ratio, alpha=args.alpha)
             write_json(output / "paired_comparison.json", result)
         print(output)
         return
@@ -112,9 +114,10 @@ def execute(args, cfg):
         configure_cpu(cfg)  # Apply thread limits after importing PyTorch, too.
         source = project_path(args.input_csv)
         target = project_path(args.output) if args.output else report_path(cfg, "predictions") / (source.stem + "_alarms.csv")
-        stream, names = load_bundle(project_path(args.bundle), cfg["runtime"]["device"], anomaly_ratio=args.anomaly_ratio)
+        stream, names = load_bundle(project_path(args.bundle), cfg["runtime"]["device"], anomaly_ratio=args.anomaly_ratio, alpha=args.alpha)
         frame = pd.read_csv(source, usecols=names)
-        output = [stream.push(row) for row in frame[names].to_numpy(np.float64)]
+        values = frame[names].to_numpy(np.float64)
+        output = stream.push_many(values) if hasattr(stream, "push_many") else [stream.push(row) for row in values]
         target.parent.mkdir(parents=True, exist_ok=True)
         pd.DataFrame(output).to_csv(target, index=False)
         print(target)
@@ -131,8 +134,11 @@ def execute(args, cfg):
         if args.threshold_method:
             cfg["calibration"]["method"] = args.threshold_method
         if args.anomaly_ratios is not None:
-            cfg["calibration"].update(method="tab_anomaly_ratio", anomaly_ratios=args.anomaly_ratios,
-                                     prediction_ratio=1. if 1. in args.anomaly_ratios else args.anomaly_ratios[0])
+            if cfg["stage2"].get("method") == "in_1_2_4":
+                cfg["calibration"]["offline_anomaly_ratios"] = args.anomaly_ratios
+            else:
+                cfg["calibration"].update(method="tab_anomaly_ratio", anomaly_ratios=args.anomaly_ratios,
+                                         prediction_ratio=1. if 1. in args.anomaly_ratios else args.anomaly_ratios[0])
     cfg = resolve_paths(cfg)
     datasets = set(ds.upper() for ds in (args.datasets or cfg["data"]["datasets"]))
     unsupported = datasets - set(DATASETS)
