@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .progress import Progress, log, epoch_log
 from .resources import cooperate
-from .tasks import observable_positive_mask, phase_weights
+from .tasks import observable_positive_mask, phase_weights, channel_phase_weights
 from .training import StageCheckpoint, _recovery, learning_rate_schedule
 from .batching import BatchFeatures
 
@@ -41,7 +41,7 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
         progress = Progress(f"stage2 {'train' if learn else 'validation'} blocks", total_blocks * (2 if tail_enabled else 1),
                             cfg["runtime"].get("log_interval_seconds", 30))
         completed, updates = 0, 0
-        totals = torch.zeros(4, device=device, dtype=torch.float64)
+        totals = torch.zeros(5, device=device, dtype=torch.float64)
         for batch_number, indices in enumerate(batches):
             cooperate()
             batch = [cache.get(int(i)) for i in indices]
@@ -55,6 +55,9 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
             whole_weight = np.zeros((2 * size, maximum), np.float32)
             whole_truth = np.zeros_like(whole_weight)
             whole_ramp = np.zeros((size, maximum, model.normal.schema.channels), np.float32)
+            channel_enabled = settings.get("lambda_channel", 0.) > 0 and model.variant != "energy_only"
+            channel_weight = np.zeros((2 * size, maximum, model.normal.schema.channels), np.float32) if channel_enabled else None
+            channel_truth = np.zeros_like(channel_weight) if channel_enabled else None
             state_denominators, recovery_denominators = [], []
             for i, (left, right, y) in enumerate(zip(clean, corrupt, labels)):
                 def channel_usable(record):
@@ -63,18 +66,24 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                     return record.mask & previous & active & (np.arange(len(y)) >= record.target_start)[:, None]
                 cv, av = channel_usable(left[0]), channel_usable(right[0])
                 positive = observable_positive_mask(left[0], right[0], y)
-                cw, aw = phase_weights(y, cv.any(-1), av.any(-1), positive)
+                cw, aw = phase_weights(y, cv.any(-1), av.any(-1), positive, settings.get("onset_fraction", .5))
                 whole_weight[i, :len(y)], whole_weight[size + i, :len(y)] = cw, aw
                 whole_truth[size + i, :len(y)] = y
                 ramp = _recovery(left[0], right[0], y)
                 whole_ramp[i, :len(y)] = ramp
                 state_denominators.append(max(1, cv.sum()))
                 recovery_denominators.append(max(1, (ramp * av).sum()))
+                if channel_enabled:
+                    channel_positive, ccw, caw = channel_phase_weights(left[0], right[0], y, cv, av, settings.get("onset_fraction", .5))
+                    channel_weight[i, :len(y)], channel_weight[size + i, :len(y)] = ccw, caw
+                    channel_truth[size + i, :len(y)] = channel_positive
             weights = torch.as_tensor(whole_weight, device=device)
             truth = torch.as_tensor(whole_truth, device=device)
             ramps = torch.as_tensor(whole_ramp, device=device)
             state_den = torch.as_tensor(state_denominators, device=device)
             recovery_den = torch.as_tensor(recovery_denominators, device=device)
+            channel_weights = torch.as_tensor(channel_weight, device=device) if channel_enabled else None
+            channel_targets = torch.as_tensor(channel_truth, device=device) if channel_enabled else None
             tail = weights.new_zeros(())
             tail_coefficient = weights.new_zeros(())
             tail_selected = torch.zeros_like(weights, dtype=torch.bool)
@@ -138,6 +147,10 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                     anchored = (clean_loss * eligible[:size]).sum((1, 2)) / state_den
                     recovered = (recovery_loss * ramp * eligible[size:]).sum((1, 2)) / recovery_den
                     state_loss = (anchored + recovered).mean()
+                    channel_loss = classification.new_zeros(())
+                    if channel_enabled:
+                        values = F.binary_cross_entropy_with_logits(out["channel_dynamic"], channel_targets[:, start:start + length], reduction="none")
+                        channel_loss = (values * channel_weights[:, start:start + length] * out["channel_valid"]).sum() / size
                     tail_loss = classification.new_zeros(())
                     if tail_active:
                         positive = (target > 0) & (weight > 0) & valid
@@ -147,6 +160,8 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                         selected = tail_selected[:, start:start + length]
                         tail_loss = tail_loss + tail_coefficient * ((out["dynamic"] - out["dynamic"].detach()) * selected).sum() / tail_count
                     loss = classification
+                    if channel_enabled:
+                        loss = loss + settings["lambda_channel"] * channel_loss
                     if model.variant not in {"no_state", "mlp", "energy_only"}:
                         loss = loss + settings["lambda_state"] * state_loss
                     if model.variant != "no_tail":
@@ -155,7 +170,7 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                         raise FloatingPointError("Non-finite paired detector objective.")
                     if learn and model.variant != "energy_only":
                         loss.backward()
-                    totals += torch.stack([loss, classification, state_loss, tail_loss]).detach().double() * size
+                    totals += torch.stack([loss, classification, state_loss, tail_loss, channel_loss]).detach().double() * size
                 state = state.detach()
                 completed += 1
                 progress.update(completed)
@@ -176,7 +191,7 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
             if batch_number == 0:
                 progress.update(completed, force=True)
         values = (totals / len(cache)).cpu().tolist()
-        return dict(zip(("loss", "classification", "state", "tail"), values), optimizer_updates=updates)
+        return dict(zip(("loss", "classification", "state", "tail", "channel"), values), optimizer_updates=updates)
 
     for number in range(len(checkpoint.history), settings["epochs"]):
         if checkpoint.stale >= settings["patience"]:
@@ -190,7 +205,7 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                                seconds=time.perf_counter() - began), valid["loss"])
         epoch_log("stage2", number + 1, settings["epochs"], train["loss"], valid["loss"], began, cfg, checkpoint,
                   lr=rate, classification=train["classification"],
-                  state=train["state"], tail=train["tail"])
+                  state=train["state"], tail=train["tail"], channel=train["channel"])
     history = checkpoint.finish()
     model.eval()
     return history

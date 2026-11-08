@@ -39,9 +39,11 @@ def observable_positive_mask(clean: Record, corrupt: Record, labels, tolerance=1
     return usable
 
 
-def phase_weights(labels, clean_valid, corrupt_valid, positive_valid=None):
+def phase_weights(labels, clean_valid, corrupt_valid, positive_valid=None, onset_fraction=.5):
     """Weights over a pair sum to one; positives and negatives each sum to 1/2."""
     labels = np.asarray(labels, bool)
+    if not 0 < onset_fraction < 1:
+        raise ValueError("onset_fraction must be in (0,1).")
     clean_valid, corrupt_valid = np.asarray(clean_valid, bool), np.asarray(corrupt_valid, bool)
     if labels.ndim != 1 or clean_valid.shape != labels.shape or corrupt_valid.shape != labels.shape:
         raise ValueError("Labels and scoring masks must preserve the same one-dimensional time axis.")
@@ -60,12 +62,13 @@ def phase_weights(labels, clean_valid, corrupt_valid, positive_valid=None):
         onset = start + int(observed[0]) if positive_valid is not None else start
         cut = min(onset + 8, stop)
         phases = [np.arange(onset, cut), np.arange(cut, stop)]
-        phases = [p[eligible[p]] for p in phases if len(p)]
-        phases = [p for p in phases if len(p)]
+        phases = [(p[eligible[p]], w) for p, w in zip(phases, (onset_fraction, 1 - onset_fraction)) if len(p)]
+        phases = [(p, w) for p, w in phases if len(p)]
         if not phases:
             raise ValueError("No scorable positive sample for an injected event.")
-        for p in phases:
-            positive[p] = 0.5 / len(events) / len(phases) / len(p)
+        total_weight = sum(w for _, w in phases)
+        for p, weight in phases:
+            positive[p] = 0.5 / len(events) * weight / total_weight / len(p)
     if not events:
         raise ValueError("A task pair requires a scorable event.")
     clean_negative = np.asarray(clean_valid, np.float64)
@@ -274,6 +277,49 @@ def observable_channel_mask(clean, corrupt, labels, events, tolerance=1e-6):
         if channels:
             result[start:stop, channels] = np.maximum.accumulate(changed[start:stop, channels], axis=0)
     return result & np.asarray(labels, bool)[:, None]
+
+
+def channel_phase_weights(clean, corrupt, labels, clean_valid, corrupt_valid, onset_fraction=.5):
+    """Use actual paired changes to supervise every affected channel, not just argmax."""
+    if not 0 < onset_fraction < 1:
+        raise ValueError("onset_fraction must be in (0,1).")
+    labels = np.asarray(labels, bool)
+    events = event_ranges(labels)
+    channels = list(range(clean.z.shape[1]))
+    positive = observable_channel_mask(clean, corrupt, labels,
+        [dict(start=start, stop=stop, channels=channels) for start, stop in events])
+    clean_valid, corrupt_valid = np.asarray(clean_valid, bool), np.asarray(corrupt_valid, bool)
+    if clean_valid.shape != clean.z.shape or corrupt_valid.shape != clean.z.shape:
+        raise ValueError("Channel supervision masks must preserve [time, channel].")
+    cw = np.zeros_like(clean.z, dtype=np.float32)
+    aw = np.zeros_like(cw)
+    affected = np.zeros_like(positive)
+    for start, stop in events:
+        affected[start:stop] = positive[start:stop].any(0)
+        eligible = positive[start:stop] & corrupt_valid[start:stop]
+        observed_channels = np.flatnonzero(eligible.any(0))
+        if not len(observed_channels):
+            raise ValueError("No observable affected channel for a paired event.")
+        for channel in observed_channels:
+            positions = np.flatnonzero(eligible[:, channel]) + start
+            onset = positions[0]
+            first, interior = positions[positions < onset + 8], positions[positions >= onset + 8]
+            phases = [(ix, weight) for ix, weight in ((first, onset_fraction), (interior, 1 - onset_fraction)) if len(ix)]
+            normalization = sum(weight for _, weight in phases)
+            for ix, weight in phases:
+                aw[ix, channel] = .5 * weight / normalization / len(events) / len(observed_channels) / len(ix)
+    negative_clean = clean_valid.astype(np.float64)
+    # The unchanged prefix of an affected channel is unlabelled. Unaffected
+    # channels remain negative even during another channel's injected event.
+    negative_corrupt = (corrupt_valid & ~affected).astype(np.float64)
+    if events:
+        negative_corrupt[events[0][1]:] *= 2
+    total = negative_clean.sum() + negative_corrupt.sum()
+    if total <= 0:
+        raise ValueError("Channel supervision has no usable normal location.")
+    cw[:] = .5 * negative_clean / total
+    aw += (.5 * negative_corrupt / total).astype(np.float32)
+    return positive, cw, aw
 
 
 def generate_reference_pair(source, donor, window, index, seed, families, policy,

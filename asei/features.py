@@ -59,14 +59,12 @@ class DescriptorSchema(nn.Module):
     def ids(self, values):
         shape = values.shape
         result = torch.zeros(shape, dtype=torch.long, device=values.device)
-        # Per-channel bucketize avoids B*W*C*Q broadcast allocations.
-        for i in self.cat_indices:
-            support = self.vocabulary[i, self.known[i]]
-            index = torch.searchsorted(support, values[..., i].contiguous())
-            clipped = index.clamp(max=len(support) - 1)
-            matches = (index < len(support)) & (values[..., i] == support[clipped])
-            result[..., i] = torch.where(matches, index + 1, torch.zeros_like(index))
-        return result
+        if not self.cat_indices:
+            return result
+        # Fixed padded vocabularies avoid a CUDA nonzero/synchronization for each
+        # categorical channel. Zero remains the explicit unknown symbol.
+        matches = (values[..., None] == self.vocabulary) & self.known
+        return matches.long().argmax(-1)
 
     def block(self, records, starts, length, errors=None, ready=None, device=None):
         """Build [B,T,C,...] features; negative indices are padding, never wraparound."""
@@ -104,12 +102,12 @@ class DescriptorSchema(nn.Module):
                     forecast=torch.as_tensor(np.stack(error_arrays), device=device),
                     forecast_ready=torch.as_tensor(np.stack(ready_arrays), device=device))
         if all(record.routing is not None for record in records):
-            for name in ("reference_index", "m_index", "j_index", "short_marginal"):
+            for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
                 rows = []
                 for record, start in zip(records, starts):
                     index = np.arange(start, start + length).clip(0, len(record.z) - 1)
                     rows.append(record.routing[name][index])
-                dtype = torch.float32 if name == "short_marginal" else torch.long
+                dtype = torch.float32 if name in {"short_marginal", "peer_cost"} else torch.long
                 result[name] = torch.as_tensor(np.stack(rows), device=device, dtype=dtype)
         return result
 

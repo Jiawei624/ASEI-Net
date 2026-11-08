@@ -335,6 +335,9 @@ def fit_energy_scales(model, fit, cfg):
     normal = model.normal
     sums = torch.zeros_like(normal.memory.energy_scale, dtype=torch.float64)
     counts = torch.zeros_like(sums)
+    support_sum = torch.zeros(normal.schema.channels, dtype=torch.float64, device=sums.device)
+    support_square, support_count = torch.zeros_like(support_sum), torch.zeros_like(support_sum)
+    normal.memory.reference_limit.fill_(float("inf"))
     state = model.initial_state(1).normal
     length = cfg["stage2"]["block_length"]
     progress = Progress("energy calibration blocks", (len(fit.z) + length - 1) // length,
@@ -348,10 +351,23 @@ def fit_energy_scales(model, fit, cfg):
         counts[:, 1] += lavail.sum((0, 1))
         sums[:, 0] += (values["short_distance"] * values["short_available"]).double().sum((0, 1))
         counts[:, 0] += values["short_available"].sum((0, 1))
+        support_valid = values["external"] & f["sv"]
+        support = values["peer_cost"].double()
+        support_sum += (support * support_valid).sum((0, 1))
+        support_square += (support.square() * support_valid).sum((0, 1))
+        support_count += support_valid.sum((0, 1))
         cooperate()
         progress.update(start // length + 1)
     normal.memory.energy_scale.copy_((sums / counts.clamp(min=1)).clamp(min=1e-3).float())
-    return dict(counts=counts.cpu().tolist(), scales=normal.memory.energy_scale.cpu().tolist())
+    multiplier = cfg["stage2"].get("reference_guard_multiplier", 0.)
+    if multiplier:
+        mean = support_sum / support_count.clamp(min=1)
+        std = (support_square / support_count.clamp(min=1) - mean.square()).clamp(min=0).sqrt()
+        limit = (mean + multiplier * std).clamp(min=1e-3)
+        normal.memory.reference_limit.copy_(torch.where(support_count > 0, limit, torch.full_like(limit, float("inf"))).float())
+    return dict(counts=counts.cpu().tolist(), scales=normal.memory.energy_scale.cpu().tolist(),
+                reference_support_counts=support_count.cpu().tolist(),
+                reference_limits=[float(v) if torch.isfinite(v) else None for v in normal.memory.reference_limit.cpu()])
 
 
 def build_pairs(model, source, donor, cfg, directory, split, seed, names, relation_tasks=None):

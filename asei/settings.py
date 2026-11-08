@@ -55,6 +55,17 @@ def resolve(cfg, n_train, channels):
     if n_train < 65 or channels < 1:
         raise ValueError("The detector needs at least 65 fitting samples and one observed channel.")
     m, s, cal = cfg["model"], cfg["stage2"], cfg["calibration"]
+    for key, value in dict(evidence_transform="identity", evidence_hidden=64, readout_hidden=32,
+            channel_embedding_dim=0, lambda_channel=0., onset_fraction=.5, reference_guard_multiplier=0.).items():
+        s.setdefault(key, value)
+    if s["evidence_transform"] not in {"identity", "signed_log1p"}:
+        raise ValueError("stage2.evidence_transform must be identity or signed_log1p.")
+    for key in ("evidence_hidden", "readout_hidden", "channel_embedding_dim"):
+        value = s[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < (0 if key == "channel_embedding_dim" else 1):
+            raise ValueError("Invalid stage2." + key)
+    if not 0 < s["onset_fraction"] < 1:
+        raise ValueError("stage2.onset_fraction must be in (0,1).")
     small = n_train < 8448
     if m["window"] == "auto":
         m["window"] = min(128 if small else 256, ((n_train - 33) // 32) * 32)
@@ -111,7 +122,7 @@ def resolve(cfg, n_train, channels):
             raise ValueError("Invalid runtime." + key)
     if not isinstance(runtime.get("save_predictions", False), bool):
         raise ValueError("runtime.save_predictions must be boolean.")
-    for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1"):
+    for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1", "lambda_channel", "reference_guard_multiplier"):
         if not math.isfinite(s[key]) or s[key] < 0:
             raise ValueError("stage2." + key + " must be finite and nonnegative.")
     if not 0 < s["eta"] <= 1 or not 0 < s["rho"] < 1 or not 0 <= s["reference_trim"] < 1:

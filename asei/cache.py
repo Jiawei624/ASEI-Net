@@ -16,16 +16,16 @@ from .tasks import event_ranges
 class PairCache:
     FIELDS = {"z": (np.float32, 1), "mask": (np.uint8, 1), "error": (np.float32, 2), "ready": (np.uint8, 2),
               "reference_index": (np.int32, 1), "m_index": (np.int32, 1),
-              "j_index": (np.int32, 1), "short_marginal": (np.float32, 1)}
+              "j_index": (np.int32, 1), "short_marginal": (np.float32, 1), "peer_cost": (np.float32, 1)}
 
     def __init__(self, directory, key, channels, memory_mb=256):
         self.directory, self.key, self.channels = Path(directory), key, channels
         self.directory.mkdir(parents=True, exist_ok=True)
         self.path = self.directory / "index.json"
-        self.index = {"format": "asei-net/raw-pairs/2", "key": key, "channels": channels, "entries": []}
+        self.index = {"format": "asei-net/raw-pairs/3", "key": key, "channels": channels, "entries": []}
         if self.path.exists():
             self.index = json.loads(self.path.read_text(encoding="utf-8"))
-            if self.index.get("format") != "asei-net/raw-pairs/2" or self.index["key"] != key or self.index["channels"] != channels:
+            if self.index.get("format") != "asei-net/raw-pairs/3" or self.index["key"] != key or self.index["channels"] != channels:
                 raise ValueError("Task cache identity differs; use a new run.")
         self.maps, self.lru, self.bytes = {}, OrderedDict(), 0
         self.limit = max(0, int(memory_mb * 1024 ** 2))
@@ -92,7 +92,7 @@ class PairCache:
                 shape = (length, self.channels) if width == 1 else (length, self.channels, width)
                 fields[field] = np.array(self.maps[identity][begin:end].reshape(shape), copy=True)
                 size += fields[field].nbytes
-            routing = {name: fields[name] for name in ("reference_index", "m_index", "j_index", "short_marginal")}
+            routing = {name: fields[name] for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost")}
             result.append((Record(fields["z"], fields["mask"].astype(bool), entry["target_start"], routing),
                            fields["error"], fields["ready"].astype(bool)))
         labels = np.zeros(length, bool)

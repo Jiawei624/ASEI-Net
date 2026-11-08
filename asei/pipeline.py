@@ -174,6 +174,23 @@ def _weights(cfg):
     return [0., 1.] if variant == "no_energy" else [1., 0.] if variant == "energy_only" else cfg["calibration"]["weights"]
 
 
+def _normal_diagnostics(raw, calibration, start, stop, alphas):
+    """Describe normal replay after model selection; never changes a threshold."""
+    segment = {key: value[start:stop] for key, value in raw.items()}
+    output = _apply(calibration, segment)
+    valid = output["valid"]
+    diagnostics = dict(points=stop - start, scorable_points=int(valid.sum()), working_points=[])
+    if "short_reference_coverage" in segment:
+        coverage = segment["short_reference_coverage"][segment["short_valid"]]
+        diagnostics["mean_short_reference_coverage"] = float(coverage.mean()) if len(coverage) else None
+    for alpha in alphas:
+        entry = dict(alpha=alpha, normal_fpr=float((output["labels"] if alpha == calibration.alpha else valid & (output["p_mix"] <= alpha)).mean()))
+        for branch, weight in zip(("short", "dynamic"), calibration.weights):
+            entry[branch + "_normal_fpr"] = float((valid & (weight > 0) & (output["p_" + branch] <= alpha * weight)).mean())
+        diagnostics["working_points"].append(entry)
+    return diagnostics
+
+
 def _evaluate(raw, labels, calibration, cfg):
     output = _apply(calibration, raw)
     actual, _, valid, full_scores = _evaluation_scores(labels, output["scores"], output["valid"])
@@ -280,12 +297,14 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
             if scales["key"] != detector_key:
                 raise ValueError("Energy-scale identity differs; use a new run.")
             normal.memory.energy_scale.copy_(scales["value"])
+            normal.memory.reference_limit.copy_(scales["reference_limit"])
             experiment["energy_scales"] = scales["statistics"]
         else:
             start = time.perf_counter()
             experiment["energy_scales"] = fit_energy_scales(model, fit, cfg)
             experiment["timings"]["energy_scale_seconds"] = time.perf_counter() - start
-            _save(scale_path, dict(key=detector_key, value=normal.memory.energy_scale.cpu(), statistics=experiment["energy_scales"]))
+            _save(scale_path, dict(key=detector_key, value=normal.memory.energy_scale.cpu(),
+                reference_limit=normal.memory.reference_limit.cpu(), statistics=experiment["energy_scales"]))
         seed_everything(seed + 10000)
         model = DualTrajectoryDetector(normal, cfg["stage2"]).to(device)
         if not detector_complete or stage == "cache":
@@ -329,6 +348,9 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     experiment["calibration_scope"] = dict(source="independent_normal" if independent else "official_normal_suffix",
         fit_points=len(fit.z), selection_points=cut, calibration_points=len(heldout.z) - cut,
         calibration_start=calibration_start, weights=_weights(cfg), resolution=calibration.resolution())
+    experiment["normal_replay_diagnostics"] = dict(
+        selection=_normal_diagnostics(normal_raw, calibration, 0 if independent else len(fit.z), calibration_start, cfg["calibration"]["alphas"]),
+        calibration=_normal_diagnostics(normal_raw, calibration, calibration_start, len(calibration_record.z), cfg["calibration"]["alphas"]))
     bootstrap = None
     if entity.test_continuous:
         if independent:
@@ -356,6 +378,7 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
         model_file=bundle.relative_to(Path(cfg["runtime"]["run_directory"])).as_posix(), test_points=len(labels),
         calibration={**experiment["calibration_scope"], "method": "parallel_normal", "alpha": calibration.alpha},
         metrics=metrics, config=cfg, provenance=provenance, timing=experiment["timings"],
+        normal_replay_diagnostics=experiment["normal_replay_diagnostics"],
         model_analysis=dict(contraction_bound=model.normal.teacher.cell.contraction,
             hidden_spectral_norm=float(torch.linalg.svdvals(model.normal.teacher.cell.hidden.weight)[0].cpu()),
             parameters=sum(p.numel() for p in model.parameters()),

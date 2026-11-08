@@ -175,6 +175,7 @@ class NormalMemory(nn.Module):
         self.register_buffer("j_active", torch.zeros(kj, dtype=torch.bool))
         self.register_buffer("peer_scale", torch.ones(c))
         self.register_buffer("energy_scale", torch.ones(c, 2, 2))  # short/long, marginal/joint
+        self.register_buffer("reference_limit", torch.full((c,), float("inf")))
 
     @staticmethod
     def _representatives(x, count, seed, priority=None, rare_fraction=.25):
@@ -377,7 +378,7 @@ class NormalMemory(nn.Module):
         return num, pair, available, joint
 
     def reference(self, f, prior_num, prior_pair, trim=.1, prior_weight=.25, external=True,
-                  prepared=None, return_index=False):
+                  prepared=None, return_index=False, return_support=False):
         # f is one time point: [B,C,...]. All routing excludes actual target input.
         prepared = self.prepare_peers(f, trim) if prepared is None else prepared
         peer, secondary, counts = prepared["peer"], prepared["secondary"], prepared["counts"]
@@ -409,16 +410,23 @@ class NormalMemory(nn.Module):
         available = joint_valid | self.m_active.any(-1)
         result = (ref_num, ref_pair, available, joint_valid)
         if return_index:
-            return (*result, torch.where(joint_valid, index, -mi - 1))
+            result = (*result, torch.where(joint_valid, index, -mi - 1))
+        if return_support:
+            support = peer.gather(1, index[:, None]).squeeze(1).float()
+            result = (*result, support.masked_fill(~joint_valid, 0))
         return result
 
-    def short_evidence(self, f, ref_num, ref_pair, reference_valid, joint_valid):
+    def short_evidence(self, f, ref_num, ref_pair, reference_valid, joint_valid, peer_cost=None):
         marginal = self.short_marginal(f)
         relative = .5 * (f["v"] - ref_num).square().sum(-1)
         if self.schema.cat_indices:
             relative[..., self.schema.cat_indices] = (f["pair"][..., self.schema.cat_indices, :] != ref_pair[..., self.schema.cat_indices, :]).float().mean(-1)
         mv = self.m_active.any(-1) & f["sv"]
         jv = reference_valid & f["sv"]
+        if peer_cost is not None:
+            # Unsupported external contexts still drive the dynamic branch and
+            # normal trajectory. They cannot force an unconditional instant alarm.
+            jv &= ~joint_valid | (peer_cost <= self.reference_limit)
         distance = torch.stack([marginal.masked_fill(~mv, 0), relative.masked_fill(~jv, 0)], -1)
         available = torch.stack([mv, jv], -1)
         return distance, available
