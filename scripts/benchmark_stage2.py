@@ -22,7 +22,7 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--discrete-channels", type=int, default=0)
-    parser.add_argument("--prepare-tasks", type=int, default=0, help="Also compare separate and batched independent task preparation")
+    parser.add_argument("--prepare-tasks", type=int, default=0, help="Also compare independent task routing and CPU synthesis")
     device_args = parser.add_mutually_exclusive_group()
     device_args.add_argument("--gpu", type=int)
     device_args.add_argument("--device")
@@ -106,6 +106,8 @@ def main():
                    cached_speedup=results["step"]["seconds_per_batch"] / results["cached"]["seconds_per_batch"],
                    scope="Synthetic forward/backward. Step/block include frozen retrieval; cached reuses exact routing. Excludes forecasting and disk I/O.")
     if args.prepare_tasks:
+        from asei.parallel import ordered_prefetch, preparation_workers
+        from asei.tasks import NormalTaskPolicy, generate_reference_pair, typed_donor_matcher
         tasks = []
         for i in range(args.prepare_tasks):
             task = values.copy()
@@ -128,6 +130,31 @@ def main():
             batched_seconds=together_seconds, speedup=separate_seconds / together_seconds,
             scope="Frozen routing only; excludes task synthesis, forecasting and disk writes.")
         print(f"task_preparation separate={separate_seconds:.6f}s batched={together_seconds:.6f}s", flush=True)
+        policy = NormalTaskPolicy(record, cfg["stage2"]["discrete_max_values"])
+        matcher = typed_donor_matcher(policy.supports)
+        def synthesize(index):
+            return generate_reference_pair(record, record, window, index, 20042,
+                cfg["stage2"]["families"], policy, donor_candidates=cfg["stage2"]["donor_candidates"],
+                boundary_blend=cfg["stage2"]["boundary_blend"], relation_matcher=matcher)
+        began = time.perf_counter()
+        serial_pairs = list(map(synthesize, range(args.prepare_tasks)))
+        serial_seconds = time.perf_counter() - began
+        workers = preparation_workers(cfg)
+        began = time.perf_counter()
+        with ordered_prefetch(synthesize, range(args.prepare_tasks), workers=workers,
+                              depth=max(1, workers * 2)) as pending:
+            parallel_pairs = list(pending)
+        parallel_seconds = time.perf_counter() - began
+        for first, second in zip(serial_pairs, parallel_pairs):
+            assert first.recipe == second.recipe
+            np.testing.assert_array_equal(first.clean.z, second.clean.z)
+            np.testing.assert_array_equal(first.corrupt.z, second.corrupt.z)
+            np.testing.assert_array_equal(first.labels, second.labels)
+        results["cpu_task_synthesis"] = dict(tasks=args.prepare_tasks, workers=workers,
+            serial_seconds=serial_seconds, parallel_seconds=parallel_seconds,
+            speedup=serial_seconds / parallel_seconds, exact_match=True,
+            scope="CPU-only independent task synthesis; excludes GPU overlap, forecasting and cache I/O. Small workloads can be slower with threads.")
+        print(f"cpu_task_synthesis workers={workers} serial={serial_seconds:.6f}s parallel={parallel_seconds:.6f}s", flush=True)
     target = project_path(args.output) if args.output else Path(cfg["runtime"]["output"]) / "benchmarks" / "stage2.json"
     write_json(target, results)
     print("Benchmark report:", target)

@@ -17,6 +17,11 @@ def validate_cpu_config(runtime):
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError("runtime." + key + " must be a positive integer.")
         runtime[key] = value
+    for key in ("preparation_workers", "prefetch_batches"):
+        value = runtime.get(key, 2)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("runtime." + key + " must be a nonnegative integer.")
+        runtime[key] = value
     for key, default, maximum in (("cpu_max_percent", 80, 100),
                                    ("cpu_check_interval_seconds", 5, None)):
         try:
@@ -141,6 +146,8 @@ def configure_cpu(cfg):
               "interop_threads": torch.get_num_interop_threads() if torch is not None else runtime["interop_threads"],
               "workers": workers, "cpu_max_percent": runtime["cpu_max_percent"],
               "cpu_check_interval_seconds": runtime["cpu_check_interval_seconds"]}
+    report["preparation_workers"] = min(runtime.get("preparation_workers", 2), max(0, budget - threads))
+    report["prefetch_batches"] = runtime.get("prefetch_batches", 2) if report["preparation_workers"] else 0
     runtime["effective_cpu"] = report
     settings = (runtime["cpu_max_percent"], runtime["cpu_check_interval_seconds"])
     if settings != _governor_settings:
@@ -149,6 +156,7 @@ def configure_cpu(cfg):
     report["system_load_guard"] = _governor.previous is not None
     if report != _last_report:
         log(f"CPU budget={budget} threads={threads} workers={workers} "
+            f"prepare_workers={report['preparation_workers']} prefetch={report['prefetch_batches']} "
             f"affinity={report['cpu_affinity']} host_limit={settings[0]:g}% "
             f"load_guard={report['system_load_guard']}", cfg)
         _last_report = report.copy()

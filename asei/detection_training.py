@@ -13,6 +13,52 @@ from .resources import cooperate
 from .tasks import observable_positive_mask, phase_weights, channel_phase_weights
 from .training import StageCheckpoint, _recovery, learning_rate_schedule
 from .batching import BatchFeatures
+from .parallel import ordered_prefetch, prefetch_depth
+
+
+def prepare_detector_batch(cache, indices, active, settings, schema):
+    """Read tasks and build fixed supervision on a single CPU producer."""
+    batch = [cache.get(int(i)) for i in indices]
+    clean, corrupt, labels, _ = zip(*batch)
+    records = [v[0] for v in clean] + [v[0] for v in corrupt]
+    errors = [v[1] for v in clean] + [v[1] for v in corrupt]
+    ready = [v[2] for v in clean] + [v[2] for v in corrupt]
+    size, maximum = len(clean), max(len(r.z) for r in records)
+    channels = schema.channels
+    whole_weight = np.zeros((2 * size, maximum), np.float32)
+    whole_truth = np.zeros_like(whole_weight)
+    whole_ramp = np.zeros((size, maximum, channels), np.float32)
+    channel_enabled = settings.get("lambda_channel", 0.) > 0 and settings["variant"] != "energy_only"
+    channel_weight = np.zeros((2 * size, maximum, channels), np.float32) if channel_enabled else None
+    channel_truth = np.zeros_like(channel_weight) if channel_enabled else None
+    state_denominators, recovery_denominators = [], []
+    for i, (left, right, y) in enumerate(zip(clean, corrupt, labels)):
+        def channel_usable(record):
+            previous = np.roll(record.mask, 1, axis=0)
+            previous[0] = False
+            return record.mask & previous & active & (np.arange(len(y)) >= record.target_start)[:, None]
+        cv, av = channel_usable(left[0]), channel_usable(right[0])
+        positive = observable_positive_mask(left[0], right[0], y)
+        try:
+            cw, aw = phase_weights(y, cv.any(-1), av.any(-1), positive, settings.get("onset_fraction", .5))
+            if channel_enabled:
+                channel_positive, ccw, caw = channel_phase_weights(left[0], right[0], y, cv, av, settings.get("onset_fraction", .5))
+                channel_weight[i, :len(y)], channel_weight[size + i, :len(y)] = ccw, caw
+                channel_truth[size + i, :len(y)] = channel_positive
+        except ValueError as exc:
+            raise ValueError(f"Invalid cached task index={indices[i]}, recipe={batch[i][3]}: {exc}") from exc
+        whole_weight[i, :len(y)], whole_weight[size + i, :len(y)] = cw, aw
+        whole_truth[size + i, :len(y)] = y
+        ramp = _recovery(left[0], right[0], y)
+        whole_ramp[i, :len(y)] = ramp
+        state_denominators.append(max(1, cv.sum()))
+        recovery_denominators.append(max(1, (ramp * av).sum()))
+    supervision = dict(weights=whole_weight, truth=whole_truth, ramps=whole_ramp,
+        state_den=np.asarray(state_denominators), recovery_den=np.asarray(recovery_denominators, dtype=np.float32))
+    if channel_enabled:
+        supervision.update(channel_weights=channel_weight, channel_targets=channel_truth)
+    packed = schema.pack(records, [0] * len(records), maximum, errors, ready)
+    return records, errors, ready, maximum, size, supervision, packed
 
 
 def fit_detector(model, training, validation, cfg, directory, key, seed):
@@ -42,154 +88,126 @@ def fit_detector(model, training, validation, cfg, directory, key, seed):
                             cfg["runtime"].get("log_interval_seconds", 30))
         completed, updates = 0, 0
         totals = torch.zeros(5, device=device, dtype=torch.float64)
-        for batch_number, indices in enumerate(batches):
-            cooperate()
-            batch = [cache.get(int(i)) for i in indices]
-            clean, corrupt, labels, _ = zip(*batch)
-            records = [v[0] for v in clean] + [v[0] for v in corrupt]
-            errors = [v[1] for v in clean] + [v[1] for v in corrupt]
-            ready = [v[2] for v in clean] + [v[2] for v in corrupt]
-            size = len(clean)
-            maximum = max(len(r.z) for r in records)
-            batch_features = BatchFeatures(model, records, errors, ready, maximum, cfg)
-            whole_weight = np.zeros((2 * size, maximum), np.float32)
-            whole_truth = np.zeros_like(whole_weight)
-            whole_ramp = np.zeros((size, maximum, model.normal.schema.channels), np.float32)
-            channel_enabled = settings.get("lambda_channel", 0.) > 0 and model.variant != "energy_only"
-            channel_weight = np.zeros((2 * size, maximum, model.normal.schema.channels), np.float32) if channel_enabled else None
-            channel_truth = np.zeros_like(channel_weight) if channel_enabled else None
-            state_denominators, recovery_denominators = [], []
-            for i, (left, right, y) in enumerate(zip(clean, corrupt, labels)):
-                def channel_usable(record):
-                    previous = np.roll(record.mask, 1, axis=0)
-                    previous[0] = False
-                    return record.mask & previous & active & (np.arange(len(y)) >= record.target_start)[:, None]
-                cv, av = channel_usable(left[0]), channel_usable(right[0])
-                positive = observable_positive_mask(left[0], right[0], y)
-                cw, aw = phase_weights(y, cv.any(-1), av.any(-1), positive, settings.get("onset_fraction", .5))
-                whole_weight[i, :len(y)], whole_weight[size + i, :len(y)] = cw, aw
-                whole_truth[size + i, :len(y)] = y
-                ramp = _recovery(left[0], right[0], y)
-                whole_ramp[i, :len(y)] = ramp
-                state_denominators.append(max(1, cv.sum()))
-                recovery_denominators.append(max(1, (ramp * av).sum()))
-                if channel_enabled:
-                    channel_positive, ccw, caw = channel_phase_weights(left[0], right[0], y, cv, av, settings.get("onset_fraction", .5))
-                    channel_weight[i, :len(y)], channel_weight[size + i, :len(y)] = ccw, caw
-                    channel_truth[size + i, :len(y)] = channel_positive
-            weights = torch.as_tensor(whole_weight, device=device)
-            truth = torch.as_tensor(whole_truth, device=device)
-            ramps = torch.as_tensor(whole_ramp, device=device)
-            state_den = torch.as_tensor(state_denominators, device=device)
-            recovery_den = torch.as_tensor(recovery_denominators, device=device)
-            channel_weights = torch.as_tensor(channel_weight, device=device) if channel_enabled else None
-            channel_targets = torch.as_tensor(channel_truth, device=device) if channel_enabled else None
-            tail = weights.new_zeros(())
-            tail_coefficient = weights.new_zeros(())
-            tail_selected = torch.zeros_like(weights, dtype=torch.bool)
-            tail_count, tail_active = 1, False
-            if tail_enabled and learn:
-                snapshot, snapshot_valid, state = torch.zeros_like(weights), torch.zeros_like(tail_selected), None
-                target_state = None
-                with torch.no_grad():
-                    for start in range(0, maximum, block):
-                        cooperate()
-                        length = min(block, maximum - start)
-                        f = batch_features.block(start, length)
-                        prepared = model.frozen_block(f, None if state is None else state.normal)
-                        out, state = model.forward_block(f, state, prepared=prepared)
-                        target_state = batch_features.store(start, f, prepared, target_state, size)
-                        snapshot[:, start:start + length] = out["dynamic"]
-                        snapshot_valid[:, start:start + length] = out["dynamic_valid"]
-                        completed += 1
-                        progress.update(completed)
+        def prepare(indices):
+            return prepare_detector_batch(cache, indices, active, settings, model.normal.schema)
+        with ordered_prefetch(prepare, batches, depth=prefetch_depth(cfg)) as pending:
+            for batch_number, batch in enumerate(pending):
+                cooperate()
+                records, errors, ready, maximum, size, supervision, packed = batch
+                batch_features = BatchFeatures(model, records, errors, ready, maximum, cfg, packed=packed)
+                tensors = {key: torch.as_tensor(value, device=device) for key, value in supervision.items()}
+                weights, truth, ramps = tensors["weights"], tensors["truth"], tensors["ramps"]
+                state_den, recovery_den = tensors["state_den"], tensors["recovery_den"]
+                channel_weights, channel_targets = tensors.get("channel_weights"), tensors.get("channel_targets")
+                channel_enabled = channel_weights is not None
+                tail = weights.new_zeros(())
+                tail_coefficient = weights.new_zeros(())
+                tail_selected = torch.zeros_like(weights, dtype=torch.bool)
+                tail_count, tail_active = 1, False
+                if tail_enabled and learn:
+                    snapshot, snapshot_valid, state = torch.zeros_like(weights), torch.zeros_like(tail_selected), None
+                    target_state = None
+                    with torch.no_grad():
+                        for start in range(0, maximum, block):
+                            cooperate()
+                            length = min(block, maximum - start)
+                            f = batch_features.block(start, length)
+                            prepared = model.frozen_block(f, None if state is None else state.normal)
+                            out, state = model.forward_block(f, state, prepared=prepared)
+                            target_state = batch_features.store(start, f, prepared, target_state, size)
+                            snapshot[:, start:start + length] = out["dynamic"]
+                            snapshot_valid[:, start:start + length] = out["dynamic_valid"]
+                            completed += 1
+                            progress.update(completed)
+                        negative = (truth == 0) & (weights > 0) & snapshot_valid
+                        positive = (truth > 0) & (weights > 0) & snapshot_valid
+                        tail_active = bool(negative.any() & positive.any())
+                        if tail_active:
+                            positions = negative.flatten().nonzero(as_tuple=False).flatten()
+                            tail_count = max(1, int(np.ceil(settings["tail_fraction"] * len(positions))))
+                            selected = positions[snapshot.flatten()[positions].topk(tail_count).indices]
+                            tail_selected.flatten()[selected] = True
+                            tail = snapshot.flatten()[selected].mean()
+                            tail_coefficient = 2 * (torch.sigmoid(settings["tail_margin"] + tail - snapshot)
+                                                    * weights * positive).sum() / size
+                if tail_enabled and not learn:
+                    snapshot = torch.zeros_like(weights)
+                    snapshot_valid = torch.zeros_like(tail_selected)
+                state, teacher_state = None, None
+                finite = torch.ones((), dtype=torch.bool, device=device)
+                if learn:
+                    optimizer.zero_grad(set_to_none=True)
+                for start in range(0, maximum, block):
+                    cooperate()
+                    length = min(block, maximum - start)
+                    f = batch_features.block(start, length)
+                    cached = batch_features.cached.get(start)
+                    with torch.no_grad():
+                        if cached is None:
+                            targets, teacher_state = model.teacher_block({k: v[:size] for k, v in f.items()}, teacher_state)
+                        else:
+                            targets, teacher_state = cached["targets"], cached["teacher_state"]
+                    with torch.set_grad_enabled(learn):
+                        out, state = model.forward_block(f, state, return_aux=True,
+                            prepared=None if cached is None else cached["prepared"])
+                        if tail_enabled and not learn:
+                            snapshot[:, start:start + length] = out["dynamic"]
+                            snapshot_valid[:, start:start + length] = out["dynamic_valid"]
+                        weight = weights[:, start:start + length]
+                        target = truth[:, start:start + length]
+                        ramp = ramps[:, start:start + length]
+                        valid = out["dynamic_valid"]
+                        classification = (F.binary_cross_entropy_with_logits(out["dynamic"], target, reduction="none") * weight * valid).sum() / size
+                        eligible = out["reference_valid"] & f["target"]
+                        clean_loss = F.huber_loss(out["observed"][:size], targets, reduction="none").mean(-1)
+                        recovery_loss = F.huber_loss(out["observed"][size:], targets, reduction="none").mean(-1)
+                        anchored = (clean_loss * eligible[:size]).sum((1, 2)) / state_den
+                        recovered = (recovery_loss * ramp * eligible[size:]).sum((1, 2)) / recovery_den
+                        state_loss = (anchored + recovered).mean()
+                        channel_loss = classification.new_zeros(())
+                        if channel_enabled:
+                            values = F.binary_cross_entropy_with_logits(out["channel_dynamic"], channel_targets[:, start:start + length], reduction="none")
+                            channel_loss = (values * channel_weights[:, start:start + length] * out["channel_valid"]).sum() / size
+                        tail_loss = classification.new_zeros(())
+                        if tail_active:
+                            positive = (target > 0) & (weight > 0) & valid
+                            tail_loss = 2 * (F.softplus(settings["tail_margin"] + tail - out["dynamic"]) * weight * positive).sum() / size
+                            # Restore the exact derivative of the task-wide normal tail,
+                            # while retaining only this block's trainable graph.
+                            selected = tail_selected[:, start:start + length]
+                            tail_loss = tail_loss + tail_coefficient * ((out["dynamic"] - out["dynamic"].detach()) * selected).sum() / tail_count
+                        loss = classification
+                        if channel_enabled:
+                            loss = loss + settings["lambda_channel"] * channel_loss
+                        if model.variant not in {"no_state", "mlp", "energy_only"}:
+                            loss = loss + settings["lambda_state"] * state_loss
+                        if model.variant != "no_tail":
+                            loss = loss + settings["lambda_tail"] * tail_loss
+                        finite &= torch.isfinite(loss.detach())
+                        if learn and model.variant != "energy_only":
+                            loss.backward()
+                        totals += torch.stack([loss, classification, state_loss, tail_loss, channel_loss]).detach().double() * size
+                    state = state.detach()
+                    completed += 1
+                    progress.update(completed)
+                if tail_enabled and not learn:
                     negative = (truth == 0) & (weights > 0) & snapshot_valid
                     positive = (truth > 0) & (weights > 0) & snapshot_valid
-                    tail_active = bool(negative.any() & positive.any())
-                    if tail_active:
-                        positions = negative.flatten().nonzero(as_tuple=False).flatten()
-                        tail_count = max(1, int(np.ceil(settings["tail_fraction"] * len(positions))))
-                        selected = positions[snapshot.flatten()[positions].topk(tail_count).indices]
-                        tail_selected.flatten()[selected] = True
-                        tail = snapshot.flatten()[selected].mean()
-                        tail_coefficient = 2 * (torch.sigmoid(settings["tail_margin"] + tail - snapshot)
-                                                * weights * positive).sum() / size
-            if tail_enabled and not learn:
-                snapshot = torch.zeros_like(weights)
-                snapshot_valid = torch.zeros_like(tail_selected)
-            state, teacher_state = None, None
-            if learn:
-                optimizer.zero_grad(set_to_none=True)
-            for start in range(0, maximum, block):
-                cooperate()
-                length = min(block, maximum - start)
-                f = batch_features.block(start, length)
-                cached = batch_features.cached.get(start)
-                with torch.no_grad():
-                    if cached is None:
-                        targets, teacher_state = model.teacher_block({k: v[:size] for k, v in f.items()}, teacher_state)
-                    else:
-                        targets, teacher_state = cached["targets"], cached["teacher_state"]
-                with torch.set_grad_enabled(learn):
-                    out, state = model.forward_block(f, state, return_aux=True,
-                        prepared=None if cached is None else cached["prepared"])
-                    if tail_enabled and not learn:
-                        snapshot[:, start:start + length] = out["dynamic"]
-                        snapshot_valid[:, start:start + length] = out["dynamic_valid"]
-                    weight = weights[:, start:start + length]
-                    target = truth[:, start:start + length]
-                    ramp = ramps[:, start:start + length]
-                    valid = out["dynamic_valid"]
-                    classification = (F.binary_cross_entropy_with_logits(out["dynamic"], target, reduction="none") * weight * valid).sum() / size
-                    eligible = out["reference_valid"] & f["target"]
-                    clean_loss = F.huber_loss(out["observed"][:size], targets, reduction="none").mean(-1)
-                    recovery_loss = F.huber_loss(out["observed"][size:], targets, reduction="none").mean(-1)
-                    anchored = (clean_loss * eligible[:size]).sum((1, 2)) / state_den
-                    recovered = (recovery_loss * ramp * eligible[size:]).sum((1, 2)) / recovery_den
-                    state_loss = (anchored + recovered).mean()
-                    channel_loss = classification.new_zeros(())
-                    if channel_enabled:
-                        values = F.binary_cross_entropy_with_logits(out["channel_dynamic"], channel_targets[:, start:start + length], reduction="none")
-                        channel_loss = (values * channel_weights[:, start:start + length] * out["channel_valid"]).sum() / size
-                    tail_loss = classification.new_zeros(())
-                    if tail_active:
-                        positive = (target > 0) & (weight > 0) & valid
-                        tail_loss = 2 * (F.softplus(settings["tail_margin"] + tail - out["dynamic"]) * weight * positive).sum() / size
-                        # Restore the exact derivative of the task-wide normal tail,
-                        # while retaining only this block's trainable graph.
-                        selected = tail_selected[:, start:start + length]
-                        tail_loss = tail_loss + tail_coefficient * ((out["dynamic"] - out["dynamic"].detach()) * selected).sum() / tail_count
-                    loss = classification
-                    if channel_enabled:
-                        loss = loss + settings["lambda_channel"] * channel_loss
-                    if model.variant not in {"no_state", "mlp", "energy_only"}:
-                        loss = loss + settings["lambda_state"] * state_loss
-                    if model.variant != "no_tail":
-                        loss = loss + settings["lambda_tail"] * tail_loss
-                    if not torch.isfinite(loss):
-                        raise FloatingPointError("Non-finite paired detector objective.")
-                    if learn and model.variant != "energy_only":
-                        loss.backward()
-                    totals += torch.stack([loss, classification, state_loss, tail_loss, channel_loss]).detach().double() * size
-                state = state.detach()
-                completed += 1
-                progress.update(completed)
-            if tail_enabled and not learn:
-                negative = (truth == 0) & (weights > 0) & snapshot_valid
-                positive = (truth > 0) & (weights > 0) & snapshot_valid
-                if bool(negative.any() & positive.any()):
-                    values = snapshot[negative]
-                    count = max(1, int(np.ceil(settings["tail_fraction"] * len(values))))
-                    threshold = values.topk(count).values.mean()
-                    penalty = 2 * (F.softplus(settings["tail_margin"] + threshold - snapshot) * weights * positive).sum() / size
-                    totals[3] += penalty.double() * size
-                    totals[0] += settings["lambda_tail"] * penalty.double() * size
-            if learn and model.variant != "energy_only":
-                torch.nn.utils.clip_grad_norm_(parameters, 1)
-                optimizer.step()
-                updates += 1
-            if batch_number == 0:
-                progress.update(completed, force=True)
+                    if bool(negative.any() & positive.any()):
+                        values = snapshot[negative]
+                        count = max(1, int(np.ceil(settings["tail_fraction"] * len(values))))
+                        threshold = values.topk(count).values.mean()
+                        penalty = 2 * (F.softplus(settings["tail_margin"] + threshold - snapshot) * weights * positive).sum() / size
+                        totals[3] += penalty.double() * size
+                        totals[0] += settings["lambda_tail"] * penalty.double() * size
+                if not finite:
+                    raise FloatingPointError("Non-finite paired detector objective.")
+                if learn and model.variant != "energy_only":
+                    torch.nn.utils.clip_grad_norm_(parameters, 1)
+                    optimizer.step()
+                    updates += 1
+                if batch_number == 0:
+                    progress.update(completed, force=True)
         values = (totals / len(cache)).cpu().tolist()
         return dict(zip(("loss", "classification", "state", "tail", "channel"), values), optimizer_updates=updates)
 

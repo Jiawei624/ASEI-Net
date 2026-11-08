@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from itertools import islice
 from pathlib import Path
 import time
 
@@ -11,12 +12,13 @@ import torch.nn.functional as F
 
 from .compat import load_torch_checkpoint
 from .config import fingerprint, write_json
-from .tasks import NormalTaskPolicy, generate_reference_pair
+from .tasks import NormalTaskPolicy, generate_reference_pair, TaskGenerationError, validate_pair_observability
 from .resources import cooperate
 from .progress import Progress, log, epoch_log
 from .features import forecast_errors
 from .cache import PairCache
-from .batching import BatchFeatures
+from .batching import BatchFeatures, teacher_scoring_mask, feature_blocks
+from .parallel import ordered_prefetch, preparation_workers, prefetch_depth
 from .tasks import normal_difficulty, typed_donor_matcher
 
 
@@ -226,62 +228,64 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
     block_size = min(int(cfg["stage2"]["block_length"]), int(settings.get("block_length", 64)))
     def epoch(record, sequences, training):
         teacher.train(training)
-        total = 0.
+        total = torch.zeros((), dtype=torch.float64, device=normal.schema.amp_mean.device)
         blocks_per_batch = (max(length for _, length in sequences) + block_size - 1) // block_size
         progress = Progress(f"teacher {'train' if training else 'validation'} blocks",
             ((len(sequences) + settings["batch_sequences"] - 1) // settings["batch_sequences"]) * blocks_per_batch,
             cfg["runtime"].get("log_interval_seconds", 30))
         completed = 0
-        for first in range(0, len(sequences), settings["batch_sequences"]):
+        def prepare(first):
             batch = sequences[first:first + settings["batch_sequences"]]
             starts, lengths = zip(*batch)
-            features = BatchFeatures(model, [record] * len(batch), None, None, max(lengths) + 1, cfg, starts=starts)
-            def current_and_next(offset, length):
-                full = features.block(offset, length + 1)
-                f = {key: value[:, :-1] for key, value in full.items()}
-                following = {key: value[:, 1:] for key, value in full.items()}
-                if offset == 0:
-                    f["sv"][:, 0] = False
-                f["target"] &= (torch.arange(offset, offset + length, device=f["v"].device)[None, :, None] >= w)
-                return f, following
-            direct, closed = None, None
-            if training:
-                optimizer.zero_grad(set_to_none=True)
-            accumulated, has_grad = 0., False
-            # Fixed per-sequence/channel denominators avoid block-size dependent targets.
-            denominator = torch.zeros(len(batch), normal.schema.channels, device=normal.schema.amp_mean.device)
-            for offset in range(0, max(lengths), block_size):
-                length = min(block_size, max(lengths) - offset)
-                f, following = current_and_next(offset, length)
-                good = f["sv"] & f["lv"] & following["lv"] & f["target"]
-                denominator += good.sum(1)
-            for offset in range(0, max(lengths), block_size):
-                cooperate()
-                length = min(block_size, max(lengths) - offset)
-                f, following = current_and_next(offset, length)
-                valid = f["sv"] & f["lv"] & following["lv"] & f["target"]
-                with torch.set_grad_enabled(training):
-                    hidden, direct = model.teacher_block(f, direct, False)
-                    reference_hidden, closed = model.teacher_block(f, closed, True)
-                    now, future = teacher.losses(hidden, f, following)
-                    rn, rf = teacher.losses(reference_hidden, f, following)
-                    channel_loss = ((now + future + rn + rf) * .25 * valid).sum(1) / denominator.clamp(min=1)
-                    loss = (channel_loss.sum(-1) / (denominator > 0).sum(-1).clamp(min=1)).mean()
-                    if not torch.isfinite(loss):
-                        raise FloatingPointError("Non-finite normal state-teacher loss.")
-                    if training and valid.any():
-                        loss.backward()
-                        has_grad = True
-                direct, closed = direct.detach(), closed.detach()
-                accumulated += float(loss.detach())
-                completed += 1
-                progress.update(completed)
-            if training and has_grad:
-                torch.nn.utils.clip_grad_norm_(teacher.parameters(), 1)
-                optimizer.step()
-                teacher.cell.project()
-            total += accumulated * len(batch)
-        return total / len(sequences)
+            packed = normal.schema.pack([record] * len(batch), starts, max(lengths) + 1)
+            return batch, starts, lengths, packed, teacher_scoring_mask(packed, w)
+        with ordered_prefetch(prepare, range(0, len(sequences), settings["batch_sequences"]),
+                              depth=prefetch_depth(cfg)) as pending:
+            for batch, starts, lengths, packed, scoring in pending:
+                features = BatchFeatures(model, [record] * len(batch), None, None, max(lengths) + 1, cfg, starts=starts, packed=packed)
+                def current_and_next(offset, length):
+                    full = features.block(offset, length + 1)
+                    f = {key: value[:, :-1] for key, value in full.items()}
+                    following = {key: value[:, 1:] for key, value in full.items()}
+                    if offset == 0:
+                        f["sv"][:, 0] = False
+                    f["target"] &= (torch.arange(offset, offset + length, device=f["v"].device)[None, :, None] >= w)
+                    return f, following
+                direct, closed = None, None
+                if training:
+                    optimizer.zero_grad(set_to_none=True)
+                accumulated, has_grad = total.new_zeros(()), False
+                # Fixed per-sequence/channel denominators avoid block-size dependent targets.
+                denominator = torch.as_tensor(scoring.sum(1), device=normal.schema.amp_mean.device, dtype=torch.float32)
+                for offset in range(0, max(lengths), block_size):
+                    cooperate()
+                    length = min(block_size, max(lengths) - offset)
+                    f, following = current_and_next(offset, length)
+                    valid = f["sv"] & f["lv"] & following["lv"] & f["target"]
+                    with torch.set_grad_enabled(training):
+                        hidden, direct = model.teacher_block(f, direct, False)
+                        reference_hidden, closed = model.teacher_block(f, closed, True)
+                        now, future = teacher.losses(hidden, f, following)
+                        rn, rf = teacher.losses(reference_hidden, f, following)
+                        channel_loss = ((now + future + rn + rf) * .25 * valid).sum(1) / denominator.clamp(min=1)
+                        loss = (channel_loss.sum(-1) / (denominator > 0).sum(-1).clamp(min=1)).mean()
+                        if training and scoring[:, offset:offset + length].any():
+                            loss.backward()
+                            has_grad = True
+                    direct, closed = direct.detach(), closed.detach()
+                    accumulated += loss.detach().double()
+                    completed += 1
+                    progress.update(completed)
+                # One synchronization per task batch. No optimizer update occurs
+                # before all of its blocks have passed this finite-loss check.
+                if not torch.isfinite(accumulated):
+                    raise FloatingPointError("Non-finite normal state-teacher loss.")
+                if training and has_grad:
+                    torch.nn.utils.clip_grad_norm_(teacher.parameters(), 1)
+                    optimizer.step()
+                    teacher.cell.project()
+                total += accumulated * len(batch)
+        return float(total / len(sequences))
     @torch.no_grad()
     def validate():
         """One chronological selection replay, without resetting at compute blocks."""
@@ -291,20 +295,25 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
         counts = torch.zeros_like(sums)
         total = (len(selection.z) - 1 + block_size - 1) // block_size
         progress = Progress("teacher validation blocks", total, cfg["runtime"].get("log_interval_seconds", 30))
-        for start in range(0, len(selection.z) - 1, block_size):
-            cooperate()
+        # Include the following descriptor in each CPU input block; overlapping
+        # descriptors do not reset either recurrent trajectory.
+        def prepare(start):
             length = min(block_size, len(selection.z) - start - 1)
-            full = normal.schema.block([selection], [start], length + 1)
-            f = {key: value[:, :-1] for key, value in full.items()}
-            following = {key: value[:, 1:] for key, value in full.items()}
-            hidden, direct = model.teacher_block(f, direct)
-            reference, closed = model.teacher_block(f, closed, True)
-            now, future = teacher.losses(hidden, f, following)
-            rn, rf = teacher.losses(reference, f, following)
-            valid = f["sv"] & f["lv"] & following["lv"] & f["target"]
-            sums += ((now + future + rn + rf) * .25 * valid).double().sum((0, 1))
-            counts += valid.sum((0, 1))
-            progress.update(start // block_size + 1)
+            return start, length, normal.schema.pack([selection], [start], length + 1)
+        with ordered_prefetch(prepare, range(0, len(selection.z) - 1, block_size), depth=prefetch_depth(cfg)) as pending:
+            for start, length, packed in pending:
+                cooperate()
+                full = normal.schema.from_packed(packed)
+                f = {key: value[:, :-1] for key, value in full.items()}
+                following = {key: value[:, 1:] for key, value in full.items()}
+                hidden, direct = model.teacher_block(f, direct)
+                reference, closed = model.teacher_block(f, closed, True)
+                now, future = teacher.losses(hidden, f, following)
+                rn, rf = teacher.losses(reference, f, following)
+                valid = f["sv"] & f["lv"] & following["lv"] & f["target"]
+                sums += ((now + future + rn + rf) * .25 * valid).double().sum((0, 1))
+                counts += valid.sum((0, 1))
+                progress.update(start // block_size + 1)
         if not (counts > 0).any():
             raise ValueError("Normal selection has no usable state-teacher targets.")
         loss = (sums[counts > 0] / counts[counts > 0]).mean()
@@ -342,8 +351,7 @@ def fit_energy_scales(model, fit, cfg):
     length = cfg["stage2"]["block_length"]
     progress = Progress("energy calibration blocks", (len(fit.z) + length - 1) // length,
                         cfg["runtime"].get("log_interval_seconds", 30))
-    for start in range(0, len(fit.z), length):
-        f = normal.schema.block([fit], [start], min(length, len(fit.z) - start))
+    for start, _, f in feature_blocks(normal.schema, [fit], [0], len(fit.z), length, cfg):
         values = model.frozen_block(f, state)
         state = values["final_normal"]
         lavail = values["long_available"]
@@ -408,31 +416,56 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
             source_ready._mmap.close()
         write_json(marker, dict(key=key, shape=shape))
     source_error, source_ready = np.load(error_path, mmap_mode="r"), np.load(ready_path, mmap_mode="r")
+    active = normal.memory.m_active.any(-1).cpu().numpy()
+    cycle = 2 * len([f for f in settings["families"] if source.z.shape[1] > 1 or f != "relation"])
+
+    def generate(index):
+        # All random draws are local to the task identity. Worker scheduling
+        # cannot change another task, its family/layout, or the cache order.
+        for retry in range(64):
+            generation_index = index + retry * cycle
+            pair = generate_reference_pair(source, donor, normal.predictor.window, generation_index, seed,
+                settings["families"], policy, hard, settings["hard_negative_fraction"],
+                settings["donor_candidates"], settings["boundary_blend"], relation_matcher=matcher)
+            pair.recipe["index"] = index
+            if retry:
+                pair.recipe["final_observability_retry"] = retry
+                pair.recipe["generation_index"] = generation_index
+            if relation_tasks is not None:
+                pair = relation_tasks.apply(pair, seed)
+            try:
+                validate_pair_observability(pair, active)
+            except TaskGenerationError:
+                continue
+            return pair
+        raise TaskGenerationError(f"Cannot prepare a scorable task after 64 final checks: split={split}, index={index}, seed={seed}.")
+
     try:
         group_size = max(1, int(cfg["runtime"].get("preparation_batch_pairs", 8)))
-        for first in range(len(cache), count, group_size):
-            pending = []
-            for index in range(first, min(first + group_size, count)):
-                pair = generate_reference_pair(source, donor, normal.predictor.window, index, seed,
-                    settings["families"], policy, hard, settings["hard_negative_fraction"],
-                    settings["donor_candidates"], settings["boundary_blend"], relation_matcher=matcher)
-                if relation_tasks is not None:
-                    pair = relation_tasks.apply(pair, seed)
-                begin, end = pair.recipe["source_start"], pair.recipe["source_stop"]
-                clean_error, clean_ready = source_error[begin:end].copy(), source_ready[begin:end].copy()
-                clean_error[:normal.predictor.window] = 0
-                clean_ready[:normal.predictor.window] = False
-                corrupt_error, corrupt_ready, reused = forecast_errors(pair.corrupt, normal,
-                    cfg["runtime"]["feature_batch_size"], pair.clean, clean_error, clean_ready)
-                pair.recipe["forecast_rows_reused"] = reused
-                pair.recipe["generator"] = settings["relation_generator"]
-                pending.append((pair, (clean_error, corrupt_error), (clean_ready, corrupt_ready)))
-            records = [p[0].clean for p in pending] + [p[0].corrupt for p in pending]
-            routes = model.routing_many(records, settings["block_length"])
-            for record, routing in zip(records, routes):
-                record.routing = routing
-            for pair, error, valid in pending:
-                cache.append(pair, error, valid)
+        workers = preparation_workers(cfg)
+        with ordered_prefetch(generate, range(len(cache), count), workers=workers,
+                              depth=2 * group_size if workers else 0) as generated:
+            while True:
+                pairs = list(islice(generated, group_size))
+                if not pairs:
+                    break
+                pending = []
+                for pair in pairs:
+                    begin, end = pair.recipe["source_start"], pair.recipe["source_stop"]
+                    clean_error, clean_ready = source_error[begin:end].copy(), source_ready[begin:end].copy()
+                    clean_error[:normal.predictor.window] = 0
+                    clean_ready[:normal.predictor.window] = False
+                    corrupt_error, corrupt_ready, reused = forecast_errors(pair.corrupt, normal,
+                        cfg["runtime"]["feature_batch_size"], pair.clean, clean_error, clean_ready)
+                    pair.recipe["forecast_rows_reused"] = reused
+                    pair.recipe["generator"] = settings["relation_generator"]
+                    pending.append((pair, (clean_error, corrupt_error), (clean_ready, corrupt_ready)))
+                records = [p[0].clean for p in pending] + [p[0].corrupt for p in pending]
+                routes = model.routing_many(records, settings["block_length"])
+                for record, routing in zip(records, routes):
+                    record.routing = routing
+                for pair, error, valid in pending:
+                    cache.append(pair, error, valid)
     finally:
         source_error._mmap.close()
         source_ready._mmap.close()

@@ -12,13 +12,19 @@ sys.path.insert(0, str(ROOT))
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs/psm.yaml")
+    parser.add_argument("--channels", type=int, default=3)
+    parser.add_argument("--discrete-channels", type=int, default=1)
+    parser.add_argument("--pairs", type=int, default=8, help="Eight tasks cover both layouts of all four families")
     device = parser.add_mutually_exclusive_group()
     device.add_argument("--device", default=None, help="cpu or a logical CUDA device")
     device.add_argument("--gpu", type=int, help="Physical GPU index")
     parser.add_argument("--output", help="Keep smoke artifacts in this directory; default uses a temporary directory")
     args = parser.parse_args()
+    if args.channels < 2 or not 0 <= args.discrete_channels < args.channels or args.pairs < 1:
+        parser.error("Use at least two channels with at least one continuous channel.")
     from asei.config import load_config, configure_cuda
-    cfg = load_config(ROOT / "configs" / "psm.yaml")
+    cfg = load_config(args.config)
     configure_cuda(cfg, gpu=args.gpu, device=args.device or (None if args.gpu is not None else "cpu"))
     # Configure visibility before importing modules that import PyTorch.
     import numpy as np
@@ -36,7 +42,15 @@ def main():
         states = (t // 13) % 2
         labels = ((t >= 630) & (t < 680)).astype(int)
         a[labels > 0] += 1.5
-        frame = pd.DataFrame(dict(sensor_a=a, sensor_b=b, actuator=states, label=labels))
+        numeric = args.channels - args.discrete_channels
+        columns = {"sensor_a": a}
+        if numeric >= 2:
+            columns["sensor_b"] = b
+        for channel in range(2, numeric):
+            columns[f"sensor_{channel}"] = .5 * np.roll(a, channel) + rng.normal(0, .1, len(t))
+        for channel in range(args.discrete_channels):
+            columns[f"actuator_{channel}"] = states if channel == 0 else (t // (13 + channel)) % 3
+        frame = pd.DataFrame(dict(**columns, label=labels))
         path = directory / "smoke.csv"
         frame.to_csv(path, index=False)
         cfg["runtime"].update(output=str(directory / "outputs"), keep_intermediates=True, seeds=[42])
@@ -45,9 +59,9 @@ def main():
         cfg["stage1"].update(epochs=1, patience=1, batch_size=8, max_train_points=16, max_validation_points=16)
         cfg["teacher"].update(epochs=1, patience=1, train_sequences=1,
                                batch_sequences=1, sequence_length=16, block_length=16)
-        cfg["stage2"].update(epochs=1, patience=1, train_pairs=4, validation_pairs=4, batch_pairs=2, block_length=32)
+        cfg["stage2"].update(epochs=1, patience=1, train_pairs=args.pairs, validation_pairs=args.pairs, batch_pairs=2, block_length=32)
         cfg["evaluation"].update(skip_vus=True)
-        destination = run_entity(Entity("SMD", "smoke", path, 600), cfg, 42, diagnostics=True)
+        destination = run_entity(Entity(cfg["data"]["datasets"][0], "smoke", path, 600), cfg, 42, diagnostics=True)
         stream, names = load_bundle(destination / "bundle.pt", cfg["runtime"]["device"])
         output = stream.push_many(frame[names].to_numpy()[600:])
         with np.load(destination / "predictions.npz") as saved:

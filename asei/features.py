@@ -66,9 +66,8 @@ class DescriptorSchema(nn.Module):
         matches = (values[..., None] == self.vocabulary) & self.known
         return matches.long().argmax(-1)
 
-    def block(self, records, starts, length, errors=None, ready=None, device=None):
-        """Build [B,T,C,...] features; negative indices are padding, never wraparound."""
-        device = self.amp_mean.device if device is None else device
+    def pack(self, records, starts, length, errors=None, ready=None):
+        """CPU-only input preparation, safe to prefetch for independent blocks."""
         values, masks, error_arrays, ready_arrays, target_masks = [], [], [], [], []
         for k, (record, start) in enumerate(zip(records, starts)):
             index = np.arange(start - 31, start + length)
@@ -81,8 +80,25 @@ class DescriptorSchema(nn.Module):
             clipped_target = target_index.clip(0, len(record.z) - 1)
             error_arrays.append(np.zeros((length, self.channels, 2), np.float32) if errors is None else errors[k][clipped_target])
             ready_arrays.append(np.zeros((length, self.channels, 2), bool) if ready is None else ready[k][clipped_target] & inside[31:, None, None])
-        z = torch.as_tensor(np.stack(values), device=device, dtype=torch.float32)
-        observed = torch.as_tensor(np.stack(masks), device=device)
+        result = dict(z=np.stack(values), mask=np.stack(masks),
+                      target=np.stack(target_masks)[..., None],
+                      forecast=np.stack(error_arrays), forecast_ready=np.stack(ready_arrays))
+        if all(record.routing is not None for record in records):
+            for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
+                rows = []
+                for record, start in zip(records, starts):
+                    index = np.arange(start, start + length).clip(0, len(record.z) - 1)
+                    rows.append(record.routing[name][index])
+                result[name] = np.stack(rows)
+        return result
+
+    def from_packed(self, packed, start=0, length=None, device=None):
+        """GPU descriptor math stays on its owning thread and stream."""
+        device = self.amp_mean.device if device is None else device
+        length = packed["target"].shape[1] - start if length is None else length
+        stop = start + length
+        z = torch.as_tensor(packed["z"][:, start:stop + 31], device=device, dtype=torch.float32)
+        observed = torch.as_tensor(packed["mask"][:, start:stop + 31], device=device)
         segments = z.unfold(1, 32, 1)  # [B,T,C,32] is a view.
         complete = observed.unfold(1, 32, 1).all(-1)
         mean8, mean32 = segments[..., -8:].mean(-1), segments.mean(-1)
@@ -95,21 +111,21 @@ class DescriptorSchema(nn.Module):
         chi = torch.where(self.categorical[None, None, :, None], torch.zeros_like(chi), chi)
         symbols = self.ids(z).unfold(1, 32, 1)
         short_valid = observed[:, 31:] & observed[:, 30:-1]
-        target = torch.as_tensor(np.stack(target_masks), device=device)[..., None]
+        target = torch.as_tensor(packed["target"][:, start:stop], device=device)
         result = dict(chi=chi, v=amp[..., :2].masked_fill(self.categorical[None, None, :, None], 0),
                     tokens=symbols, pair=symbols[..., -2:], sv=short_valid, lv=complete,
                     target=target, observed=observed[:, 31:],
-                    forecast=torch.as_tensor(np.stack(error_arrays), device=device),
-                    forecast_ready=torch.as_tensor(np.stack(ready_arrays), device=device))
-        if all(record.routing is not None for record in records):
+                    forecast=torch.as_tensor(packed["forecast"][:, start:stop], device=device),
+                    forecast_ready=torch.as_tensor(packed["forecast_ready"][:, start:stop], device=device))
+        if "reference_index" in packed:
             for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
-                rows = []
-                for record, start in zip(records, starts):
-                    index = np.arange(start, start + length).clip(0, len(record.z) - 1)
-                    rows.append(record.routing[name][index])
                 dtype = torch.float32 if name in {"short_marginal", "peer_cost"} else torch.long
-                result[name] = torch.as_tensor(np.stack(rows), device=device, dtype=dtype)
+                result[name] = torch.as_tensor(packed[name][:, start:stop], device=device, dtype=dtype)
         return result
+
+    def block(self, records, starts, length, errors=None, ready=None, device=None):
+        """Build [B,T,C,...] features; negative indices are padding, never wraparound."""
+        return self.from_packed(self.pack(records, starts, length, errors, ready), device=device)
 
     def cluster_features(self, f, channel=None):
         """No ordinal distances for state symbols, including dictionary construction."""

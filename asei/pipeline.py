@@ -28,6 +28,7 @@ from .training import (_save, fit_forecaster, fit_teacher, fit_energy_scales,
                        build_pairs, seed_everything)
 from .detection_training import fit_detector
 from .progress import Progress, log
+from .batching import feature_blocks
 
 
 def get_device(name):
@@ -59,15 +60,15 @@ def score_raw(model, record, cfg, start=0, state=None, diagnostics=False):
     block = 1 if cfg["runtime"].get("detector_execution") == "step" else cfg["stage2"]["block_length"]
     outputs = {}
     progress = Progress("scoring blocks", (len(record.z) - start + block - 1) // block, interval) if len(record.z) - start > block else None
-    for begin in range(start, len(record.z), block):
+    for offset, length, features in feature_blocks(model.normal.schema, [record], [start],
+            len(record.z) - start, block, cfg, [errors], [ready]):
         cooperate()
-        features = model.normal.schema.block([record], [begin], min(block, len(record.z) - begin), [errors], [ready])
         values, state = model.forward_block(features, state, return_aux=diagnostics)
         for key, value in values.items():
             if not diagnostics or key not in {"normal", "observed", "reference_pair"}:
                 outputs.setdefault(key, []).append(value[0].cpu().numpy())
         if progress:
-            progress.update((begin - start) // block + 1)
+            progress.update(offset // block + 1)
     if not outputs:
         raise ValueError("No time points to score.")
     return {key: np.concatenate(value) for key, value in outputs.items()}, state.detach()

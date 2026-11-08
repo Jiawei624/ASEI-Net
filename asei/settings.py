@@ -35,6 +35,7 @@ def defaults(cfg):
         "runtime": dict(device="auto", output="outputs", log_dir="logs", feature_batch_size=64,
                         threads=4, interop_threads=1, cpu_cores=8, cpu_max_percent=80,
                         seeds=[41, 42, 43, 44, 45], keep_intermediates=False,
+                        preparation_workers=2, prefetch_batches=2,
                         task_cache_memory_mb=256, log_interval_seconds=30, detector_execution="block"),
     }
     for section, values in sections.items():
@@ -116,6 +117,10 @@ def resolve(cfg, n_train, channels):
         if patience and (not 0 < options.get("lr_factor", .5) < 1 or not 0 < options.get("min_lr", 1e-5) <= options["lr"]):
             raise ValueError("Invalid learning-rate scheduler settings in " + section)
     runtime = cfg["runtime"]
+    for key in ("preparation_workers", "prefetch_batches"):
+        value = runtime[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError("runtime." + key + " must be a nonnegative integer.")
     for key, default in (("preparation_batch_pairs", 8), ("batch_working_memory_mb", 2048)):
         value = runtime.get(key, default)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < (1 if key == "preparation_batch_pairs" else 0):

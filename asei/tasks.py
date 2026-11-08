@@ -14,6 +14,31 @@ class TaskGenerationError(ValueError):
     """A sampled task layout could not produce an observed change."""
 
 
+def validate_pair_observability(pair, active=None, tolerance=1e-6):
+    """Validate the final stored observations, after every intervention and fill.
+
+    A nonzero floating-point proposal is insufficient: blending and assignment
+    into float32 may erase it. Never hide such a task by dropping its positives.
+    """
+    clean, corrupt = pair.clean, pair.corrupt
+    previous = np.roll(corrupt.mask, 1, axis=0)
+    previous[0] = False
+    valid = corrupt.mask & previous
+    valid &= (np.arange(len(pair.labels)) >= corrupt.target_start)[:, None]
+    if active is not None:
+        valid &= active
+    changed = clean.mask & corrupt.mask & (np.abs(corrupt.z.astype(np.float64) - clean.z) > tolerance)
+    events = event_ranges(pair.labels)
+    if not events:
+        raise TaskGenerationError("Task has no injected event.")
+    for start, stop in events:
+        observed = np.maximum.accumulate(changed[start:stop], axis=0) & valid[start:stop]
+        if not observed.any():
+            raise TaskGenerationError(
+                f"Task index={pair.recipe.get('index')} family={pair.recipe.get('family')} "
+                f"event=[{start},{stop}) has no observable, scorable change after final storage.")
+
+
 def event_ranges(labels):
     values = np.asarray(labels, dtype=bool)
     edges = np.diff(np.pad(values.astype(np.int8), (1, 1)))
@@ -416,6 +441,10 @@ def generate_reference_pair(source, donor, window, index, seed, families, policy
             corrupt[t] = last
         pair.corrupt = Record(corrupt, pair.corrupt.mask, window)
         pair.recipe.update(index=index, base_index=base_index, support_retry=retry, task_protocol=REFERENCE_TASK_PROTOCOL)
+        try:
+            validate_pair_observability(pair)
+        except TaskGenerationError:
+            continue
         return pair
     raise TaskGenerationError(f"Cannot construct a support-preserving task (seed={seed}, index={index}).")
 
@@ -523,7 +552,16 @@ class ResidualLagTasks:
                 if blend:
                     strength[:blend] = np.arange(1, blend + 1) / (blend + 1)
                     strength[-blend:] = strength[:blend][::-1]
-                values[start:stop, i] = pair.clean.z[start:stop, i] + strength * delta
+                # Test the exact values that will be stored, rather than the raw
+                # delta. A short blended event or float32 rounding can erase an
+                # otherwise nonzero proposal; keep its valid matched donor then.
+                proposed = (pair.clean.z[start:stop, i] + strength * delta).astype(values.dtype)
+                observed = pair.clean.mask[start:stop, i] & pair.corrupt.mask[start:stop, i]
+                changed = np.abs(proposed.astype(np.float64) - pair.clean.z[start:stop, i]) > 1e-6
+                if not (changed & observed).any():
+                    fallbacks.append(dict(channel=i, reason="lag_intervention_has_no_observable_effect_after_storage"))
+                    continue
+                values[start:stop, i] = proposed
                 interventions.append(dict(channel=i, source=j, coefficient=beta, added_lag=lag,
                                           delta_rms=float(np.sqrt(np.mean(np.square(strength * delta))))))
             event["residual_lag_interventions"] = interventions

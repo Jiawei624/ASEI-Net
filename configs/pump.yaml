@@ -154,6 +154,8 @@ runtime:
   task_cache_memory_mb: 256
   detector_execution: block
   preparation_batch_pairs: 8
+  preparation_workers: 2
+  prefetch_batches: 2
   batch_working_memory_mb: 2048
   save_predictions: true
 reports:

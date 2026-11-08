@@ -155,6 +155,8 @@ runtime:
   detector_execution: block
   save_predictions: true
   preparation_batch_pairs: 8
+  preparation_workers: 2
+  prefetch_batches: 2
   batch_working_memory_mb: 2048
 reports:
   inventory: data_inventory.csv
