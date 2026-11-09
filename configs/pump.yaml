@@ -53,10 +53,10 @@ stage2:
   variant: full
   epochs: 28
   patience: 5
-  batch_pairs: 16
-  lr: 0.0002
+  batch_pairs: 32
+  lr: 0.00015
   block_length: 256
-  train_pairs: 1024
+  train_pairs: 2048
   validation_pairs: 256
   families:
   - level
@@ -71,14 +71,14 @@ stage2:
   reference_trim: 0.1
   reference_prior: 0.25
   lambda_state: 0.1
-  lambda_tail: 0.1
+  lambda_tail: 0.2
   tail_fraction: 0.01
   tail_margin: 0.5
   hard_negative_fraction: 0.5
   discrete_max_values: 16
   donor_candidates: 16
   boundary_blend: 4
-  weight_decay: 0.0001
+  weight_decay: 0.0003
   lr_patience: 2
   lr_factor: 0.5
   min_lr: 1.0e-05
