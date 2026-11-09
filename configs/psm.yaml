@@ -53,10 +53,10 @@ stage2:
   variant: full
   epochs: 24
   patience: 6
-  batch_pairs: 16
-  lr: 0.00015
+  batch_pairs: 32
+  lr: 0.0001
   block_length: 256
-  train_pairs: 1024
+  train_pairs: 2048
   validation_pairs: 256
   families:
   - level
@@ -71,10 +71,10 @@ stage2:
   reference_trim: 0.1
   reference_prior: 0.25
   lambda_state: 0.1
-  lambda_tail: 0.05
+  lambda_tail: 0.1
   tail_fraction: 0.01
   tail_margin: 0.5
-  hard_negative_fraction: 0.25
+  hard_negative_fraction: 0.5
   discrete_max_values: 16
   donor_candidates: 16
   boundary_blend: 4
@@ -86,8 +86,8 @@ stage2:
   channel_embedding_dim: 8
   evidence_hidden: 64
   readout_hidden: 32
-  lambda_channel: 0.1
-  onset_fraction: 0.25
+  lambda_channel: 0.5
+  onset_fraction: 0.5
   reference_guard_multiplier: 3.0
 calibration:
   method: parallel_normal

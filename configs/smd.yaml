@@ -52,11 +52,11 @@ stage2:
   optimizer_update: task_batch
   variant: full
   epochs: 20
-  patience: 4
-  batch_pairs: 16
-  lr: 0.00005
+  patience: 5
+  batch_pairs: 32
+  lr: 0.000075
   block_length: 256
-  train_pairs: 1536
+  train_pairs: 2048
   validation_pairs: 256
   families:
   - level
@@ -74,16 +74,16 @@ stage2:
   lambda_tail: 0.1
   tail_fraction: 0.01
   tail_margin: 0.5
-  hard_negative_fraction: 0.5
+  hard_negative_fraction: 0.25
   discrete_max_values: 16
   donor_candidates: 16
   boundary_blend: 4
-  evidence_transform: signed_log1p
-  channel_embedding_dim: 4
-  evidence_hidden: 48
-  readout_hidden: 16
-  lambda_channel: 0.1
-  onset_fraction: 0.25
+  evidence_transform: identity
+  channel_embedding_dim: 0
+  evidence_hidden: 64
+  readout_hidden: 32
+  lambda_channel: 0.0
+  onset_fraction: 0.5
   reference_guard_multiplier: 3.0
   weight_decay: 0.001
   lr_patience: 1
@@ -92,8 +92,8 @@ stage2:
 calibration:
   method: parallel_normal
   weights:
-  - 0.5
-  - 0.5
+  - 0.25
+  - 0.75
   alphas:
   - 0.001
   - 0.005
