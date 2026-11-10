@@ -84,7 +84,7 @@ class DescriptorSchema(nn.Module):
                       target=np.stack(target_masks)[..., None],
                       forecast=np.stack(error_arrays), forecast_ready=np.stack(ready_arrays))
         if all(record.routing is not None for record in records):
-            for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
+            for name in ("reference_index", "m_index", "j_index", "short_index", "short_marginal", "peer_cost"):
                 rows = []
                 for record, start in zip(records, starts):
                     index = np.arange(start, start + length).clip(0, len(record.z) - 1)
@@ -118,7 +118,7 @@ class DescriptorSchema(nn.Module):
                     forecast=torch.as_tensor(packed["forecast"][:, start:stop], device=device),
                     forecast_ready=torch.as_tensor(packed["forecast_ready"][:, start:stop], device=device))
         if "reference_index" in packed:
-            for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
+            for name in ("reference_index", "m_index", "j_index", "short_index", "short_marginal", "peer_cost"):
                 dtype = torch.float32 if name in {"short_marginal", "peer_cost"} else torch.long
                 result[name] = torch.as_tensor(packed[name][:, start:stop], device=device, dtype=dtype)
         return result

@@ -71,6 +71,19 @@ stage2:
   reference_trim: 0.1
   reference_prior: 0.25
   lambda_state: 0.1
+  local_scaling: true
+  local_scale_prior: 32.0
+  local_scale_clip: 10.0
+  local_scale_min: 0.5
+  local_scale_max: 3.0
+  lambda_pair: 0.25
+  pair_margin: 0.5
+  selection_metric: normal_constrained
+  selection_normal_points: 16384
+  selection_reference_fraction: 0.5
+  selection_fpr_limit: 0.02
+  selection_fpr_tolerance: 0.002
+  selection_coverage_weight: 0.2
   lambda_tail: 0.1
   tail_fraction: 0.01
   tail_margin: 0.5
@@ -86,8 +99,8 @@ stage2:
   channel_embedding_dim: 8
   evidence_hidden: 64
   readout_hidden: 32
-  lambda_channel: 0.5
-  onset_fraction: 0.5
+  lambda_channel: 0.2
+  onset_fraction: 0.35
   reference_guard_multiplier: 3.0
 calibration:
   method: parallel_normal

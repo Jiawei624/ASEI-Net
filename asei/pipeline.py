@@ -229,6 +229,24 @@ def _evaluate(raw, labels, calibration, cfg):
     return metrics, output, np.stack(alarms)
 
 
+def _score_diagnostics(raw, labels, calibration, output, channels):
+    """Explain tail ties and alarm attribution without changing evaluation scores."""
+    result = {}
+    normal, anomaly = np.asarray(labels) == 0, np.asarray(labels) == 1
+    for branch, reference, weight in zip(("short", "dynamic"), calibration.references, calibration.weights):
+        valid = raw[branch + "_valid"]
+        beyond = valid & (raw[branch] > reference[-1]) if len(reference) else np.zeros_like(valid)
+        alarm = valid & (output["p_" + branch] <= calibration.alpha * weight)
+        attribution = raw["attribution_" + branch]
+        result[branch] = dict(
+            normal_exceed_reference_max=float(beyond[normal & valid].mean()) if (normal & valid).any() else None,
+            anomaly_exceed_reference_max=float(beyond[anomaly & valid].mean()) if (anomaly & valid).any() else None,
+            normal_alarm_counts_by_channel=np.bincount(attribution[normal & alarm], minlength=channels).tolist())
+    scores = output["scores"][output["valid"]]
+    result["fused_tied_fraction"] = float(1 - len(np.unique(scores)) / len(scores)) if len(scores) else None
+    return result
+
+
 def run_entity(entity, config, seed, stage="all", diagnostics=False):
     cfg = resolve_paths(copy.deepcopy(config))
     if diagnostics:
@@ -299,13 +317,17 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
                 raise ValueError("Energy-scale identity differs; use a new run.")
             normal.memory.energy_scale.copy_(scales["value"])
             normal.memory.reference_limit.copy_(scales["reference_limit"])
+            normal.memory.local_energy_scale.copy_(scales["local_energy_scale"])
+            normal.memory.local_energy_count.copy_(scales["local_energy_count"])
             experiment["energy_scales"] = scales["statistics"]
         else:
             start = time.perf_counter()
             experiment["energy_scales"] = fit_energy_scales(model, fit, cfg)
             experiment["timings"]["energy_scale_seconds"] = time.perf_counter() - start
             _save(scale_path, dict(key=detector_key, value=normal.memory.energy_scale.cpu(),
-                reference_limit=normal.memory.reference_limit.cpu(), statistics=experiment["energy_scales"]))
+                reference_limit=normal.memory.reference_limit.cpu(),
+                local_energy_scale=normal.memory.local_energy_scale.cpu(), local_energy_count=normal.memory.local_energy_count.cpu(),
+                statistics=experiment["energy_scales"]))
         seed_everything(seed + 10000)
         model = DualTrajectoryDetector(normal, cfg["stage2"]).to(device)
         if not detector_complete or stage == "cache":
@@ -320,7 +342,8 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
                 if stage == "cache":
                     return directory
                 start = time.perf_counter()
-                experiment["histories"]["detector"] = fit_detector(model, train_cache, valid_cache, cfg, detector_dir, detector_key, seed)
+                experiment["histories"]["detector"] = fit_detector(model, train_cache, valid_cache, cfg, detector_dir, detector_key, seed,
+                    normal_selection=selection)
                 experiment["timings"]["detector_seconds"] = time.perf_counter() - start
             finally:
                 if train_cache is not None:
@@ -380,11 +403,18 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
         calibration={**experiment["calibration_scope"], "method": "parallel_normal", "alpha": calibration.alpha},
         metrics=metrics, config=cfg, provenance=provenance, timing=experiment["timings"],
         normal_replay_diagnostics=experiment["normal_replay_diagnostics"],
+        normal_energy_scales=experiment.get("energy_scales", {}),
+        score_diagnostics=_score_diagnostics(raw, labels, calibration, output, len(provenance["channels"])),
         model_analysis=dict(contraction_bound=model.normal.teacher.cell.contraction,
             hidden_spectral_norm=float(torch.linalg.svdvals(model.normal.teacher.cell.hidden.weight)[0].cpu()),
             parameters=sum(p.numel() for p in model.parameters()),
             trainable_detector_parameters=sum(p.numel() for name, p in model.named_parameters() if not name.startswith("normal."))),
         environment=dict(torch=str(torch.__version__), numpy=np.__version__, device=str(device)))
+    history = experiment.get("histories", {}).get("detector", [])
+    if history:
+        best = min(history, key=lambda entry: entry["selection"].get("objective", entry["selection"]["loss"]))
+        result["detector_selection"] = dict(metric=cfg["stage2"]["selection_metric"], best_epoch=best["epoch"],
+            statistics=best["selection"])
     # Keep TAB thresholds visibly separate from the operational normal-only protocol.
     ratios = cfg["calibration"].get("offline_anomaly_ratios")
     if ratios:

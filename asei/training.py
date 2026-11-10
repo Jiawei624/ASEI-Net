@@ -373,7 +373,43 @@ def fit_energy_scales(model, fit, cfg):
         std = (support_square / support_count.clamp(min=1) - mean.square()).clamp(min=0).sqrt()
         limit = (mean + multiplier * std).clamp(min=1e-3)
         normal.memory.reference_limit.copy_(torch.where(support_count > 0, limit, torch.full_like(limit, float("inf"))).float())
+    memory = normal.memory
+    memory.local_energy_scale.copy_(memory.energy_scale[..., None].expand_as(memory.local_energy_scale))
+    memory.local_energy_count.zero_()
+    local_statistics = dict(enabled=bool(cfg["stage2"].get("local_scaling", False)))
+    if local_statistics["enabled"]:
+        # A second normal-only replay uses the fitted support guard. Each radius
+        # describes the exact retrieval rule used at inference, including fallback.
+        local_sum = torch.zeros_like(memory.local_energy_scale, dtype=torch.float64)
+        prior = cfg["stage2"]["local_scale_prior"]
+        clip = cfg["stage2"]["local_scale_clip"]
+        global_scale = memory.energy_scale.double()[..., None]
+        state = model.initial_state(1).normal
+        for _, _, f in feature_blocks(normal.schema, [fit], [0], len(fit.z), length, cfg):
+            values = model.frozen_block(f, state)
+            state = values["final_normal"]
+            distance = torch.stack([values["short_distance"], values["long_distance"]], -2)
+            available = torch.stack([values["short_available"], values["long_available"]], -2)
+            # [B,T,C,span,source] -> [C,span,source,B*T]. Symbolic
+            # channels accumulate mismatch rates, never distances between IDs.
+            index = values["energy_indices"].permute(2, 3, 4, 0, 1).reshape(*memory.energy_scale.shape, -1)
+            valid = available.permute(2, 3, 4, 0, 1).reshape_as(index)
+            distance = distance.permute(2, 3, 4, 0, 1).reshape_as(index).double()
+            clipped = torch.minimum(distance, clip * global_scale).masked_fill(~valid, 0)
+            local_sum.scatter_add_(-1, index, clipped)
+            memory.local_energy_count.scatter_add_(-1, index, valid.long())
+        radius = (local_sum + prior * global_scale) / (memory.local_energy_count + prior)
+        ratio = (radius / global_scale).clamp(cfg["stage2"]["local_scale_min"], cfg["stage2"]["local_scale_max"])
+        memory.local_energy_scale.copy_((ratio * global_scale).float())
+        occupied = memory.local_energy_count > 0
+        used = ratio[occupied]
+        local_statistics.update(method="clipped_mean_with_global_pseudocount", prior_count=prior,
+            clip_ratio=clip, min_ratio=cfg["stage2"]["local_scale_min"], max_ratio=cfg["stage2"]["local_scale_max"],
+            occupied_groups=int(occupied.sum()), samples=int(memory.local_energy_count.sum()),
+            scale_ratio_quantiles=torch.quantile(used, used.new_tensor([0., .1, .5, .9, 1.])).cpu().tolist() if len(used) else [],
+            occupied_groups_by_channel=occupied.sum((1, 2, 3)).cpu().tolist())
     return dict(counts=counts.cpu().tolist(), scales=normal.memory.energy_scale.cpu().tolist(),
+                local_scaling=local_statistics,
                 reference_support_counts=support_count.cpu().tolist(),
                 reference_limits=[float(v) if torch.isfinite(v) else None for v in normal.memory.reference_limit.cpu()])
 

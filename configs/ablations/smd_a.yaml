@@ -1,0 +1,5 @@
+base: ../smd.yaml
+stage2:
+  local_scaling: true
+  lambda_pair: 0
+  selection_metric: loss

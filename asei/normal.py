@@ -175,7 +175,26 @@ class NormalMemory(nn.Module):
         self.register_buffer("j_active", torch.zeros(kj, dtype=torch.bool))
         self.register_buffer("peer_scale", torch.ones(c))
         self.register_buffer("energy_scale", torch.ones(c, 2, 2))  # short/long, marginal/joint
+        # Marginal indices occupy [0, km), joint indices [km, km + kj).
+        # Conditional short evidence also uses the marginal part for fallback references.
+        self.register_buffer("local_energy_scale", torch.ones(c, 2, 2, km + kj))
+        self.register_buffer("local_energy_count", torch.zeros(c, 2, 2, km + kj, dtype=torch.long))
         self.register_buffer("reference_limit", torch.full((c,), float("inf")))
+
+    def energy_indices(self, short_index, reference_index, marginal_index, joint_index):
+        offset = self.m_num.shape[1]
+        reference = torch.where(reference_index >= 0, reference_index + offset, -reference_index - 1)
+        short = torch.stack([short_index, reference], -1)
+        long = torch.stack([marginal_index, joint_index + offset], -1)
+        return torch.stack([short, long], -2)
+
+    def energy_scales(self, indices, local=False):
+        if not local:
+            return self.energy_scale.expand(*indices.shape[:-3], -1, -1, -1)
+        channels = torch.arange(self.schema.channels, device=indices.device)[:, None, None]
+        span = torch.arange(2, device=indices.device)[None, :, None]
+        source = torch.arange(2, device=indices.device)[None, None, :]
+        return self.local_energy_scale[channels, span, source, indices]
 
     @staticmethod
     def _representatives(x, count, seed, priority=None, rare_fraction=.25):
@@ -342,15 +361,19 @@ class NormalMemory(nn.Module):
         full = F.pad(finite.cumsum(-1), (1, 0))[..., :-1] + F.pad(finite.flip(-1).cumsum(-1).flip(-1), (0, 1))[..., 1:]
         return trimmed, full / peer_count[:, None].clamp(min=1), peer_count
 
-    def short_marginal(self, f):
-        if "short_marginal" in f:
-            return f["short_marginal"]
+    def short_marginal(self, f, return_index=False):
+        if "short_marginal" in f and (not return_index or "short_index" in f):
+            return (f["short_marginal"], f["short_index"]) if return_index else f["short_marginal"]
         best = f["v"].new_full(f["sv"].shape, float("inf"))
+        best_index = torch.zeros_like(best, dtype=torch.long)
         for start in range(0, self.m_num.shape[1], self.chunk):
             end = start + self.chunk
             d = self._distances(f, self.m_num[:, start:end], self.m_tokens[:, start:end], short=True)
-            best = torch.minimum(best, d.masked_fill(~self.m_active[:, start:end], float("inf")).min(-1).values)
-        return best.masked_fill(~self.m_active.any(-1), 0)
+            value, index = d.masked_fill(~self.m_active[:, start:end], float("inf")).min(-1)
+            best_index = torch.where(value < best, index + start, best_index)
+            best = torch.minimum(best, value)
+        best = best.masked_fill(~self.m_active.any(-1), 0)
+        return (best, best_index) if return_index else best
 
     def prepare_peers(self, f, trim=.1):
         """Batch time-independent retrieval; state-dependent priors stay causal."""

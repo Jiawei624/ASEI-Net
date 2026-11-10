@@ -1,0 +1,3 @@
+base: ../swat.yaml
+stage2:
+  local_scaling: false

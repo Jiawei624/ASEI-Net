@@ -51,12 +51,12 @@ stage2:
   method: asei_net
   optimizer_update: task_batch
   variant: full
-  epochs: 64
+  epochs: 48
   patience: 8
   batch_pairs: 16
-  lr: 0.0002
+  lr: 0.00015
   block_length: 256
-  train_pairs: 1024
+  train_pairs: 1536
   validation_pairs: 256
   families:
   - level
@@ -71,7 +71,20 @@ stage2:
   reference_trim: 0.1
   reference_prior: 0.25
   lambda_state: 0.1
-  lambda_tail: 0.2
+  local_scaling: true
+  local_scale_prior: 64.0
+  local_scale_clip: 10.0
+  local_scale_min: 0.5
+  local_scale_max: 4.0
+  lambda_pair: 0.25
+  pair_margin: 0.5
+  selection_metric: normal_constrained
+  selection_normal_points: 16384
+  selection_reference_fraction: 0.5
+  selection_fpr_limit: 0.03
+  selection_fpr_tolerance: 0.002
+  selection_coverage_weight: 0.2
+  lambda_tail: 0.15
   tail_fraction: 0.01
   tail_margin: 0.5
   hard_negative_fraction: 0.5
@@ -82,7 +95,7 @@ stage2:
   channel_embedding_dim: 8
   evidence_hidden: 96
   readout_hidden: 32
-  lambda_channel: 0.5
+  lambda_channel: 0.2
   onset_fraction: 0.25
   reference_guard_multiplier: 3.0
   weight_decay: 0.0003
@@ -92,8 +105,8 @@ stage2:
 calibration:
   method: parallel_normal
   weights:
-  - 0.2
-  - 0.8
+  - 0.05
+  - 0.95
   alphas:
   - 0.001
   - 0.005

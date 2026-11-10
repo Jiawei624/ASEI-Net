@@ -304,6 +304,13 @@ def observable_channel_mask(clean, corrupt, labels, events, tolerance=1e-6):
     return result & np.asarray(labels, bool)[:, None]
 
 
+def paired_channel_weights(clean, corrupt, labels, clean_valid, corrupt_valid, onset_fraction=.5):
+    """Unit positive mass per task, aligned to the same observed context/channel."""
+    paired_valid = np.asarray(clean_valid, bool) & np.asarray(corrupt_valid, bool)
+    positive, _, weights = channel_phase_weights(clean, corrupt, labels, clean_valid, paired_valid, onset_fraction)
+    return (2 * weights * positive).astype(np.float32)
+
+
 def channel_phase_weights(clean, corrupt, labels, clean_valid, corrupt_valid, onset_fraction=.5):
     """Use actual paired changes to supervise every affected channel, not just argmax."""
     if not 0 < onset_fraction < 1:

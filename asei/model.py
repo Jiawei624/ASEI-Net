@@ -106,12 +106,14 @@ class DualTrajectoryDetector(nn.Module):
         rv, external = references["available"], references["external"]
         long = normal.memory.long_evidence(f)
         # The marginal query depends only on current descriptors, not on the reference.
-        marginal = normal.memory.short_marginal(f)
+        marginal, short_index = normal.memory.short_marginal(f, return_index=True)
         distances, available = normal.memory.short_evidence(dict(f, short_marginal=marginal), reference, pair, rv, external,
             peer_cost=references["peer_cost"] if self.settings.get("reference_guard_multiplier", 0.) else None)
-        short_energy = (distances / normal.memory.energy_scale[:, 0] * available).sum(-1) / available.sum(-1).clamp(min=1)
+        energy_indices = normal.memory.energy_indices(short_index, references["reference_index"], long["m_index"], long["j_index"])
+        scales = normal.memory.energy_scales(energy_indices, self.settings.get("local_scaling", False))
+        short_energy = (distances / scales[..., 0, :] * available).sum(-1) / available.sum(-1).clamp(min=1)
         lavail = torch.stack([long["mv"], long["jv"]], -1)
-        long_energy = (long["long_dist"] / normal.memory.energy_scale[:, 1] * lavail).sum(-1) / lavail.sum(-1).clamp(min=1)
+        long_energy = (long["long_dist"] / scales[..., 1, :] * lavail).sum(-1) / lavail.sum(-1).clamp(min=1)
         difference = f["v"] - reference
         if normal.schema.cat_indices:
             ids = normal.schema.cat_indices
@@ -128,7 +130,8 @@ class DualTrajectoryDetector(nn.Module):
             short_energy=short_energy, short_distance=distances, short_available=available,
             long_distance=long["long_dist"], long_available=lavail,
             reference_index=references["reference_index"], m_index=long["m_index"],
-            j_index=long["j_index"], short_marginal=marginal, peer_cost=references["peer_cost"], external=external)
+            j_index=long["j_index"], short_index=short_index, short_marginal=marginal,
+            energy_indices=energy_indices, peer_cost=references["peer_cost"], external=external)
 
     def encode_evidence(self, features):
         if self.evidence_transform == "signed_log1p":
@@ -206,7 +209,7 @@ class DualTrajectoryDetector(nn.Module):
             f = self.normal.schema.block(records, [start] * len(records), min(block_length, maximum - start))
             values = self.frozen_block(f, state)
             state = values["final_normal"]
-            for name in ("reference_index", "m_index", "j_index", "short_marginal", "peer_cost"):
+            for name in ("reference_index", "m_index", "j_index", "short_index", "short_marginal", "peer_cost"):
                 dtype = np.float32 if name in {"short_marginal", "peer_cost"} else np.int32
                 array = values[name].cpu().numpy().astype(dtype)
                 for i, record in enumerate(records):

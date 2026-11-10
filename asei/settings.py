@@ -26,6 +26,10 @@ def defaults(cfg):
                        families=["level", "variance", "temporal", "relation"],
                        fixed_retention=.9, eta=.2, rho=.95, reference_trim=.1, reference_prior=.25,
                        lambda_state=.1, lambda_tail=.1, tail_fraction=.01, tail_margin=.5,
+                       local_scaling=False, local_scale_prior=32., local_scale_clip=10., local_scale_min=.25, local_scale_max=4.,
+                       lambda_pair=0., pair_margin=.5, selection_metric="loss", selection_normal_points=8192,
+                       selection_reference_fraction=.5, selection_fpr_limit=.02, selection_fpr_tolerance=.002,
+                       selection_coverage_weight=.2,
                        optimizer_update="task_batch", hard_negative_fraction=.25, discrete_max_values=16, donor_candidates=16,
                        boundary_blend=4, relation_l1=.001, relation_generator="residual_var"),
         "memory": dict(pool_size=8192, prototype_chunk=32, reference_block_length=16, rare_fraction=.25),
@@ -67,6 +71,23 @@ def resolve(cfg, n_train, channels):
             raise ValueError("Invalid stage2." + key)
     if not 0 < s["onset_fraction"] < 1:
         raise ValueError("stage2.onset_fraction must be in (0,1).")
+    if not isinstance(s["local_scaling"], bool):
+        raise ValueError("stage2.local_scaling must be boolean.")
+    for name in ("local_scale_prior", "local_scale_clip", "local_scale_min", "local_scale_max"):
+        value = s[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError("stage2." + name + " must be finite and positive.")
+    if not s["local_scale_min"] <= 1 <= s["local_scale_max"] or s["local_scale_clip"] < 1:
+        raise ValueError("Local scale bounds must contain one; the clipping ratio must be at least one.")
+    if s["selection_metric"] not in {"loss", "normal_constrained"}:
+        raise ValueError("stage2.selection_metric must be loss or normal_constrained.")
+    points = s["selection_normal_points"]
+    if isinstance(points, bool) or not isinstance(points, int) or points < 2:
+        raise ValueError("stage2.selection_normal_points must be an integer of at least two.")
+    if not 0 < s["selection_reference_fraction"] < 1 or not 0 < s["selection_fpr_tolerance"] <= 1:
+        raise ValueError("Invalid internal selection reference fraction or FPR tolerance.")
+    if not 0 <= s["selection_fpr_limit"] <= 1 or not 0 <= s["selection_coverage_weight"] <= 1:
+        raise ValueError("Invalid selection FPR limit or coverage weight.")
     small = n_train < 8448
     if m["window"] == "auto":
         m["window"] = min(128 if small else 256, ((n_train - 33) // 32) * 32)
@@ -127,7 +148,7 @@ def resolve(cfg, n_train, channels):
             raise ValueError("Invalid runtime." + key)
     if not isinstance(runtime.get("save_predictions", False), bool):
         raise ValueError("runtime.save_predictions must be boolean.")
-    for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1", "lambda_channel", "reference_guard_multiplier"):
+    for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1", "lambda_channel", "reference_guard_multiplier", "lambda_pair", "pair_margin"):
         if not math.isfinite(s[key]) or s[key] < 0:
             raise ValueError("stage2." + key + " must be finite and nonnegative.")
     if not 0 < s["eta"] <= 1 or not 0 < s["rho"] < 1 or not 0 <= s["reference_trim"] < 1:

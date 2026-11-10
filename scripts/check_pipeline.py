@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -61,8 +62,17 @@ def main():
                                batch_sequences=1, sequence_length=16, block_length=16)
         cfg["stage2"].update(epochs=1, patience=1, train_pairs=args.pairs, validation_pairs=args.pairs, batch_pairs=2, block_length=32)
         cfg["evaluation"].update(skip_vus=True)
+        # Enough rank resolution to exercise the constrained selector on this
+        # tiny synthetic prefix; these values are never used by dataset runs.
+        cfg["calibration"].update(alpha=.1, alphas=[.1], weights=[.5, .5])
         destination = run_entity(Entity(cfg["data"]["datasets"][0], "smoke", path, 600), cfg, 42, diagnostics=True)
         stream, names = load_bundle(destination / "bundle.pt", cfg["runtime"]["device"])
+        result = json.loads((destination / "result.json").read_text(encoding="utf-8"))
+        if cfg["stage2"]["selection_metric"] == "normal_constrained":
+            assert result["detector_selection"]["statistics"]["normal_constraint_supported"]
+        if cfg["stage2"]["local_scaling"]:
+            assert result["normal_energy_scales"]["local_scaling"]["enabled"]
+            assert stream.model.normal.memory.local_energy_count.sum() > 0
         output = stream.push_many(frame[names].to_numpy()[600:])
         with np.load(destination / "predictions.npz") as saved:
             np.testing.assert_allclose([r["p_mix"] for r in output], saved["p_mix"], atol=1e-6)

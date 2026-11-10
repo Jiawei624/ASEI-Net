@@ -52,7 +52,7 @@ stage2:
   optimizer_update: task_batch
   variant: full
   epochs: 20
-  patience: 4
+  patience: 5
   batch_pairs: 32
   lr: 0.00005
   block_length: 256
@@ -71,19 +71,32 @@ stage2:
   reference_trim: 0.1
   reference_prior: 0.25
   lambda_state: 0.1
-  lambda_tail: 0.1
+  local_scaling: true
+  local_scale_prior: 64.0
+  local_scale_clip: 10.0
+  local_scale_min: 0.25
+  local_scale_max: 3.0
+  lambda_pair: 0.4
+  pair_margin: 0.5
+  selection_metric: normal_constrained
+  selection_normal_points: 32768
+  selection_reference_fraction: 0.5
+  selection_fpr_limit: 0.03
+  selection_fpr_tolerance: 0.002
+  selection_coverage_weight: 0.25
+  lambda_tail: 0.05
   tail_fraction: 0.01
   tail_margin: 0.5
   hard_negative_fraction: 0.25
   discrete_max_values: 16
   donor_candidates: 16
   boundary_blend: 4
-  evidence_transform: signed_log1p
-  channel_embedding_dim: 4
+  evidence_transform: identity
+  channel_embedding_dim: 0
   evidence_hidden: 64
   readout_hidden: 32
-  lambda_channel: 0.1
-  onset_fraction: 0.5
+  lambda_channel: 0.0
+  onset_fraction: 0.35
   reference_guard_multiplier: 3.0
   weight_decay: 0.001
   lr_patience: 1
@@ -92,8 +105,8 @@ stage2:
 calibration:
   method: parallel_normal
   weights:
-  - 0.25
-  - 0.75
+  - 0.5
+  - 0.5
   alphas:
   - 0.001
   - 0.005

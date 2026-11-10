@@ -1,0 +1,5 @@
+base: ../swat.yaml
+stage2:
+  local_scaling: false
+  lambda_pair: 0
+  selection_metric: loss

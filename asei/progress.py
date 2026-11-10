@@ -14,7 +14,8 @@ def log(message, cfg=None):
 def epoch_log(stage, number, total, train, validation, began, cfg, checkpoint, **details):
     seconds = time.perf_counter() - began
     elapsed = sum(entry.get("seconds", 0.) for entry in checkpoint.history)
-    best = min(checkpoint.history, key=lambda entry: entry.get("validation_loss", entry.get("selection", {}).get("loss", float("inf"))))
+    best = min(checkpoint.history, key=lambda entry: entry.get("validation_loss",
+        entry.get("selection", {}).get("objective", entry.get("selection", {}).get("loss", float("inf")))))
     extra = " ".join(f"{key}={value:.6g}" if isinstance(value, float) else f"{key}={value}" for key, value in details.items())
     stop = checkpoint.stale >= cfg[stage]["patience"]
     remaining = 0. if stop else elapsed / max(1, number) * (total - number)
