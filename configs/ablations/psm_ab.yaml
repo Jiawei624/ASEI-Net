@@ -1,0 +1,3 @@
+base: ../psm.yaml
+stage2:
+  local_scaling: true

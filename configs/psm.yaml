@@ -52,12 +52,12 @@ stage2:
   optimizer_update: task_batch
   variant: full
   epochs: 32
-  patience: 6
+  patience: 8
   batch_pairs: 32
   lr: 0.0001
   block_length: 256
   train_pairs: 2048
-  validation_pairs: 256
+  validation_pairs: 512
   families:
   - level
   - variance
@@ -76,14 +76,14 @@ stage2:
   local_scale_clip: 10.0
   local_scale_min: 0.5
   local_scale_max: 3.0
-  lambda_pair: 0.25
+  lambda_pair: 0.1
   pair_margin: 0.5
   selection_metric: normal_constrained
-  selection_normal_points: 16384
+  selection_normal_points: 65536
   selection_reference_fraction: 0.5
-  selection_fpr_limit: 0.02
-  selection_fpr_tolerance: 0.002
-  selection_coverage_weight: 0.2
+  selection_fpr_limit: 0.03
+  selection_fpr_tolerance: 0.005
+  selection_coverage_weight: 0.05
   lambda_tail: 0.1
   tail_fraction: 0.01
   tail_margin: 0.5
