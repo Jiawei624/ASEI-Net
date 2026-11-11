@@ -51,10 +51,10 @@ stage2:
   method: asei_net
   optimizer_update: task_batch
   variant: full
-  epochs: 64
+  epochs: 32
   patience: 8
   batch_pairs: 16
-  lr: 0.0002
+  lr: 0.00015
   block_length: 256
   train_pairs: 1536
   validation_pairs: 512
@@ -83,7 +83,7 @@ stage2:
   selection_reference_fraction: 0.5
   selection_fpr_limit: 0.03
   selection_fpr_tolerance: 0.005
-  selection_coverage_weight: 0.1
+  selection_coverage_weight: 0.2
   lambda_tail: 0.2
   tail_fraction: 0.01
   tail_margin: 0.5
@@ -105,8 +105,8 @@ stage2:
 calibration:
   method: parallel_normal
   weights:
-  - 0.05
-  - 0.95
+  - 0.025
+  - 0.975
   alphas:
   - 0.001
   - 0.005

@@ -1,0 +1,5 @@
+# Only fusion weights differ from the archived local round-011 profile.
+# Selection reads these weights too; a rerun may select a different checkpoint.
+base: smd_round011.yaml
+calibration:
+  weights: [0.05, 0.95]
