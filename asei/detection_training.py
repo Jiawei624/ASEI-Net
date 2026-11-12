@@ -254,20 +254,30 @@ def fit_detector(model, training, validation, cfg, directory, key, seed, normal_
             break
         began = time.perf_counter()
         rate = optimizer.param_groups[0]["lr"]
-        train, valid = epoch(training, True), epoch(validation, False)
+        train = epoch(training, True)
+        train_seconds = time.perf_counter() - began
+        validation_began = time.perf_counter()
+        valid = epoch(validation, False)
+        synthetic_validation_seconds = time.perf_counter() - validation_began
+        audit_began = time.perf_counter()
         if selector is not None:
             calibration, audit = selector.evaluate(model)
             valid.update(constrained_selection(valid, valid.pop("_scores"), calibration, audit, settings))
         else:
             valid["objective"] = valid["loss"]
+        normal_audit_seconds = time.perf_counter() - audit_began
         if scheduler is not None:
             scheduler.step(valid["objective"])
         checkpoint.record(dict(epoch=number + 1, train=train, selection=valid,
+                               train_seconds=train_seconds, synthetic_validation_seconds=synthetic_validation_seconds,
+                               normal_audit_seconds=normal_audit_seconds,
                                seconds=time.perf_counter() - began), valid["objective"])
         selection_details = {name: valid[name] for name in ("synthetic_ap", "positive_coverage", "normal_dynamic_fpr", "normal_fused_fpr") if name in valid}
         epoch_log("stage2", number + 1, settings["epochs"], train["loss"], valid["loss"], began, cfg, checkpoint,
                   lr=rate, classification=train["classification"],
                   state=train["state"], tail=train["tail"], channel=train["channel"], pair=train["pair"],
+                  train_seconds=train_seconds, synthetic_validation_seconds=synthetic_validation_seconds,
+                  normal_audit_seconds=normal_audit_seconds,
                   selection_objective=valid["objective"], **selection_details)
     history = checkpoint.finish()
     model.eval()

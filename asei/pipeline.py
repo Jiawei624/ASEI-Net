@@ -15,7 +15,7 @@ from .data import Record, Standardizer, load_entity, validation_context
 from .metrics import (METRICS_PROTOCOL, _evaluation_scores, label_metrics, score_metrics,
                        event_metrics, evaluate_anomaly_ratios, thresholds_from_anomaly_ratios)
 from .resources import configure_cpu, cooperate
-from .results import write_run_result
+from .results import write_run_result, write_named_result
 from .runs import training_root
 from . import FORMAT, METHOD
 from .calibration import ParallelCalibration
@@ -29,6 +29,7 @@ from .training import (_save, fit_forecaster, fit_teacher, fit_energy_scales,
 from .detection_training import fit_detector
 from .progress import Progress, log
 from .batching import feature_blocks
+from .parallel import preparation_workers, prefetch_depth
 
 
 def get_device(name):
@@ -56,7 +57,7 @@ def score_raw(model, record, cfg, start=0, state=None, diagnostics=False):
     model.eval()
     interval = cfg["runtime"].get("log_interval_seconds", 30)
     errors, ready, _ = forecast_errors(record, model.normal, cfg["runtime"]["feature_batch_size"],
-                                      log_interval_seconds=interval)
+                                      log_interval_seconds=interval, workers=preparation_workers(cfg), prefetch=prefetch_depth(cfg))
     block = 1 if cfg["runtime"].get("detector_execution") == "step" else cfg["stage2"]["block_length"]
     outputs = {}
     progress = Progress("scoring blocks", (len(record.z) - start + block - 1) // block, interval) if len(record.z) - start > block else None
@@ -85,7 +86,8 @@ def _join(*records):
 def _bootstrap(record, state, window):
     n = max(window, 32)
     return dict(z=record.z[-n:].copy(), mask=record.mask[-n:].copy(),
-                normal=state.normal.cpu(), observed=state.observed.cpu())
+                normal=state.normal.cpu(), observed=state.observed.cpu(),
+                evidence=None if state.evidence is None else state.evidence.cpu())
 
 
 def save_bundle(path, model, scaler, calibration, cfg, provenance, experiment, bootstrap=None):
@@ -96,7 +98,7 @@ def save_bundle(path, model, scaler, calibration, cfg, provenance, experiment, b
 
 
 def _load_bundle(saved, device="cpu", alpha=None):
-    if saved.get("format") != FORMAT:
+    if saved.get("format") not in {FORMAT, "asei-net/4"}:
         raise ValueError("Unsupported detector bundle format.")
     cfg = saved["config"]
     normal = NormalModel(saved["schema"], cfg).to(device)
@@ -137,7 +139,9 @@ class StreamingDetector:
                     value = value.cpu().numpy()
                 return np.asarray(value, dtype).copy()
             self.context = Record(array(self.bootstrap["z"], np.float32), array(self.bootstrap["mask"], bool))
-            self.state = TrajectoryState(self.bootstrap["normal"].to(device), self.bootstrap["observed"].to(device))
+            evidence = self.bootstrap.get("evidence")
+            self.state = TrajectoryState(self.bootstrap["normal"].to(device), self.bootstrap["observed"].to(device),
+                                         None if evidence is None else evidence.to(device))
             self.previous = self.context.z[-1].astype(np.float64) * self.scaler.scale + self.scaler.mean
 
     @torch.no_grad()
@@ -197,11 +201,13 @@ def _evaluate(raw, labels, calibration, cfg):
     actual, _, valid, full_scores = _evaluation_scores(labels, output["scores"], output["valid"])
     warnings = {}
     if valid.any():
-        ranking = score_metrics(actual, full_scores, cfg["evaluation"]["score_metrics"], warnings)
+        ranking = score_metrics(actual, full_scores, cfg["evaluation"]["score_metrics"], warnings,
+                                workers=min(cfg["runtime"].get("metric_workers", 1), cfg["runtime"].get("effective_cpu", {}).get("cpu_budget", cfg["runtime"].get("cpu_cores", 8))))
     else:
         ranking = {name: float("nan") for name in cfg["evaluation"]["score_metrics"]}
         warnings["scores"] = "No scorable test point."
     metrics = dict(protocol=METRICS_PROTOCOL, score=ranking, label_by_alpha=[],
+        ranking_mapping=calibration.ranking, score_role="ranking; alarms use empirical p_mix",
         comparison="p_mix <= alpha", point_adjusted_metrics="adjust_* fields are compatibility outputs only")
     alarms = []
     for alpha in cfg["calibration"]["alphas"]:
@@ -256,6 +262,13 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     seed_everything(seed)
     device = get_device(cfg["runtime"]["device"])
     fit, heldout, test, labels, scaler, provenance = load_entity(entity, cfg["data"]["train_fraction"])
+    default_type = cfg["data"].get("default_channel_type", "auto")
+    if default_type != "auto":
+        overrides = cfg["data"].get("channel_types") or {}
+        unknown = set(overrides) - set(provenance["channels"])
+        if unknown:
+            raise ValueError("Unknown channel type overrides: " + ", ".join(sorted(unknown)))
+        cfg["data"]["channel_types"] = {name: overrides.get(name, default_type) for name in provenance["channels"]}
     cfg = resolve_config(cfg, len(fit.z), fit.z.shape[1])
     cut = int(len(heldout.z) * cfg["data"]["selection_fraction"])
     if min(cut, len(heldout.z) - cut) < 4:
@@ -339,6 +352,8 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
                 train_cache = build_pairs(model, fit, fit, cfg, directory, "train", seed + 20000, provenance["channels"], relation)
                 valid_cache = build_pairs(model, selection, selection, cfg, directory, "selection", seed + 30000, provenance["channels"], relation)
                 experiment["timings"]["pair_preparation_seconds"] = time.perf_counter() - start
+                experiment["preparation_timings"] = {"train": getattr(train_cache, "preparation_timings", {"reused": True}),
+                                                     "selection": getattr(valid_cache, "preparation_timings", {"reused": True})}
                 if stage == "cache":
                     return directory
                 start = time.perf_counter()
@@ -367,7 +382,7 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     normal_raw, final_state = score_raw(model, calibration_record, cfg)
     selected = {k: v[calibration_start:] for k, v in normal_raw.items()}
     calibration = ParallelCalibration(selected["short"][selected["short_valid"]],
-        selected["dynamic"][selected["dynamic_valid"]], _weights(cfg), cfg["calibration"]["alpha"])
+        selected["dynamic"][selected["dynamic_valid"]], _weights(cfg), cfg["calibration"]["alpha"], cfg["calibration"].get("ranking", "empirical"))
     experiment["timings"]["normal_replay_seconds"] = time.perf_counter() - start
     experiment["calibration_scope"] = dict(source="independent_normal" if independent else "official_normal_suffix",
         fit_points=len(fit.z), selection_points=cut, calibration_points=len(heldout.z) - cut,
@@ -382,6 +397,7 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
         bootstrap = _bootstrap(official, final_state, cfg["model"]["window"])
     save_bundle(bundle, model, scaler, calibration, cfg, provenance, experiment, bootstrap)
     write_json(detector_dir / "calibration.json", {**experiment["calibration_scope"], "method": "parallel_normal",
+               "ranking": calibration.ranking, "tail_parameters": calibration.tail_parameters,
                "alpha": calibration.alpha, "alphas": cfg["calibration"]["alphas"]})
     if stage == "calibrate":
         return detector_dir
@@ -390,22 +406,31 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
         raw, _ = score_raw(model, test, cfg, diagnostics=diagnostics)
     else:
         context = Record(bootstrap["z"], bootstrap["mask"])
-        state = TrajectoryState(bootstrap["normal"].to(device), bootstrap["observed"].to(device))
+        evidence = bootstrap.get("evidence")
+        state = TrajectoryState(bootstrap["normal"].to(device), bootstrap["observed"].to(device),
+                                None if evidence is None else evidence.to(device))
         raw, _ = score_raw(model, _join(context, test), cfg, len(context.z), state, diagnostics)
     experiment["timings"]["test_scoring_seconds"] = time.perf_counter() - start
     log(f"evaluation label_metrics={len(cfg['evaluation']['label_metrics'])} "
         f"score_metrics={len(cfg['evaluation']['score_metrics'])}", cfg)
+    start = time.perf_counter()
     metrics, output, alarms = _evaluate(raw, labels, calibration, cfg)
+    experiment["timings"]["evaluation_seconds"] = time.perf_counter() - start
     result = dict(dataset=entity.dataset, entity=entity.name, seed=seed, method=METHOD, variant=model.variant,
         run_id=cfg["runtime"]["run_id"], run_created_ns=cfg["runtime"]["run_created_ns"],
         model_key=detector_key, implementation_key=implementation, metrics_protocol=METRICS_PROTOCOL,
         model_file=bundle.relative_to(Path(cfg["runtime"]["run_directory"])).as_posix(), test_points=len(labels),
         calibration={**experiment["calibration_scope"], "method": "parallel_normal", "alpha": calibration.alpha},
         metrics=metrics, config=cfg, provenance=provenance, timing=experiment["timings"],
+        preparation_timings=experiment.get("preparation_timings", {}),
         normal_replay_diagnostics=experiment["normal_replay_diagnostics"],
         normal_energy_scales=experiment.get("energy_scales", {}),
         score_diagnostics=_score_diagnostics(raw, labels, calibration, output, len(provenance["channels"])),
         model_analysis=dict(contraction_bound=model.normal.teacher.cell.contraction,
+            evidence_horizons=list(model.horizons), evidence_dimensions=model.layout.size,
+            reference_peer_mode=model.normal.memory.peer_mode, reference_prior=cfg["stage2"]["reference_prior"],
+            reference_neighbor_counts=(model.normal.memory.peer_active.sum(-1).cpu().tolist()
+                if model.normal.memory.peer_active is not None else [max(0, len(provenance["channels"]) - 1)] * len(provenance["channels"])),
             hidden_spectral_norm=float(torch.linalg.svdvals(model.normal.teacher.cell.hidden.weight)[0].cpu()),
             parameters=sum(p.numel() for p in model.parameters()),
             trainable_detector_parameters=sum(p.numel() for name, p in model.named_parameters() if not name.startswith("normal."))),
@@ -429,6 +454,7 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     save_bundle(bundle, model, scaler, calibration, cfg, provenance, experiment, bootstrap)
     write_json(detector_dir / "result.json", result)
     csv_path = write_run_result(cfg["runtime"]["run_directory"], result)
+    named_csv = write_named_result(cfg, result)
     if cfg["runtime"]["keep_intermediates"] or diagnostics or cfg["runtime"].get("save_predictions", False):
         np.savez_compressed(detector_dir / "predictions.npz", labels=labels, alarms_by_alpha=alarms,
             alphas=np.asarray(cfg["calibration"]["alphas"]),
@@ -436,5 +462,6 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
             **{"raw_" + k: v for k, v in raw.items()})
     if not cfg["runtime"]["keep_intermediates"] and not diagnostics:
         prune_task_cache(directory)
-    log(f"saved metrics {csv_path}; best model {bundle}", cfg)
+    log(f"saved metrics {csv_path}; all metrics {named_csv}; best model {bundle}", cfg)
+    log("stage timings " + " ".join(f"{key}={value:.2f}" for key, value in experiment["timings"].items()), cfg)
     return detector_dir

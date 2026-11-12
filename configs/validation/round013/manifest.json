@@ -1,0 +1,29 @@
+{
+  "format": "asei-validation-profiles/1",
+  "round": "013",
+  "datasets": [
+    "psm",
+    "smd",
+    "pump",
+    "swat"
+  ],
+  "baseline": "current local dataset configurations; not a server-verified round012 reproduction",
+  "source_sha256": {
+    "configs/psm.yaml": "35a14048dbb9756376acdbd1c5c7bbf690d51cdaef10b4ec9561e5ee38160e7b",
+    "configs/smd.yaml": "8fbd3604e79061c8e22e882b9cfd780304e34c946bccb45cc948bfe4e17b96f1",
+    "configs/pump.yaml": "8070337a06c9d7e4825ac07fc4d186579294a6d5f276781490d47edd3a0e3593",
+    "configs/swat.yaml": "4d2c5eeeb142f11178f1b5c21d07010dd8e0e944edb2e786905be98d115b48c6"
+  },
+  "implementation_at_preparation": "2990815f4c51323b50e85f048e12ce250ba2f49798c334ea336b600477b5d1cf",
+  "output": "outputs/validation/round013",
+  "profiles": {
+    "configs/validation/round013/psm.yaml": "8fb5170d9cb34415892ac0d1adbcac5d9ec940c91ab5617efdf6720616ce9c8b",
+    "configs/validation/round013/psm_single_gru.yaml": "817c741a49ab43dfd2f2bd39e498cef1bf1e698b839d26ddb812d03baff7b813",
+    "configs/validation/round013/smd.yaml": "836b7b0cd8ccdf1328f10155b58cf6cb5de287c3638632bb174389c8ccf32598",
+    "configs/validation/round013/smd_single_gru.yaml": "d9ba2be80c21b75c66a90726ee63cf9b5cfe27a44597ac3e195abdab3a6d85cb",
+    "configs/validation/round013/pump.yaml": "c5b6bf7264ed9a048f0c091c47d279905d2a150e8667df8b615e922cf2844a5b",
+    "configs/validation/round013/pump_single_gru.yaml": "4499f19d2b4cba4feba1066db1660b121e492487d7a637edcbad7f908f115957",
+    "configs/validation/round013/swat.yaml": "11c8862e5d548ce27f2eb91b070640f8c7d546b9ad88393f92072448142d4ab3",
+    "configs/validation/round013/swat_single_gru.yaml": "32a9c28a7dacd6c539836cd3bb87f61f073c271293e06b3fd1f0548d39e87f99"
+  }
+}

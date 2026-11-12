@@ -55,3 +55,27 @@ def ordered_prefetch(function, items, workers=1, depth=2):
 
 def prefetch_depth(cfg):
     return cfg["runtime"].get("prefetch_batches", 2) if preparation_workers(cfg) else 0
+
+
+@contextmanager
+def background_writer(function, enabled=False):
+    """One ordered disk writer, at most one queued group, with visible failures."""
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="asei-write") if enabled else None
+    pending = None
+    def submit(value):
+        nonlocal pending
+        if executor is None:
+            function(value)
+        else:
+            if pending is not None:
+                pending.result()
+            pending = executor.submit(function, value)
+    try:
+        yield submit
+    finally:
+        try:
+            if pending is not None:
+                pending.result()
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)

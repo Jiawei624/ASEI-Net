@@ -49,6 +49,17 @@ def normal_scan(inputs: torch.Tensor, state: torch.Tensor, valid: torch.Tensor,
 
 
 @torch.jit.script
+def evidence_scan(inputs: torch.Tensor, state: torch.Tensor, valid: torch.Tensor, rates: torch.Tensor):
+    """Causal evidence at several time scales; invalid channels reset every scale."""
+    outputs = torch.jit.annotate(List[torch.Tensor], [])
+    for t in range(inputs.size(1)):
+        state = (1 - rates) * state + rates * inputs[:, t, :, None, :]
+        state = state.masked_fill(~valid[:, t, :, None, None], 0)
+        outputs.append(state.flatten(-2))
+    return torch.stack(outputs, 1), state
+
+
+@torch.jit.script
 def observed_scan(inputs: torch.Tensor, normals: torch.Tensor, previous_normal: torch.Tensor,
                   observed: torch.Tensor, gate_base: torch.Tensor, gate_delta: torch.Tensor,
                   valid: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor,

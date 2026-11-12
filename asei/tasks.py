@@ -255,6 +255,18 @@ def generate_pair(source: Record, donor: Record, window: int, index: int, seed: 
 REFERENCE_TASK_PROTOCOL = "support_preserving_pairs_v2"
 
 
+def scale_numeric_intervention(pair, supports, strength):
+    """Vary fault severity without changing normal targets or symbolic semantics."""
+    if not 0 < strength <= 1:
+        raise ValueError("Intervention strength must lie in (0,1].")
+    numeric = [i for i, support in enumerate(supports) if support is None]
+    if numeric and strength != 1:
+        clean = pair.clean.z[:, numeric]
+        pair.corrupt.z[:, numeric] = clean + strength * (pair.corrupt.z[:, numeric] - clean)
+    pair.recipe["numeric_strength"] = float(strength)
+    return pair
+
+
 class NormalTaskPolicy:
     """Channel supports come exclusively from the normal fit record."""
 

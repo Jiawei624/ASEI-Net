@@ -15,11 +15,11 @@ from .config import fingerprint, write_json
 from .tasks import NormalTaskPolicy, generate_reference_pair, TaskGenerationError, validate_pair_observability
 from .resources import cooperate
 from .progress import Progress, log, epoch_log
-from .features import forecast_errors
+from .features import forecast_errors, forecast_errors_many
 from .cache import PairCache
 from .batching import BatchFeatures, teacher_scoring_mask, feature_blocks
-from .parallel import ordered_prefetch, preparation_workers, prefetch_depth
-from .tasks import normal_difficulty, typed_donor_matcher
+from .parallel import ordered_prefetch, preparation_workers, prefetch_depth, background_writer
+from .tasks import normal_difficulty, typed_donor_matcher, scale_numeric_intervention
 
 
 def seed_everything(seed):
@@ -196,7 +196,9 @@ def fit_forecaster(normal, fit, selection, cfg, directory, key, seed):
     # Dictionaries contain real fitting windows and are fixed before teacher learning.
     saved = load_torch_checkpoint(path, map_location=normal.schema.amp_mean.device)
     if not saved.get("memory_complete", False):
-        normal.memory.fit(fit, seed, cfg["memory"]["pool_size"], cfg["memory"]["rare_fraction"], interval)
+        normal.memory.fit(fit, seed, cfg["memory"]["pool_size"], cfg["memory"]["rare_fraction"], interval,
+                          workers=preparation_workers(cfg))
+        normal.memory.set_peers(predictor.weights())
         saved.update(model=normal.state_dict(), memory_complete=True)
         _save(path, saved)
         log("memory construction complete", cfg)
@@ -326,13 +328,18 @@ def fit_teacher(model, fit, selection, cfg, directory, key, seed):
         began = time.perf_counter()
         rate = optimizer.param_groups[0]["lr"]
         sequences = _sequence_starts(fit, w, settings["sequence_length"], settings["train_sequences"], seed + 7200 + number)
-        training_loss, validation_loss = epoch(fit, sequences, True), validate()
+        training_loss = epoch(fit, sequences, True)
+        train_seconds = time.perf_counter() - began
+        validation_began = time.perf_counter()
+        validation_loss = validate()
+        validation_seconds = time.perf_counter() - validation_began
         if scheduler is not None:
             scheduler.step(validation_loss)
         checkpoint.record(dict(epoch=number + 1, train_loss=training_loss, validation_loss=validation_loss,
+                               train_seconds=train_seconds, validation_seconds=validation_seconds,
                                seconds=time.perf_counter() - began), validation_loss)
         epoch_log("teacher", number + 1, settings["epochs"], training_loss, validation_loss, began, cfg, checkpoint,
-                  lr=rate)
+                  lr=rate, train_seconds=train_seconds, validation_seconds=validation_seconds)
     history = checkpoint.finish()
     normal.freeze()
     return history
@@ -425,6 +432,7 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
         log(f"cache {split} complete pairs={count} reused=True", cfg)
         return cache
     began = time.perf_counter()
+    timings = dict(source_forecast_seconds=0., generation_wait_seconds=0., task_forecast_seconds=0., routing_seconds=0., write_seconds=0.)
     progress = Progress(f"cache {split} pairs", count, cfg["runtime"].get("log_interval_seconds", 30))
     policy = NormalTaskPolicy(source, settings["discrete_max_values"], cfg["data"].get("channel_types"), names)
     policy.supports = [None if s is None else np.asarray(s, np.float32) for s in normal.metadata["supports"]]
@@ -439,18 +447,21 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
     marker = cache.directory / "source_forecast.json"
     complete = marker.exists() and json.loads(marker.read_text(encoding="utf-8")).get("key") == key
     if not complete or not error_path.exists() or not ready_path.exists():
+        source_began = time.perf_counter()
         shape = (*source.z.shape, 2)
         source_error = np.lib.format.open_memmap(error_path, mode="w+", dtype=np.float32, shape=shape)
         source_ready = np.lib.format.open_memmap(ready_path, mode="w+", dtype=bool, shape=shape)
         try:
             forecast_errors(source, normal, cfg["runtime"]["feature_batch_size"], output=(source_error, source_ready),
-                log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 30), progress_label=f"cache {split} source forecast")
+                log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 30), progress_label=f"cache {split} source forecast",
+                workers=preparation_workers(cfg), prefetch=prefetch_depth(cfg))
             source_error.flush()
             source_ready.flush()
         finally:
             source_error._mmap.close()
             source_ready._mmap.close()
         write_json(marker, dict(key=key, shape=shape))
+        timings["source_forecast_seconds"] = time.perf_counter() - source_began
     source_error, source_ready = np.load(error_path, mmap_mode="r"), np.load(ready_path, mmap_mode="r")
     active = normal.memory.m_active.any(-1).cpu().numpy()
     cycle = 2 * len([f for f in settings["families"] if source.z.shape[1] > 1 or f != "relation"])
@@ -469,6 +480,8 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
                 pair.recipe["generation_index"] = generation_index
             if relation_tasks is not None:
                 pair = relation_tasks.apply(pair, seed)
+            strengths = settings.get("task_strengths", [1.])
+            pair = scale_numeric_intervention(pair, policy.supports, strengths[(index // cycle) % len(strengths)])
             try:
                 validate_pair_observability(pair, active)
             except TaskGenerationError:
@@ -479,33 +492,49 @@ def build_pairs(model, source, donor, cfg, directory, split, seed, names, relati
     try:
         group_size = max(1, int(cfg["runtime"].get("preparation_batch_pairs", 8)))
         workers = preparation_workers(cfg)
-        with ordered_prefetch(generate, range(len(cache), count), workers=workers,
-                              depth=2 * group_size if workers else 0) as generated:
+        def persist(group):
+            started = time.perf_counter()
+            for pair, error, valid in group:
+                cache.append(pair, error, valid)
+            timings["write_seconds"] += time.perf_counter() - started
+        with background_writer(persist, cfg["runtime"].get("async_task_writes", False)) as write_group, ordered_prefetch(
+                generate, range(len(cache), count), workers=workers, depth=2 * group_size if workers else 0) as generated:
             while True:
+                started = time.perf_counter()
                 pairs = list(islice(generated, group_size))
+                timings["generation_wait_seconds"] += time.perf_counter() - started
                 if not pairs:
                     break
-                pending = []
+                clean_errors, clean_masks = [], []
                 for pair in pairs:
                     begin, end = pair.recipe["source_start"], pair.recipe["source_stop"]
                     clean_error, clean_ready = source_error[begin:end].copy(), source_ready[begin:end].copy()
                     clean_error[:normal.predictor.window] = 0
                     clean_ready[:normal.predictor.window] = False
-                    corrupt_error, corrupt_ready, reused = forecast_errors(pair.corrupt, normal,
-                        cfg["runtime"]["feature_batch_size"], pair.clean, clean_error, clean_ready)
+                    clean_errors.append(clean_error)
+                    clean_masks.append(clean_ready)
+                started = time.perf_counter()
+                forecasts = forecast_errors_many([pair.corrupt for pair in pairs], normal, cfg["runtime"]["feature_batch_size"],
+                    [pair.clean for pair in pairs], clean_errors, clean_masks, workers=workers, prefetch=prefetch_depth(cfg))
+                timings["task_forecast_seconds"] += time.perf_counter() - started
+                pending = []
+                for pair, clean_error, clean_ready, (corrupt_error, corrupt_ready, reused) in zip(pairs, clean_errors, clean_masks, forecasts):
                     pair.recipe["forecast_rows_reused"] = reused
                     pair.recipe["generator"] = settings["relation_generator"]
                     pending.append((pair, (clean_error, corrupt_error), (clean_ready, corrupt_ready)))
                 records = [p[0].clean for p in pending] + [p[0].corrupt for p in pending]
+                started = time.perf_counter()
                 routes = model.routing_many(records, settings["block_length"])
+                timings["routing_seconds"] += time.perf_counter() - started
                 for record, routing in zip(records, routes):
                     record.routing = routing
-                for pair, error, valid in pending:
-                    cache.append(pair, error, valid)
+                write_group(pending)
     finally:
         source_error._mmap.close()
         source_ready._mmap.close()
-    log(f"cache {split} complete pairs={count} storage=packed seconds={time.perf_counter() - began:.1f}", cfg)
+    cache.preparation_timings = timings
+    log(f"cache {split} complete pairs={count} storage=packed seconds={time.perf_counter() - began:.1f} " +
+        " ".join(f"{k}={v:.2f}" for k, v in timings.items()), cfg)
     return cache
 
 

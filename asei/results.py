@@ -18,13 +18,14 @@ CSV_COLUMNS = ("run_id", "run_created_ns", "dataset", "entity", "seed", "variant
                "missing_metrics", "undefined_metrics", "model_file")
 BRANCH_COLUMNS = tuple(branch + "_" + measure for branch in ("short", "dynamic")
                        for measure in ("normal_fpr", "anomaly_recall"))
-CSV_COLUMNS = tuple(dict.fromkeys(CSV_COLUMNS + BRANCH_COLUMNS))
+CSV_COLUMNS = tuple(dict.fromkeys(CSV_COLUMNS + BRANCH_COLUMNS + ("ranking_mapping", "export_role")))
 
 
 def result_row(record):
     row = {key: record.get(key, "") for key in CSV_COLUMNS[:7]}
     row["method"] = record.get("method") or record.get("config", {}).get("stage2", {}).get("method") or "legacy"
     row["metrics_protocol"] = record.get("metrics_protocol", record["metrics"].get("protocol", "legacy_binary_topk_v1"))
+    row["ranking_mapping"] = record["metrics"].get("ranking_mapping", record.get("config", {}).get("calibration", {}).get("ranking", "empirical"))
     row["test_points"] = record.get("test_points", "")
     row["metrics_type"] = record.get("metrics_type", "both")
     calibration = record.get("calibration", {})
@@ -137,6 +138,35 @@ def write_run_result(run_directory, record):
     return _write_rows(path, rows)
 
 
+def write_named_result(cfg, record):
+    """A log-named CSV with all 22 metrics together on each preset-alpha row."""
+    from .config import project_path
+    from .runs import run_log_path
+    path = project_path(cfg["runtime"]["output"]) / "results" / (run_log_path(cfg).stem + ".csv")
+    additions = result_rows(record)
+    if "label_by_alpha" in record["metrics"]:
+        merged = []
+        for row in additions:
+            if row["metrics_type"] != "label":
+                continue
+            row["metrics_type"] = "both"
+            row["export_role"] = "combined_view"
+            undefined = []
+            for name in SCORE_METRIC_ORDER:
+                value = record["metrics"]["score"].get(name)
+                row[name] = value if value is not None and math.isfinite(float(value)) else ""
+                if name in record["metrics"]["score"] and row[name] == "":
+                    undefined.append(name)
+            row["undefined_metrics"] = ";".join(filter(None, [row["undefined_metrics"], ";".join(undefined)]))
+            row["missing_metrics"] = ";".join(filter(None, [row["missing_metrics"],
+                ";".join(name for name in SCORE_METRIC_ORDER if name not in record["metrics"]["score"])]))
+            merged.append(row)
+        additions = merged
+    rows = read_rows(path) if path.exists() else []
+    rows = [row for row in rows if _model_identity(row) != _model_identity(additions[0])] + additions
+    return _write_rows(path, rows)
+
+
 def remove_run_result(run_directory, dataset, entity, seed, variant):
     path = Path(run_directory) / "metrics.csv"
     if path.exists():
@@ -208,9 +238,20 @@ def collect_rows(root, recompute_labels=False):
                     if row["metrics_protocol"] not in CONTINUOUS_TOPK_PROTOCOLS and row.get("precision_at_k"):
                         row["precision_at_k"] = ""
                         row["undefined_metrics"] = ";".join(filter(None, [row.get("undefined_metrics"), "precision_at_k:legacy_binary_input"]))
-                    row["_source"] = str(path)
-                    rows[_identity(row)] = row
-                    csv_models.add(_model_identity(row))
+                    candidates = [row]
+                    if row.get("export_role") == "combined_view":
+                        # This additional CSV mirrors the canonical split rows.
+                        # Normalize it before aggregation so recursive export
+                        # never counts its repeated score metrics once per alpha.
+                        label_row = dict(row, metrics_type="label", export_role="")
+                        label_row.update({name: "" for name in SCORE_METRIC_ORDER})
+                        score_row = dict(row, metrics_type="score", export_role="", alpha="", anomaly_ratio="", threshold="")
+                        score_row.update({name: "" for name in LABEL_METRIC_ORDER + EVENT_METRIC_ORDER})
+                        candidates = [label_row, score_row]
+                    for candidate in candidates:
+                        candidate["_source"] = str(path)
+                        rows[_identity(candidate)] = candidate
+                        csv_models.add(_model_identity(candidate))
     paths = [root] if root.is_file() and root.suffix == ".json" else sorted(root.rglob("*.json"))
     for path in paths:
         if "task_cache" in path.parts:

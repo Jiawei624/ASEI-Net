@@ -162,11 +162,15 @@ class NormalTeacher(nn.Module):
 
 
 class NormalMemory(nn.Module):
-    def __init__(self, schema, km, kj, chunk=32):
+    def __init__(self, schema, km, kj, chunk=32, peer_mode="all", neighbors=4):
         super().__init__()
         object.__setattr__(self, "schema", schema)
         c = schema.channels
         self.chunk = int(chunk)
+        self.peer_mode = peer_mode
+        width = min(neighbors, max(1, c - 1))
+        self.register_buffer("peer_indices", torch.zeros(c, width, dtype=torch.long) if peer_mode == "normal_topk" else None)
+        self.register_buffer("peer_active", torch.zeros(c, width, dtype=torch.bool) if peer_mode == "normal_topk" else None)
         self.register_buffer("m_num", torch.zeros(c, km, 38))
         self.register_buffer("m_tokens", torch.zeros(c, km, 32, dtype=torch.long))
         self.register_buffer("m_active", torch.zeros(c, km, dtype=torch.bool))
@@ -180,6 +184,18 @@ class NormalMemory(nn.Module):
         self.register_buffer("local_energy_scale", torch.ones(c, 2, 2, km + kj))
         self.register_buffer("local_energy_count", torch.zeros(c, 2, 2, km + kj, dtype=torch.long))
         self.register_buffer("reference_limit", torch.full((c,), float("inf")))
+
+    @torch.no_grad()
+    def set_peers(self, relation):
+        if self.peer_indices is None:
+            return
+        strength = relation.detach().abs().clone()
+        strength.fill_diagonal_(0)
+        # Stable channel-order tie breaks; no test observations choose neighbors.
+        index = torch.argsort(strength, dim=-1, descending=True, stable=True)[:, :self.peer_indices.shape[1]]
+        selected = strength.gather(-1, index)
+        self.peer_indices.copy_(index)
+        self.peer_active.copy_((selected > 1e-6) & (index != torch.arange(len(index), device=index.device)[:, None]))
 
     def energy_indices(self, short_index, reference_index, marginal_index, joint_index):
         offset = self.m_num.shape[1]
@@ -214,8 +230,10 @@ class NormalMemory(nn.Module):
         return np.asarray(selected)
 
     @torch.no_grad()
-    def fit(self, record, seed=42, pool_size=8192, rare_fraction=.25, log_interval_seconds=30):
+    def fit(self, record, seed=42, pool_size=8192, rare_fraction=.25, log_interval_seconds=30, workers=0):
         from .tasks import normal_difficulty
+        from .parallel import ordered_prefetch
+        from threadpoolctl import threadpool_limits
         rng = np.random.default_rng(seed)
         candidates = np.arange(31, len(record.z))
         priority = normal_difficulty(record, self.schema.metadata["supports"])
@@ -227,11 +245,11 @@ class NormalMemory(nn.Module):
         f = self.schema.block([record] * len(indices), indices.tolist(), 1)
         f = {k: v[:, 0] for k, v in f.items()}
         progress = Progress("memory marginal channels", self.schema.channels, log_interval_seconds)
+        jobs = []
         for i in range(self.schema.channels):
             cooperate()
             valid = torch.nonzero(f["lv"][:, i], as_tuple=False).flatten()
             if not len(valid):
-                progress.update(i + 1)
                 continue
             embedding = self.schema.cluster_features({k: v[valid] for k, v in f.items()}, i).cpu().numpy()
             local_priority = priority[indices[valid.cpu().numpy()]]
@@ -240,12 +258,22 @@ class NormalMemory(nn.Module):
                 _, first, inverse, counts = np.unique(pairs, axis=0, return_index=True, return_inverse=True, return_counts=True)
                 local_priority = 1 / counts[inverse]
                 local_priority[first] += 2  # Prefer distinct rare transitions before duplicate windows.
-            chosen = valid[torch.as_tensor(self._representatives(embedding, self.m_num.shape[1], seed + i,
-                                           local_priority, rare_fraction), device=valid.device)]
-            self.m_num[i, :len(chosen)] = f["chi"][chosen, i]
-            self.m_tokens[i, :len(chosen)] = f["tokens"][chosen, i]
-            self.m_active[i, :len(chosen)] = True
-            progress.update(i + 1)
+            jobs.append((i, valid.cpu().numpy(), embedding, local_priority))
+        def choose(job):
+            i, valid, embedding, local_priority = job
+            selected = self._representatives(embedding, self.m_num.shape[1], seed + i, local_priority, rare_fraction)
+            return i, valid[selected]
+        # Only CPU arrays enter workers. Restrict native KMeans pools to avoid
+        # multiplying the configured CPU budget by the number of channels.
+        with threadpool_limits(limits=1 if workers else None):
+            with ordered_prefetch(choose, jobs, workers=workers, depth=max(1, 2 * workers)) as pending:
+                for completed, (i, selected) in enumerate(pending, 1):
+                    chosen = torch.as_tensor(selected, device=f["v"].device)
+                    self.m_num[i, :len(chosen)] = f["chi"][chosen, i]
+                    self.m_tokens[i, :len(chosen)] = f["tokens"][chosen, i]
+                    self.m_active[i, :len(chosen)] = True
+                    progress.update(completed)
+        progress.update(self.schema.channels, force=True)
         valid = torch.nonzero(f["lv"].all(-1), as_tuple=False).flatten()
         if len(valid):
             embedding = self.schema.cluster_features({k: v[valid] for k, v in f.items()}).cpu().numpy()
@@ -380,12 +408,33 @@ class NormalMemory(nn.Module):
         shape = f["sv"].shape
         pn, pt = self.j_num.transpose(0, 1), self.j_tokens.transpose(0, 1)
         d = self._distances(f, pn, pt, short=True) / self.peer_scale[:, None]
+        if self.peer_indices is not None:
+            # [..., target, neighbor, prototype]; memory grows with top-k, not C².
+            cost = d[..., self.peer_indices, :].double()
+            valid = f["sv"][..., self.peer_indices] & self.peer_active
+            ordered = cost.masked_fill(~valid[..., None], float("inf")).sort(dim=-2, stable=True).values
+            counts = valid.sum(-1)
+            kept = torch.ceil(counts * (1 - trim)).long()
+            positions = torch.arange(cost.shape[-2], device=cost.device)
+            take = positions < kept[..., None]
+            peer = ordered.masked_fill(~take[..., None], 0).sum(-2) / kept.clamp_min(1)[..., None]
+            secondary = cost.masked_fill(~valid[..., None], 0).sum(-2) / counts.clamp_min(1)[..., None]
+            return dict(peer=peer.transpose(-1, -2), secondary=secondary.transpose(-1, -2), counts=counts)
         peer, secondary, counts = self.excluded_trim(
             d.reshape(-1, self.schema.channels, self.j_num.shape[0]).transpose(1, 2),
             f["sv"].reshape(-1, self.schema.channels), trim)
         return dict(peer=peer.reshape(*shape[:-1], self.j_num.shape[0], shape[-1]),
                     secondary=secondary.reshape(*shape[:-1], self.j_num.shape[0], shape[-1]),
                     counts=counts.reshape(shape))
+
+    def external_reference(self, prepared):
+        """Vectorized exact routing when the state-prior coefficient is zero."""
+        cost = prepared["peer"].masked_fill(~self.j_active[:, None], float("inf"))
+        tied = cost == cost.min(-2, keepdim=True).values
+        index = prepared["secondary"].masked_fill(~tied, float("inf")).argmin(-2)
+        channels = torch.arange(self.schema.channels, device=index.device)
+        support = prepared["peer"].gather(-2, index.unsqueeze(-2)).squeeze(-2).float()
+        return self.j_num[index, channels, :2], self.j_tokens[index, channels, -2:], index, support
 
     def lookup_reference(self, index):
         channels = torch.arange(self.schema.channels, device=index.device)
@@ -462,7 +511,9 @@ class NormalModel(nn.Module):
         self.schema = DescriptorSchema(metadata)
         self.predictor = TypedForecaster(self.schema, config["model"])
         self.memory = NormalMemory(self.schema, config["model"]["marginal_prototypes"], config["model"]["joint_prototypes"],
-                                      config.get("memory", {}).get("prototype_chunk", 32))
+                                      config.get("memory", {}).get("prototype_chunk", 32),
+                                      config.get("memory", {}).get("reference_peer_mode", "all"),
+                                      config.get("memory", {}).get("reference_neighbors", 4))
         self.teacher = NormalTeacher(self.schema, config["stage2"].get("eta", .2), config["stage2"].get("rho", .95))
 
     def freeze(self):

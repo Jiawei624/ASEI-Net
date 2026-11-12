@@ -21,6 +21,7 @@ def main():
     device.add_argument("--device", default=None, help="cpu or a logical CUDA device")
     device.add_argument("--gpu", type=int, help="Physical GPU index")
     parser.add_argument("--output", help="Keep smoke artifacts in this directory; default uses a temporary directory")
+    parser.add_argument("--with-vus", action="store_true", help="Also exercise the complete 22-metric evaluation on synthetic data")
     args = parser.parse_args()
     if args.channels < 2 or not 0 <= args.discrete_channels < args.channels or args.pairs < 1:
         parser.error("Use at least two channels with at least one continuous channel.")
@@ -61,13 +62,23 @@ def main():
         cfg["teacher"].update(epochs=1, patience=1, train_sequences=1,
                                batch_sequences=1, sequence_length=16, block_length=16)
         cfg["stage2"].update(epochs=1, patience=1, train_pairs=args.pairs, validation_pairs=args.pairs, batch_pairs=2, block_length=32)
-        cfg["evaluation"].update(skip_vus=True)
+        cfg["evaluation"].update(skip_vus=not args.with_vus)
         # Enough rank resolution to exercise the constrained selector on this
         # tiny synthetic prefix; these values are never used by dataset runs.
         cfg["calibration"].update(alpha=.1, alphas=[.1], weights=[.5, .5])
         destination = run_entity(Entity(cfg["data"]["datasets"][0], "smoke", path, 600), cfg, 42, diagnostics=True)
         stream, names = load_bundle(destination / "bundle.pt", cfg["runtime"]["device"])
         result = json.loads((destination / "result.json").read_text(encoding="utf-8"))
+        if cfg["stage2"]["variant"] == "full":
+            from asei.compat import load_torch_checkpoint
+            history = load_torch_checkpoint(destination / "detector.pt", map_location="cpu")["history"]
+            for entry in history:
+                for phase in ("train", "selection"):
+                    values = entry[phase]
+                    expected = values["classification"] + sum(cfg["stage2"]["lambda_" + name] * values[name]
+                        for name in ("state", "tail", "channel", "pair"))
+                    np.testing.assert_allclose(values["loss"], expected, rtol=1e-5, atol=1e-6)
+                    assert "rank" not in values and "synthetic_f_score" not in values
         if cfg["stage2"]["selection_metric"] == "normal_constrained":
             assert result["detector_selection"]["statistics"]["normal_constraint_supported"]
         if cfg["stage2"]["local_scaling"]:

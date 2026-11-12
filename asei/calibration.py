@@ -5,7 +5,10 @@ import numpy as np
 
 
 class ParallelCalibration:
-    def __init__(self, short, dynamic, weights=(.5, .5), alpha=.01):
+    def __init__(self, short, dynamic, weights=(.5, .5), alpha=.01, ranking="empirical"):
+        if ranking not in {"empirical", "continuous_tail"}:
+            raise ValueError("Unknown ranking score mapping.")
+        self.ranking = ranking
         self.weights = np.asarray(weights, np.float64)
         if self.weights.shape != (2,) or not np.isfinite(self.weights).all() or (self.weights < 0).any() or not np.isclose(self.weights.sum(), 1):
             raise ValueError("Parallel calibration requires nonnegative fixed weights summing to one.")
@@ -22,6 +25,17 @@ class ParallelCalibration:
             values = np.sort(values).copy()
             values.setflags(write=False)
             self.references.append(values)
+        self.tail_parameters = []
+        for reference in self.references:
+            if not len(reference):
+                self.tail_parameters.append(None)
+                continue
+            anchor = float(reference[int(.95 * (len(reference) - 1))])
+            excess = reference[reference > anchor] - anchor
+            spread = float(np.quantile(reference, .75) - np.quantile(reference, .25))
+            scale = max(float(excess.mean()) if len(excess) else 0., .1 * spread, 1e-3)
+            probability = (1 + len(reference) - np.searchsorted(reference, anchor, side="left")) / (len(reference) + 1)
+            self.tail_parameters.append(dict(anchor=anchor, scale=scale, probability=float(probability)))
 
     def transform(self, short, dynamic, short_valid=None, dynamic_valid=None, alpha=None):
         arrays = np.broadcast_arrays(np.asarray(short, np.float64), np.asarray(dynamic, np.float64))
@@ -40,7 +54,18 @@ class ParallelCalibration:
         operating_alpha = self.alpha if alpha is None else float(alpha)
         if not 0 < operating_alpha < 1:
             raise ValueError("alpha must lie in (0,1).")
-        return dict(scores=np.where(valid, -np.log(combined), np.nan), valid=valid,
+        scores = -np.log(combined)
+        if self.ranking == "continuous_tail":
+            evidence = []
+            for values, mask, p, weight, parameters in zip(arrays, masks, ranks, self.weights, self.tail_parameters):
+                branch = -np.log(p)
+                if parameters is not None:
+                    above = values > parameters["anchor"]
+                    extended = -np.log(parameters["probability"]) + (values - parameters["anchor"]) / parameters["scale"]
+                    branch = np.where(above, extended, branch)
+                evidence.append(np.where(mask & (weight > 0), branch + np.log(weight) if weight > 0 else -np.inf, -np.inf))
+            scores = np.maximum(0., np.maximum(*evidence))
+        return dict(scores=np.where(valid, scores, np.nan), valid=valid,
                     p_short=ranks[0], p_dynamic=ranks[1], p_mix=combined,
                     labels=valid & (combined <= operating_alpha))
 
@@ -52,8 +77,10 @@ class ParallelCalibration:
 
     def as_dict(self):
         return dict(short=self.references[0], dynamic=self.references[1], weights=self.weights.tolist(), alpha=self.alpha,
-                    method="parallel_normal", guarantee="pointwise only under valid marginal tail ranks; not anytime-valid")
+                    method="parallel_normal", ranking=self.ranking, tail_parameters=self.tail_parameters,
+                    score_role="ranking only; alarms always use empirical p_mix",
+                    guarantee="pointwise only under valid marginal tail ranks; not anytime-valid; continuous ranking is not a p-value")
 
     @classmethod
     def from_dict(cls, record):
-        return cls(record["short"], record["dynamic"], record["weights"], record["alpha"])
+        return cls(record["short"], record["dynamic"], record["weights"], record["alpha"], record.get("ranking", "empirical"))

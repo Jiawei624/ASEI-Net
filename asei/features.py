@@ -11,6 +11,16 @@ from .tasks import NormalTaskPolicy
 from .progress import periodic_progress
 
 
+class EvidenceLayout:
+    """Stable layout: forecast(2), short difference(2), long differences(76)."""
+    numeric_stop = 80
+    energy_stop = 82
+    base_size = 90  # eight availability masks follow the two energies
+
+    def __init__(self, reference_features=False):
+        self.size = self.base_size + (2 if reference_features else 0)
+
+
 class DescriptorSchema(nn.Module):
     def __init__(self, metadata):
         super().__init__()
@@ -146,45 +156,91 @@ class DescriptorSchema(nn.Module):
 
 @torch.no_grad()
 def forecast_errors(record, normal, batch_size=64, clean=None, clean_errors=None, clean_ready=None, output=None,
-                    log_interval_seconds=0, progress_label="forecast batches"):
+                    log_interval_seconds=0, progress_label="forecast batches", workers=0, prefetch=2):
     """Cache only two errors per channel; affected histories are recomputed exactly."""
-    n, c = record.z.shape
+    return forecast_errors_many([record], normal, batch_size,
+        [clean], [clean_errors], [clean_ready], [output], log_interval_seconds, progress_label, workers, prefetch)[0]
+
+
+@torch.no_grad()
+def forecast_errors_many(records, normal, batch_size=64, cleans=None, clean_errors=None, clean_ready=None, outputs=None,
+                         log_interval_seconds=0, progress_label="forecast batches", workers=0, prefetch=2):
+    """Fill whole GPU batches across independent tasks; keep exact task-local histories."""
+    from .parallel import ordered_prefetch
+    count = len(records)
+    cleans = [None] * count if cleans is None else cleans
+    clean_errors = [None] * count if clean_errors is None else clean_errors
+    clean_ready = [None] * count if clean_ready is None else clean_ready
+    outputs = [None] * count if outputs is None else outputs
+    if not all(len(v) == count for v in (cleans, clean_errors, clean_ready, outputs)):
+        raise ValueError("Forecast task lists must have matching lengths.")
     w = normal.predictor.window
-    if output is None:
-        errors, ready = np.zeros((n, c, 2), np.float32), np.zeros((n, c, 2), bool)
-    else:
-        errors, ready = output
-        if errors.shape != (n, c, 2) or ready.shape != errors.shape:
-            raise ValueError("Forecast output cache shape differs from the source.")
-        errors[:] = 0
-        ready[:] = False
-    times = np.arange(w, n)
-    reused = 0
-    if clean is not None:
-        if clean.z.shape != record.z.shape:
-            raise ValueError("Paired prediction reuse requires identical time axes.")
-        changed = np.any((clean.mask != record.mask) | (clean.z != record.z), axis=1)
-        prefix = np.r_[0, np.cumsum(changed, dtype=np.int64)]
-        reuse = (prefix[times + 1] - prefix[times - w]) == 0
-        index = times[reuse]
-        errors[index], ready[index] = clean_errors[index], clean_ready[index]
-        times = times[~reuse]
-        reused = len(index)
+    results, tasks = [], []
+    for record, clean, cached_error, cached_ready, output in zip(records, cleans, clean_errors, clean_ready, outputs):
+        n, c = record.z.shape
+        if output is None:
+            errors, ready = np.zeros((n, c, 2), np.float32), np.zeros((n, c, 2), bool)
+        else:
+            errors, ready = output
+            if errors.shape != (n, c, 2) or ready.shape != errors.shape:
+                raise ValueError("Forecast output cache shape differs from the source.")
+            errors[:] = 0
+            ready[:] = False
+        times, reused = np.arange(w, n), 0
+        if clean is not None:
+            if clean.z.shape != record.z.shape:
+                raise ValueError("Paired prediction reuse requires identical time axes.")
+            changed = np.any((clean.mask != record.mask) | (clean.z != record.z), axis=1)
+            prefix = np.r_[0, np.cumsum(changed, dtype=np.int64)]
+            reuse = (prefix[times + 1] - prefix[times - w]) == 0
+            index = times[reuse]
+            errors[index], ready[index] = cached_error[index], cached_ready[index]
+            times, reused = times[~reuse], len(index)
+        results.append((errors, ready, reused))
+        tasks.append(times)
     device = normal.schema.amp_mean.device
     normal.predictor.eval()
     offsets = np.arange(-w, 0)
-    for left in periodic_progress(range(0, len(times), batch_size), progress_label, log_interval_seconds):
-        ix = times[left:left + batch_size]
-        history = torch.as_tensor(record.z[ix[:, None] + offsets], device=device)
-        masks = torch.as_tensor(record.mask[ix[:, None] + offsets], device=device)
-        target = torch.as_tensor(record.z[ix], device=device)
-        prediction, logits, usable = normal.predictor(history, masks)
-        residual = target[..., None] - prediction
-        symbols = normal.schema.ids(target)
-        if normal.schema.cat_indices:
-            nll = -F.log_softmax(logits, -1).gather(-1, symbols[..., None, None].expand(-1, -1, 2, 1)).squeeze(-1)
-            residual = torch.where(normal.schema.categorical[None, :, None], nll, residual)
-        usable &= torch.as_tensor(record.mask[ix], device=device)[..., None]
-        errors[ix] = residual.masked_fill(~usable, 0).cpu().numpy()
-        ready[ix] = usable.cpu().numpy()
-    return errors, ready, reused
+    def batches():
+        pending, size = [], 0
+        for task, times in enumerate(tasks):
+            for left in range(0, len(times), batch_size):
+                ix = times[left:left + batch_size]
+                while len(ix):
+                    take = min(batch_size - size, len(ix))
+                    pending.append((task, ix[:take]))
+                    ix, size = ix[take:], size + take
+                    if size == batch_size:
+                        yield pending
+                        pending, size = [], 0
+        if pending:
+            yield pending
+    def prepare(batch):
+        histories, masks, targets, observed = [], [], [], []
+        for task, ix in batch:
+            record = records[task]
+            history_ix = ix[:, None] + offsets
+            histories.append(record.z[history_ix])
+            masks.append(record.mask[history_ix])
+            targets.append(record.z[ix])
+            observed.append(record.mask[ix])
+        return batch, np.concatenate(histories), np.concatenate(masks), np.concatenate(targets), np.concatenate(observed)
+    with ordered_prefetch(prepare, batches(), workers=min(1, workers), depth=prefetch if workers else 0) as pending:
+        for batch, history, masks, target, observed in periodic_progress(pending, progress_label, log_interval_seconds):
+            history = torch.as_tensor(history, device=device)
+            masks = torch.as_tensor(masks, device=device)
+            target = torch.as_tensor(target, device=device)
+            prediction, logits, usable = normal.predictor(history, masks)
+            residual = target[..., None] - prediction
+            symbols = normal.schema.ids(target)
+            if normal.schema.cat_indices:
+                nll = -F.log_softmax(logits, -1).gather(-1, symbols[..., None, None].expand(-1, -1, 2, 1)).squeeze(-1)
+                residual = torch.where(normal.schema.categorical[None, :, None], nll, residual)
+            usable &= torch.as_tensor(observed, device=device)[..., None]
+            values, available = residual.masked_fill(~usable, 0).cpu().numpy(), usable.cpu().numpy()
+            offset = 0
+            for task, ix in batch:
+                results[task][0][ix] = values[offset:offset + len(ix)]
+                results[task][1][ix] = available[offset:offset + len(ix)]
+                offset += len(ix)
+    return results

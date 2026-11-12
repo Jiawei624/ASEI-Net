@@ -1,3 +1,4 @@
 base: ../pump.yaml
 stage2:
+  selection_metric: normal_constrained
   local_scaling: false

@@ -7,10 +7,11 @@ import numpy as np
 import torch
 from sklearn.metrics import average_precision_score
 
-from .batching import feature_blocks
+from .batching import feature_blocks, tensor_bytes
 from .calibration import ParallelCalibration
 from .data import Record
 from .features import forecast_errors
+from .parallel import preparation_workers, prefetch_depth
 
 
 class NormalSelectionReplay:
@@ -22,17 +23,30 @@ class NormalSelectionReplay:
         start = max(0, target - window)
         self.record = Record(record.z[start:].copy(), record.mask[start:].copy(), target - start)
         self.errors, self.ready, _ = forecast_errors(self.record, model.normal, cfg["runtime"]["feature_batch_size"],
-            log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 30))
+            log_interval_seconds=cfg["runtime"].get("log_interval_seconds", 30), workers=preparation_workers(cfg), prefetch=prefetch_depth(cfg))
         self.record.routing = model.routing(self.record, cfg["stage2"]["block_length"])
+        self.prepared_cache, self.cache_bytes = {}, 0
+        self.cache_limit = cfg["runtime"].get("normal_selection_cache_mb", 0) * 1024 ** 2
 
     @torch.no_grad()
     def evaluate(self, model):
         model.eval()
         record, cfg = self.record, self.cfg
         state, arrays = None, {}
-        for _, _, f in feature_blocks(model.normal.schema, [record], [0], len(record.z),
+        for offset, _, f in feature_blocks(model.normal.schema, [record], [0], len(record.z),
                 cfg["stage2"]["block_length"], cfg, [self.errors], [self.ready]):
-            values, state = model.forward_block(f, state)
+            device = model.normal.schema.amp_mean.device
+            if offset in self.prepared_cache:
+                prepared = {k: v.to(device) for k, v in self.prepared_cache[offset].items()}
+            else:
+                prepared = model.frozen_block(f, None if state is None else state.normal)
+                keep = {k: prepared[k] for k in ("feature", "normal", "reference_input", "actual_projected", "reference_valid",
+                        "short_energy", "short_available", "final_normal")}
+                size = tensor_bytes(keep)
+                if self.cache_bytes + size <= self.cache_limit:
+                    self.prepared_cache[offset] = {k: v.detach().cpu() for k, v in keep.items()}
+                    self.cache_bytes += size
+            values, state = model.forward_block(f, state, prepared=prepared)
             for key in ("short", "dynamic", "short_valid", "dynamic_valid"):
                 arrays.setdefault(key, []).append(values[key][0].cpu().numpy())
         raw = {k: np.concatenate(v)[record.target_start:] for k, v in arrays.items()}
@@ -48,6 +62,8 @@ class NormalSelectionReplay:
             return None, info
         if any(weight > 0 and not len(v) for weight, v in zip(weights, references)):
             return None, info
+        # Preserve the original selection protocol. Final evaluation may use a
+        # continuous ranking map, but it never changes this internal tail rank.
         calibration = ParallelCalibration(*references, weights, cfg["calibration"]["alpha"])
         if not all(v["supported"] for weight, v in zip(weights, calibration.resolution().values()) if weight > 0):
             return None, info

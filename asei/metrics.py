@@ -221,7 +221,7 @@ def label_metrics(actual, predicted, names, errors, scores=None):
     return result
 
 
-def score_metrics(actual, scores, names, errors):
+def score_metrics(actual, scores, names, errors, workers=1):
     unknown = set(names) - SCORE_METRICS
     if unknown:
         raise ValueError(f"Unsupported score metrics (test-label threshold scans are excluded): {unknown}")
@@ -244,7 +244,10 @@ def score_metrics(actual, scores, names, errors):
         if name in {"VUS_ROC", "VUS_PR"}:
             if "vus" not in shared:
                 window = int(np.median(module.get_list_anomaly(actual)))
-                shared["vus"] = module.generate_curve(actual.copy(), scores.copy(), 2 * window)
+                if workers > 1:
+                    shared["vus"] = module.generate_curve(actual.copy(), scores.copy(), 2 * window, workers=workers)
+                else:
+                    shared["vus"] = module.generate_curve(actual.copy(), scores.copy(), 2 * window)
             return shared["vus"][6 if name == "VUS_ROC" else 7]
         return getattr(module, name)(actual.copy(), scores.copy())
 

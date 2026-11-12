@@ -18,6 +18,8 @@ model:
   marginal_prototypes: 128
   joint_prototypes: 256
 memory:
+  reference_peer_mode: normal_topk
+  reference_neighbors: 4
   pool_size: 8192
   prototype_chunk: 32
   reference_block_length: 16
@@ -69,7 +71,10 @@ stage2:
   eta: 0.2
   rho: 0.95
   reference_trim: 0.1
-  reference_prior: 0.25
+  reference_prior: 0.0
+  reference_features: true
+  evidence_horizons: [4, 16, 64]
+  task_strengths: [0.25, 0.5, 1.0]
   lambda_state: 0.1
   local_scaling: true
   local_scale_prior: 128.0
@@ -103,6 +108,7 @@ stage2:
   onset_fraction: 0.35
   reference_guard_multiplier: 3.0
 calibration:
+  ranking: continuous_tail
   method: parallel_normal
   weights:
   - 0.05
@@ -166,8 +172,11 @@ runtime:
   - 45
   task_cache_memory_mb: 256
   detector_execution: block
-  preparation_batch_pairs: 8
-  preparation_workers: 2
+  preparation_batch_pairs: 16
+  preparation_workers: 4
+  async_task_writes: true
+  metric_workers: 4
+  normal_selection_cache_mb: 512
   prefetch_batches: 2
   batch_working_memory_mb: 2048
   save_predictions: true

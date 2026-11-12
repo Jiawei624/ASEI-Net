@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .state import normal_scan, observed_scan
+from .state import normal_scan, observed_scan, evidence_scan
+from .features import EvidenceLayout
 from .resources import cooperate
 
 
@@ -15,9 +17,11 @@ from .resources import cooperate
 class TrajectoryState:
     normal: torch.Tensor
     observed: torch.Tensor
+    evidence: Optional[torch.Tensor] = None
 
     def detach(self):
-        return TrajectoryState(self.normal.detach(), self.observed.detach())
+        return TrajectoryState(self.normal.detach(), self.observed.detach(),
+                               None if self.evidence is None else self.evidence.detach())
 
 
 class DualTrajectoryDetector(nn.Module):
@@ -34,10 +38,13 @@ class DualTrajectoryDetector(nn.Module):
         self.evidence_transform = settings.get("evidence_transform", "identity")
         hidden = int(settings.get("evidence_hidden", 64))
         readout = int(settings.get("readout_hidden", 32))
-        self.evidence = nn.Sequential(nn.Linear(90 + embedding, hidden), nn.GELU(), nn.Linear(hidden, 32))
+        self.layout = EvidenceLayout(settings.get("reference_features", False))
+        self.evidence = nn.Sequential(nn.Linear(self.layout.size + embedding, hidden), nn.GELU(), nn.Linear(hidden, 32))
+        self.horizons = tuple(settings.get("evidence_horizons", []))
+        self.register_buffer("evidence_rates", torch.tensor([1. / h for h in self.horizons]).reshape(-1, 1), persistent=False)
         self.gate = nn.Linear(96, 32)
         nn.init.constant_(self.gate.bias, 1.)
-        self.readout = nn.Sequential(nn.Linear(96, readout), nn.GELU(), nn.Linear(readout, 1))
+        self.readout = nn.Sequential(nn.Linear(96 + 32 * len(self.horizons), readout), nn.GELU(), nn.Linear(readout, 1))
         self.single = nn.GRUCell(32, 32) if self.variant == "single_gru" else None
 
     def train(self, mode=True):
@@ -47,7 +54,8 @@ class DualTrajectoryDetector(nn.Module):
 
     def initial_state(self, batch):
         zeros = self.normal.schema.amp_mean.new_zeros(batch, self.normal.schema.channels, 32)
-        return TrajectoryState(zeros, zeros.clone())
+        evidence = zeros[:, :, None].expand(-1, -1, len(self.horizons), -1).clone() if self.horizons else None
+        return TrajectoryState(zeros, zeros.clone(), evidence)
 
     def _reference_replay(self, f, state, training=False):
         """Only the previous normal state and available peers can select a reference."""
@@ -69,6 +77,20 @@ class DualTrajectoryDetector(nn.Module):
             block = {k: v[:, begin:end] for k, v in f.items()}
             with torch.no_grad():
                 prepared = memory.prepare_peers(block, self.settings.get("reference_trim", .1))
+            # With an external-only query the selected reference has no state
+            # dependency. Batch its retrieval; only the small state scan is causal.
+            if (self.settings.get("reference_prior", .25) == 0 and (training or self.variant != "no_external")
+                    and self.normal.config["runtime"].get("reference_execution", "auto") != "step"
+                    and bool(memory.j_active.any()) and bool((prepared["counts"] > 0).all())):
+                reference, pair, index, peer_cost = memory.external_reference(prepared)
+                adapted, projected = teacher.reference_input(index, tables)
+                available = torch.ones_like(block["sv"])
+                states, state = normal_scan(projected, state, block["sv"],
+                    teacher.cell.hidden.weight, teacher.cell.hidden.bias, teacher.cell.eta)
+                values = (reference, pair, available, available, index, peer_cost, adapted, states)
+                for name, value in zip(collected, values):
+                    collected[name].extend(value.unbind(1))
+                continue
             for t in range(begin, end):
                 step = {k: v[:, t] for k, v in f.items()}
                 with torch.no_grad():
@@ -124,6 +146,14 @@ class DualTrajectoryDetector(nn.Module):
         feature = torch.cat([f["forecast"].masked_fill(~f["forecast_ready"], 0),
                              difference.masked_fill(~valid_state[..., None], 0), long["md"], long["jd"],
                              short_energy.log1p()[..., None], long_energy.log1p()[..., None], masks], -1)
+        if self.settings.get("reference_features", False):
+            limit = normal.memory.reference_limit
+            scale = torch.where(torch.isfinite(limit), limit, torch.ones_like(limit)).clamp_min(1e-3)
+            ratio = (references["peer_cost"] / scale).clamp_min(0)
+            trust = torch.where(external, 1 / (1 + ratio), torch.ones_like(ratio))
+            # Unsupported peers must not force a large deterministic difference.
+            feature[..., 2:4] *= trust[..., None]
+            feature = torch.cat([feature, ratio.log1p()[..., None], trust[..., None]], -1)
         return dict(feature=feature, reference=reference, reference_pair=pair,
             reference_input=references["adapted"], normal=references["states"], final_normal=final,
             actual_projected=teacher.cell.input(teacher.adapt(f["v"], f["pair"])), reference_valid=valid_state,
@@ -137,8 +167,8 @@ class DualTrajectoryDetector(nn.Module):
         if self.evidence_transform == "signed_log1p":
             # Compress outliers without discarding sign or magnitude. The two
             # energy coordinates are already log-transformed; masks stay binary.
-            numeric = features[..., :80]
-            features = torch.cat([numeric.sign() * numeric.abs().log1p(), features[..., 80:]], -1)
+            numeric = features[..., :self.layout.numeric_stop]
+            features = torch.cat([numeric.sign() * numeric.abs().log1p(), features[..., self.layout.numeric_stop:]], -1)
         if self.identity is not None:
             identity = self.identity.weight.expand(*features.shape[:-2], -1, -1)
             features = torch.cat([features, identity], -1)
@@ -168,7 +198,14 @@ class DualTrajectoryDetector(nn.Module):
             observed, retention, final_observed = observed_scan(prepared["actual_projected"], normals,
                 state.normal, state.observed, gate_base, self.gate.weight[:, 64:], valid,
                 cell.hidden.weight, cell.hidden.bias, cell.eta, mode, float(self.settings.get("fixed_retention", .9)))
-        dynamic = self.readout(torch.cat([b, observed - normals, normals], -1)).squeeze(-1)
+        readout = [b, observed - normals, normals]
+        final_evidence = state.evidence
+        if self.horizons:
+            if final_evidence is None:
+                final_evidence = self.initial_state(b.shape[0]).evidence
+            context, final_evidence = evidence_scan(b, final_evidence, valid, self.evidence_rates)
+            readout.append(context)
+        dynamic = self.readout(torch.cat(readout, -1)).squeeze(-1)
         dv = valid & f["target"] & (self.variant != "energy_only")
         sv = prepared["short_available"].any(-1) & f["target"] & (self.variant != "no_energy")
         short = prepared["short_energy"].log1p().masked_fill(~sv, float("-inf")).amax(-1)
@@ -187,7 +224,7 @@ class DualTrajectoryDetector(nn.Module):
             output.update(observed=observed, retention=retention, channel_dynamic=dynamic, channel_valid=dv)
         valid_channels = (f["sv"] & f["target"]).sum(-1).clamp(min=1)
         output["short_reference_coverage"] = (prepared["short_available"][..., 1] & f["target"]).sum(-1) / valid_channels
-        return output, TrajectoryState(prepared["final_normal"], final_observed)
+        return output, TrajectoryState(prepared["final_normal"], final_observed, final_evidence)
 
     def step(self, features, state=None, return_aux=False):
         output, state = self.forward_block({k: v[:, None] for k, v in features.items()}, state, return_aux)

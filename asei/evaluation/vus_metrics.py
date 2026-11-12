@@ -374,7 +374,8 @@ class metricor:
         return auc, ap, fpr, tpr, precision
 
     # TPR_FPR_window
-    def RangeAUC_volume(self, labels_original, score, windowSize):
+    def RangeAUC_volume(self, labels_original, score, windowSize, workers=1):
+        from ..parallel import ordered_prefetch
         ranked = self._ranked_thresholds(score)
 
         tpr_3d = []
@@ -387,17 +388,18 @@ class metricor:
         window_3d = np.arange(0, windowSize + 1, 1)
         P = np.sum(labels_original)
 
-        for window in window_3d:
+        def calculate(window):
             labels = self.extend_postive_range(labels_original, window)
-
-            AUC_range, AP_range, fpr, tpr, prec = self._ranked_range_curve(labels, P, ranked)
-
-            tpr_3d.append(tpr)
-            fpr_3d.append(fpr)
-            prec_3d.append(prec)
-
-            auc_3d.append(AUC_range)
-            ap_3d.append(AP_range)
+            return self._ranked_range_curve(labels, P, ranked)
+        # Ordered collection retains the original integration and sum order.
+        with ordered_prefetch(calculate, window_3d, workers=workers if workers > 1 else 0,
+                              depth=max(1, 2 * workers)) as pending:
+            for AUC_range, AP_range, fpr, tpr, prec in pending:
+                tpr_3d.append(tpr)
+                fpr_3d.append(fpr)
+                prec_3d.append(prec)
+                auc_3d.append(AUC_range)
+                ap_3d.append(AP_range)
 
         return (
             tpr_3d,
@@ -409,7 +411,7 @@ class metricor:
         )
 
 
-def generate_curve(label, score, slidingWindow):
+def generate_curve(label, score, slidingWindow, workers=1):
     (
         tpr_3d,
         fpr_3d,
@@ -418,7 +420,7 @@ def generate_curve(label, score, slidingWindow):
         avg_auc_3d,
         avg_ap_3d,
     ) = metricor().RangeAUC_volume(
-        labels_original=label, score=score, windowSize=1 * slidingWindow
+        labels_original=label, score=score, windowSize=1 * slidingWindow, workers=workers
     )
 
     X = np.array(tpr_3d).reshape(1, -1).ravel()

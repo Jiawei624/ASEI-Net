@@ -1,0 +1,4 @@
+base: swat.yaml
+stage2:
+  variant: single_gru
+  lambda_state: 0.0

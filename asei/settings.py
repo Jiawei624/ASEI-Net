@@ -33,7 +33,7 @@ def defaults(cfg):
                        optimizer_update="task_batch", hard_negative_fraction=.25, discrete_max_values=16, donor_candidates=16,
                        boundary_blend=4, relation_l1=.001, relation_generator="residual_var"),
         "memory": dict(pool_size=8192, prototype_chunk=32, reference_block_length=16, rare_fraction=.25),
-        "calibration": dict(method="parallel_normal", alpha=.01, alphas=[.001, .005, .01], weights=[.5, .5]),
+        "calibration": dict(method="parallel_normal", alpha=.01, alphas=[.001, .005, .01], weights=[.5, .5], ranking="empirical"),
         "evaluation": dict(skip_vus=False, recovery_confirmation=8, regression_metrics=[],
                            supplementary_label_metrics=[], latency_points=0),
         "runtime": dict(device="auto", output="outputs", log_dir="logs", feature_batch_size=64,
@@ -60,9 +60,33 @@ def resolve(cfg, n_train, channels):
     if n_train < 65 or channels < 1:
         raise ValueError("The detector needs at least 65 fitting samples and one observed channel.")
     m, s, cal = cfg["model"], cfg["stage2"], cfg["calibration"]
+    if cfg["data"].get("default_channel_type", "auto") not in {"auto", "continuous", "discrete"}:
+        raise ValueError("data.default_channel_type must be auto, continuous or discrete.")
     for key, value in dict(evidence_transform="identity", evidence_hidden=64, readout_hidden=32,
-            channel_embedding_dim=0, lambda_channel=0., onset_fraction=.5, reference_guard_multiplier=0.).items():
+            channel_embedding_dim=0, lambda_channel=0., onset_fraction=.5, reference_guard_multiplier=0.,
+            reference_features=False, evidence_horizons=[], task_strengths=[1.]).items():
         s.setdefault(key, value)
+    unsupported_objectives = {"lambda_rank", "rank_samples", "selection_fpr_penalty"}.intersection(s)
+    if unsupported_objectives:
+        raise ValueError("Unsupported stage2 objective settings: " + ", ".join(sorted(unsupported_objectives)) +
+                         "; use the original classification/state/tail/channel/pair objective.")
+    memory = cfg["memory"]
+    memory.setdefault("reference_peer_mode", "all")
+    memory.setdefault("reference_neighbors", 4)
+    if memory["reference_peer_mode"] not in {"all", "normal_topk"}:
+        raise ValueError("memory.reference_peer_mode must be all or normal_topk.")
+    neighbors = memory["reference_neighbors"]
+    if isinstance(neighbors, bool) or not isinstance(neighbors, int) or neighbors < 1:
+        raise ValueError("memory.reference_neighbors must be a positive integer.")
+    if not isinstance(s["reference_features"], bool):
+        raise ValueError("stage2.reference_features must be boolean.")
+    horizons = s["evidence_horizons"]
+    if not isinstance(horizons, list) or any(isinstance(v, bool) or not isinstance(v, int) or v < 2 for v in horizons) or len(set(horizons)) != len(horizons):
+        raise ValueError("stage2.evidence_horizons must contain distinct integer horizons >= 2.")
+    if not isinstance(s["task_strengths"], list) or not s["task_strengths"] or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not 0 < v <= 1 for v in s["task_strengths"]):
+        raise ValueError("stage2.task_strengths must be a nonempty list in (0,1].")
+    if cal["ranking"] not in {"empirical", "continuous_tail"}:
+        raise ValueError("calibration.ranking must be empirical or continuous_tail.")
     if s["evidence_transform"] not in {"identity", "signed_log1p"}:
         raise ValueError("stage2.evidence_transform must be identity or signed_log1p.")
     for key in ("evidence_hidden", "readout_hidden", "channel_embedding_dim"):
@@ -80,7 +104,7 @@ def resolve(cfg, n_train, channels):
     if not s["local_scale_min"] <= 1 <= s["local_scale_max"] or s["local_scale_clip"] < 1:
         raise ValueError("Local scale bounds must contain one; the clipping ratio must be at least one.")
     if s["selection_metric"] not in {"loss", "normal_constrained"}:
-        raise ValueError("stage2.selection_metric must be loss or normal_constrained.")
+        raise ValueError("Unknown stage2.selection_metric.")
     points = s["selection_normal_points"]
     if isinstance(points, bool) or not isinstance(points, int) or points < 2:
         raise ValueError("stage2.selection_normal_points must be an integer of at least two.")
@@ -148,6 +172,16 @@ def resolve(cfg, n_train, channels):
             raise ValueError("Invalid runtime." + key)
     if not isinstance(runtime.get("save_predictions", False), bool):
         raise ValueError("runtime.save_predictions must be boolean.")
+    for key, default in (("metric_workers", 1), ("normal_selection_cache_mb", 0)):
+        runtime.setdefault(key, default)
+        value = runtime[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < (1 if key == "metric_workers" else 0):
+            raise ValueError("Invalid runtime." + key)
+    runtime.setdefault("async_task_writes", False)
+    if not isinstance(runtime["async_task_writes"], bool):
+        raise ValueError("runtime.async_task_writes must be boolean.")
+    if runtime.get("reference_execution", "auto") not in {"auto", "step"}:
+        raise ValueError("runtime.reference_execution must be auto or step.")
     for key in ("lambda_state", "lambda_tail", "tail_margin", "reference_prior", "relation_l1", "lambda_channel", "reference_guard_multiplier", "lambda_pair", "pair_margin"):
         if not math.isfinite(s[key]) or s[key] < 0:
             raise ValueError("stage2." + key + " must be finite and nonnegative.")
