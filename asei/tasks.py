@@ -282,7 +282,10 @@ class NormalTaskPolicy:
             kind = channel_types.get(name, "auto")
             if kind not in {"auto", "continuous", "discrete"}:
                 raise ValueError("Channel type must be auto, continuous or discrete.")
-            discrete = kind == "discrete" or (kind == "auto" and len(values) <= max_values)
+            # A constant fit trace provides no evidence of a finite-state
+            # vocabulary. Keep its numeric changes observable on every dataset;
+            # physical categorical constants can still be explicitly declared.
+            discrete = kind == "discrete" or (kind == "auto" and 2 <= len(values) <= max_values)
             self.supports.append(values if discrete else None)
 
     def hard_anchors(self, source, window):

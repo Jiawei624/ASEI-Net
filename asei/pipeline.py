@@ -454,7 +454,7 @@ def run_entity(entity, config, seed, stage="all", diagnostics=False):
     save_bundle(bundle, model, scaler, calibration, cfg, provenance, experiment, bootstrap)
     write_json(detector_dir / "result.json", result)
     csv_path = write_run_result(cfg["runtime"]["run_directory"], result)
-    named_csv = write_named_result(cfg, result)
+    named_csv = write_named_result(cfg, csv_path)
     if cfg["runtime"]["keep_intermediates"] or diagnostics or cfg["runtime"].get("save_predictions", False):
         np.savez_compressed(detector_dir / "predictions.npz", labels=labels, alarms_by_alpha=alarms,
             alphas=np.asarray(cfg["calibration"]["alphas"]),

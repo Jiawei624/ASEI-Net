@@ -48,7 +48,7 @@ def write_csv(path, rows):
 
 def prepare_profiles(round_name, datasets):
     import yaml
-    from asei.config import implementation_fingerprint, write_json
+    from asei.config import implementation_fingerprint, load_config, write_json
 
     if not re.fullmatch(r"[A-Za-z0-9_]+", round_name):
         raise ValueError("Round names may contain only letters, digits and underscores.")
@@ -60,11 +60,17 @@ def prepare_profiles(round_name, datasets):
     content, source_hashes = {}, {}
     for dataset in datasets:
         source = ROOT / "configs" / (dataset + ".yaml")
-        source_hashes[source.relative_to(ROOT).as_posix()] = sha256(source)
-        cfg = yaml.safe_load(source.read_text(encoding="utf-8"))
-        if "base" in cfg:
-            raise ValueError("Dataset sources must be complete configurations: " + str(source))
-        cfg = copy.deepcopy(cfg)
+        dependency, seen = source, set()
+        while dependency not in seen:
+            seen.add(dependency)
+            source_hashes[dependency.relative_to(ROOT).as_posix()] = sha256(dependency)
+            parent = yaml.safe_load(dependency.read_text(encoding="utf-8")).get("base")
+            if parent is None:
+                break
+            dependency = (dependency.parent / parent).resolve()
+        # Materialize inheritance so a frozen profile never follows later edits
+        # to the common method file or depends on its relative source location.
+        cfg = copy.deepcopy(load_config(source))
         cfg["stage2"]["variant"] = "full"
         cfg["runtime"].update(output=output, keep_intermediates=True, save_predictions=True,
                               seeds=[42], log_dir="logs/validation/round" + round_name)

@@ -65,10 +65,19 @@ def main():
         cfg["evaluation"].update(skip_vus=not args.with_vus)
         # Enough rank resolution to exercise the constrained selector on this
         # tiny synthetic prefix; these values are never used by dataset runs.
-        cfg["calibration"].update(alpha=.1, alphas=[.1], weights=[.5, .5])
+        cfg["calibration"].update(alpha=.1, weights=[.5, .5])
         destination = run_entity(Entity(cfg["data"]["datasets"][0], "smoke", path, 600), cfg, 42, diagnostics=True)
         stream, names = load_bundle(destination / "bundle.pt", cfg["runtime"]["device"])
         result = json.loads((destination / "result.json").read_text(encoding="utf-8"))
+        resolved = json.loads((destination / "resolved_config.json").read_text(encoding="utf-8"))
+        from asei.results import read_rows
+        from asei.runs import run_log_path
+        canonical = Path(resolved["runtime"]["run_directory"]) / "metrics.csv"
+        mirror = Path(resolved["runtime"]["output"]) / "results" / (run_log_path(resolved).stem + ".csv")
+        assert canonical.read_bytes() == mirror.read_bytes()
+        csv_rows = read_rows(mirror)
+        assert len(csv_rows) == len(resolved["calibration"]["alphas"]) + 1
+        assert sum(row["metrics_type"] == "score" for row in csv_rows) == 1
         if cfg["stage2"]["variant"] == "full":
             from asei.compat import load_torch_checkpoint
             history = load_torch_checkpoint(destination / "detector.pt", map_location="cpu")["history"]

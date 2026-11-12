@@ -5,6 +5,7 @@ import csv
 import json
 import math
 from pathlib import Path
+import shutil
 
 from .data import DATASETS
 from .metrics import (LABEL_METRIC_ORDER, SCORE_METRIC_ORDER, EVENT_METRIC_ORDER, METRICS_PROTOCOL,
@@ -138,33 +139,16 @@ def write_run_result(run_directory, record):
     return _write_rows(path, rows)
 
 
-def write_named_result(cfg, record):
-    """A log-named CSV with all 22 metrics together on each preset-alpha row."""
+def write_named_result(cfg, source):
+    """Atomically copy the run CSV to its log-named result path, byte for byte."""
     from .config import project_path
     from .runs import run_log_path
     path = project_path(cfg["runtime"]["output"]) / "results" / (run_log_path(cfg).stem + ".csv")
-    additions = result_rows(record)
-    if "label_by_alpha" in record["metrics"]:
-        merged = []
-        for row in additions:
-            if row["metrics_type"] != "label":
-                continue
-            row["metrics_type"] = "both"
-            row["export_role"] = "combined_view"
-            undefined = []
-            for name in SCORE_METRIC_ORDER:
-                value = record["metrics"]["score"].get(name)
-                row[name] = value if value is not None and math.isfinite(float(value)) else ""
-                if name in record["metrics"]["score"] and row[name] == "":
-                    undefined.append(name)
-            row["undefined_metrics"] = ";".join(filter(None, [row["undefined_metrics"], ";".join(undefined)]))
-            row["missing_metrics"] = ";".join(filter(None, [row["missing_metrics"],
-                ";".join(name for name in SCORE_METRIC_ORDER if name not in record["metrics"]["score"])]))
-            merged.append(row)
-        additions = merged
-    rows = read_rows(path) if path.exists() else []
-    rows = [row for row in rows if _model_identity(row) != _model_identity(additions[0])] + additions
-    return _write_rows(path, rows)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(path)
+    return path
 
 
 def remove_run_result(run_directory, dataset, entity, seed, variant):
