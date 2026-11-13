@@ -66,7 +66,7 @@ calibration:
   ranking: continuous_tail
   weights: [0.05, 0.95]
   alpha: 0.01
-  alphas: [0.001, 0.005, 0.01, 0.02, 0.05, 0.1]
+  alphas: [0.0005, 0.001, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.3]
 evaluation:
   skip_vus: false
   recovery_confirmation: 8

@@ -33,7 +33,7 @@ def defaults(cfg):
                        optimizer_update="task_batch", hard_negative_fraction=.25, discrete_max_values=16, donor_candidates=16,
                        boundary_blend=4, relation_l1=.001, relation_generator="residual_var"),
         "memory": dict(pool_size=8192, prototype_chunk=32, reference_block_length=16, rare_fraction=.25),
-        "calibration": dict(method="parallel_normal", alpha=.01, alphas=[.001, .005, .01, .02, .05, .1], weights=[.5, .5], ranking="empirical"),
+        "calibration": dict(method="parallel_normal", alpha=.01, alphas=[.0005, .001, .005, .01, .02, .05, .1, .2, .3], weights=[.5, .5], ranking="empirical"),
         "evaluation": dict(skip_vus=False, recovery_confirmation=8, regression_metrics=[],
                            supplementary_label_metrics=[], latency_points=0),
         "runtime": dict(device="auto", output="outputs", log_dir="logs", feature_batch_size=64,

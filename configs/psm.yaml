@@ -3,20 +3,20 @@ data:
   datasets:
   - PSM
 model:
-  d_model: 64
-  layers: 2
-  dropout: 0.15
+  d_model: 48
+  layers: 1
+  dropout: 0.2
   marginal_prototypes: 128
   joint_prototypes: 256
 memory:
-  pool_size: 8192
-  rare_fraction: 0.25
+  pool_size: 16384
+  rare_fraction: 0.15
 stage1:
-  epochs: 32
+  epochs: 24
   batch_size: 128
-  lr: 0.0003
-  weight_decay: 0.0005
-  patience: 5
+  lr: 0.0002
+  weight_decay: 0.001
+  patience: 4
   stride: 1
   max_train_points: 0
   max_validation_points: 4096
@@ -24,27 +24,29 @@ stage1:
   lr_factor: 0.5
   min_lr: 2.0e-05
 teacher:
-  epochs: 28
+  epochs: 36
   patience: 5
   lr: 0.0003
-  train_sequences: 512
+  batch_sequences: 32
+  train_sequences: 1024
+  weight_decay: 0.0001
   lr_patience: 3
   lr_factor: 0.5
   min_lr: 2.0e-05
 stage2:
-  epochs: 32
-  patience: 6
-  batch_pairs: 16
-  lr: 7.5e-05
-  train_pairs: 2048
-  validation_pairs: 512
+  epochs: 20
+  patience: 4
+  batch_pairs: 32
+  lr: 5.0e-05
+  train_pairs: 4096
+  validation_pairs: 1024
   selection_normal_points: 65536
   selection_fpr_limit: 0.03
   selection_coverage_weight: 0.15
   lambda_tail: 0.15
-  hard_negative_fraction: 0.5
-  weight_decay: 0.0003
-  lr_patience: 2
+  hard_negative_fraction: 0.25
+  weight_decay: 0.001
+  lr_patience: 1
   lr_factor: 0.5
   min_lr: 1.0e-05
   evidence_hidden: 64

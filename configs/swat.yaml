@@ -3,51 +3,53 @@ data:
   datasets:
   - SWAT
 model:
-  d_model: 96
+  d_model: 64
   layers: 2
-  dropout: 0.1
-  marginal_prototypes: 256
-  joint_prototypes: 512
+  dropout: 0.15
+  marginal_prototypes: 512
+  joint_prototypes: 768
 memory:
-  pool_size: 24576
-  rare_fraction: 0.1
+  pool_size: 32768
+  rare_fraction: 0.05
 stage1:
-  epochs: 24
+  epochs: 20
   batch_size: 128
   lr: 0.0002
-  weight_decay: 0.0005
+  weight_decay: 0.001
   patience: 4
   stride: 1
-  max_train_points: 131072
+  max_train_points: 196608
   max_validation_points: 4096
   lr_patience: 1
   lr_factor: 0.5
   min_lr: 2.0e-05
 teacher:
-  epochs: 28
+  epochs: 20
   patience: 4
   lr: 0.0002
-  train_sequences: 256
+  batch_sequences: 32
+  train_sequences: 512
+  weight_decay: 0.0001
   lr_patience: 2
   lr_factor: 0.5
   min_lr: 2.0e-05
 stage2:
-  epochs: 24
-  patience: 6
-  batch_pairs: 16
-  lr: 7.5e-05
-  train_pairs: 2048
-  validation_pairs: 768
+  epochs: 32
+  patience: 5
+  batch_pairs: 32
+  lr: 5.0e-05
+  train_pairs: 4096
+  validation_pairs: 1024
   selection_normal_points: 131072
   selection_fpr_limit: 0.03
   selection_coverage_weight: 0.2
   lambda_tail: 0.2
-  hard_negative_fraction: 0.5
+  hard_negative_fraction: 0.75
   evidence_hidden: 96
   readout_hidden: 32
   lambda_channel: 0.5
   onset_fraction: 0.25
-  weight_decay: 0.0003
+  weight_decay: 0.001
   lr_patience: 2
   lr_factor: 0.5
   min_lr: 1.0e-05

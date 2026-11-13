@@ -6,13 +6,13 @@ model:
   d_model: 48
   layers: 1
   dropout: 0.25
-  marginal_prototypes: 128
-  joint_prototypes: 256
+  marginal_prototypes: 256
+  joint_prototypes: 512
 memory:
-  pool_size: 8192
-  rare_fraction: 0.25
+  pool_size: 16384
+  rare_fraction: 0.15
 stage1:
-  epochs: 20
+  epochs: 16
   batch_size: 256
   lr: 7.5e-05
   weight_decay: 0.002
@@ -25,29 +25,31 @@ stage1:
   min_lr: 1.0e-05
 teacher:
   epochs: 20
-  patience: 4
+  patience: 3
   lr: 0.0002
-  train_sequences: 256
+  batch_sequences: 32
+  train_sequences: 512
+  weight_decay: 0.0001
   lr_patience: 1
   lr_factor: 0.5
   min_lr: 2.0e-05
 stage2:
-  epochs: 16
-  patience: 4
-  batch_pairs: 32
-  lr: 2.5e-05
-  train_pairs: 3072
-  validation_pairs: 768
+  epochs: 10
+  patience: 3
+  batch_pairs: 64
+  lr: 2.0e-05
+  train_pairs: 4096
+  validation_pairs: 1024
   lambda_pair: 0.25
   selection_normal_points: 262144
   selection_fpr_limit: 0.06
   selection_coverage_weight: 0.1
   lambda_tail: 0.05
-  hard_negative_fraction: 0.25
-  evidence_hidden: 48
+  hard_negative_fraction: 0.5
+  evidence_hidden: 32
   readout_hidden: 16
   onset_fraction: 0.35
-  weight_decay: 0.002
+  weight_decay: 0.003
   lr_patience: 1
   lr_factor: 0.5
   min_lr: 1.0e-05
